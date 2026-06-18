@@ -250,7 +250,10 @@ because the project prioritises integrity over throughput.
 
 ## Documentation
 
-`make docs` generates the full FORD API reference into `ford_docs/`.
+The full FORD API reference is browsable online at
+**<https://sgeard.github.io/sqr/>** (rebuilt from source on every push by the
+`docs` GitHub Actions workflow). To generate it locally, run `make docs` — the
+HTML lands in `ford_docs/`.
 
 ---
 
