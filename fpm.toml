@@ -1,0 +1,32 @@
+name = "sqr"
+version = "1.0.0"
+license = "MIT"
+author = "sgeard"
+maintainer = "geardsj@gmail.com"
+copyright = "Copyright 2026, sgeard"
+
+[build]
+   auto-executables = true
+   auto-tests = true
+   auto-examples = false
+   module-naming = false
+
+[install]
+   library = false
+
+[fortran]
+   implicit-typing = false
+   implicit-external = false
+   source-form = "free"
+
+# clib_wrap{,_sm}.f90 use #ifdef _WIN32 for the Windows/POSIX filesystem
+# split. fpm does not preprocess lowercase .f90 by default; enable cpp for
+# them. The Make build already preprocesses every .f90 (-cpp/-fpp), and the
+# code's `//` concatenations survive both, so this matches existing behaviour.
+[preprocess]
+[preprocess.cpp]
+   suffixes = [".f90", ".F90"]
+
+# The cmdgraph engine (driving sqrsh) is vendored into src/ from
+# github.com/sgeard/cmdgraph, so there is no external dependency to resolve —
+# a fresh clone builds with `fpm test` / `fpm run sqrsh` out of the box.

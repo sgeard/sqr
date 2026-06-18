@@ -1,0 +1,23 @@
+# fpm build output
+build/
+
+# Make build directories (obj_<compiler>_<mode>, obj_mingw64) — hold all
+# objects, .mod/.smod and the built executables and libraries
+obj_*/
+
+# generated compiler-options and module-dependency makefiles
+foptions_*.mk
+depends.mk
+
+# FORD API documentation output
+ford_docs/
+
+# coverage artefacts
+*.gcov
+
+# editor / tooling artefacts
+tags/
+*~
+
+# local working notes (not part of the published project)
+commit-msg
