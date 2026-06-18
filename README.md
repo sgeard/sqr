@@ -7,7 +7,10 @@ journal for crash-safe transactions, and two interactive front-ends — a
 state-graph shell (`sqrsh`) and a small SQL-subset REPL (`sqlsh`).
 
 It is deliberately scoped for the small-to-medium workloads a single program
-needs (10⁴–10⁶ rows), not for postgres-scale concurrency. The design goal is
+needs (10⁴–10⁶ rows), not for postgres-scale concurrency. Access is
+**single-writer / multi-reader**: an advisory lock admits one read-write
+connection *or* any number of read-only ones at a time — there is no
+concurrent-writer (per-row / MVCC) isolation. The design goal is
 **integrity first**: every mutation is write-ahead journalled and survives a
 crash, even at the cost of an `fsync` per write.
 
