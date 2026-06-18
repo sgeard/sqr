@@ -40,6 +40,10 @@ jobs:
         run: ford ford.md   # output_dir = ford_docs (set in ford.md)
 
       - uses: actions/configure-pages@v5
+        with:
+          # Enable Pages via the API if it isn't already, and avoid the
+          # "Get Pages site failed / Not Found" race on first run.
+          enablement: true
 
       - uses: actions/upload-pages-artifact@v3
         with:
