@@ -1,4 +1,4 @@
-.PHONY: all clean veryclean distclean utest faulttest run-faulttest bench run-bench coverage coverage-gcov coverage-clean docs docs-clean help windows win-build sqrsh-regex test-regex
+.PHONY: all clean veryclean distclean utest sqlttest faulttest run-faulttest bench run-bench coverage coverage-gcov coverage-clean docs docs-clean help windows win-build sqrsh-regex test-regex
 .SUFFIXES:
 .DEFAULT_GOAL := all
 
@@ -232,6 +232,14 @@ $(ODIR):
 utest: $(TEST_BIN)
 	@for t in $(TEST_BIN); do echo "==> $$t" && $$t || exit 1; done
 
+# sqllogictest-subset functional tests: a Tcl harness (no tcllib; uses the
+# system md5sum) replays sqlt/tests/*.test records through the sqlsh REPL and
+# diffs results. Black-box, complements the utest_sql unit tests. See sqlt/README.md.
+SQLT_DIR    := sqlt
+SQLT_TESTS  := $(wildcard $(SQLT_DIR)/tests/*.test)
+sqlttest: $(ODIR)/sqlsh$(EXT)
+	tclsh $(SQLT_DIR)/run_sqlt.tcl $(ODIR)/sqlsh$(EXT) $(SQLT_TESTS)
+
 # Fault-injection sweep. Built only here (and by coverage), always with
 # FAULT=on, into a debug ODIR so the production release archive is never
 # overwritten with the on submodule.
@@ -333,7 +341,7 @@ windows:
 	@for t in $(WIN_TESTS); do echo "    $(WIN_ODIR)/$$t.exe"; done
 
 help:
-	@echo "Targets : all, utest, faulttest, bench, clean, veryclean, distclean"
+	@echo "Targets : all, utest, sqlttest, faulttest, bench, clean, veryclean, distclean"
 	@echo "          coverage, coverage-gcov, coverage-clean, docs, docs-clean, windows"
 	@echo "          sqrsh-regex, test-regex (opt-in DT_CHAR regex search via tcl_re)"
 	@echo "Options : F=gfortran|ifx|lfortran|flang (default ifx)  debug=1  valgrind=1 (ifx: AVX2 cap)"

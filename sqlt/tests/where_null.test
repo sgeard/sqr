@@ -1,0 +1,55 @@
+# where_null.test — NULL handling, IS [NOT] NULL, BETWEEN, and the "(empty)"
+# canonicalisation of an empty TEXT value. Values verified against sqlsh.
+
+statement ok
+CREATE TABLE t2(id INTEGER, name TEXT, score REAL)
+
+statement ok
+INSERT INTO t2 VALUES(1, 'a', 10.0)
+
+statement ok
+INSERT INTO t2 VALUES(2, NULL, 20.0)
+
+statement ok
+INSERT INTO t2 VALUES(3, 'c', NULL)
+
+statement ok
+INSERT INTO t2 VALUES(4, '', 40.0)
+
+# IS NULL selects only the row with a NULL name.
+query I nosort
+SELECT id FROM t2 WHERE name IS NULL
+----
+2
+
+# IS NOT NULL on the real column.
+query I rowsort
+SELECT id FROM t2 WHERE score IS NOT NULL
+----
+1
+2
+4
+
+# BETWEEN is inclusive on both bounds.
+query I nosort
+SELECT id FROM t2 WHERE id BETWEEN 2 AND 3 ORDER BY id
+----
+2
+3
+
+# NULL renders as the literal NULL; an empty TEXT value renders as (empty).
+query ITR nosort
+SELECT id, name, score FROM t2 ORDER BY id
+----
+1
+a
+10.000
+2
+NULL
+20.000
+3
+c
+NULL
+4
+(empty)
+40.000

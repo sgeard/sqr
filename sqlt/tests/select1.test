@@ -1,0 +1,65 @@
+# select1.test — basic single-table SELECT over sqr's SQL subset.
+# Hand-authored in the sqllogictest record format; expected values verified
+# against sqlsh. Exercises INTEGER / TEXT / REAL projection, WHERE comparison,
+# ORDER BY, LIMIT and rowsort.
+
+statement ok
+CREATE TABLE t1(a INTEGER, b TEXT, c REAL)
+
+statement ok
+INSERT INTO t1 VALUES(3, 'three', 3.5)
+
+statement ok
+INSERT INTO t1 VALUES(1, 'one', 1.25)
+
+statement ok
+INSERT INTO t1 VALUES(2, 'two', 2.0)
+
+# Single integer column, explicit order.
+query I nosort
+SELECT a FROM t1 ORDER BY a
+----
+1
+2
+3
+
+# Two columns flatten row-major: a, b, a, b, ...
+query IT nosort
+SELECT a, b FROM t1 ORDER BY a
+----
+1
+one
+2
+two
+3
+three
+
+# REAL canonicalises to 3 decimal places (sqlsh renders es15.8).
+query R nosort
+SELECT c FROM t1 ORDER BY a
+----
+1.250
+2.000
+3.500
+
+# WHERE with a >= comparison.
+query I nosort
+SELECT a FROM t1 WHERE a >= 2 ORDER BY a
+----
+2
+3
+
+# LIMIT after ORDER BY.
+query I nosort
+SELECT a FROM t1 ORDER BY a LIMIT 2
+----
+1
+2
+
+# rowsort: harness sorts the result, so scan order is irrelevant.
+query T rowsort
+SELECT b FROM t1
+----
+one
+three
+two
