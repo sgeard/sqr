@@ -6,9 +6,9 @@ records through the `sqlsh` REPL and diffs the results against expectations.
 sqllogictest is the engine-agnostic record/replay format Richard Hipp created to
 cross-check SQLite against PostgreSQL/MySQL, so it carries no SQLite-specific
 assumptions — which makes it a natural body of black-box tests to point at sqr's
-SQL subset. This is a **prototype**: it implements the slice of the format that
-sqr's subset can actually exercise, and curates/hand-authors the records rather
-than ingesting SQLite's multi-million-query corpus wholesale.
+SQL subset. It implements the slice of the format that sqr's subset can actually
+exercise, and runs curated, hand-authored records rather than ingesting SQLite's
+multi-million-query corpus wholesale.
 
 ## Running
 
@@ -69,10 +69,10 @@ query <types> [nosort|rowsort|valuesort] [label]
   great majority of the upstream corpus exercises exactly those features, so
   porting is a matter of **filtering to the supported subset**, not bulk import.
   `tests/errors.test` documents the boundaries via `statement error` records.
-- The harness parses sqlsh's human-readable table. That is fine here, but a
-  machine-readable `.mode list` output in sqlsh (one value per line) would make
-  result parsing exact rather than layout-derived — the natural next step if
-  this grows beyond a prototype.
+- The harness parses sqlsh's human-readable table. That is robust here (rows are
+  cut at the dashes-line column offsets), but a machine-readable `.mode list`
+  output in sqlsh (one value per line) would make result parsing exact rather
+  than layout-derived — the natural next step if the suite grows substantially.
 - Crash/durability tests from upstream are not portable and not needed: sqr's
   own fault-injection sweep (`fault/`) already covers that dimension.
 

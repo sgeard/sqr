@@ -1,0 +1,62 @@
+# alter.test — ALTER TABLE ADD/DROP COLUMN. A newly added column reads NULL for
+# existing rows and is writable; DROP removes the column and a later reference
+# to it is an error. Expected values verified against sqlsh.
+
+statement ok
+CREATE TABLE al(a INTEGER, b TEXT)
+
+statement ok
+INSERT INTO al VALUES(1, 'x')
+
+statement ok
+INSERT INTO al VALUES(2, 'y')
+
+# ADD COLUMN: existing rows get NULL in the new column.
+statement ok
+ALTER TABLE al ADD COLUMN c INTEGER
+
+query ITI nosort
+SELECT a, b, c FROM al ORDER BY a
+----
+1
+x
+NULL
+2
+y
+NULL
+
+# The new column is writable like any other.
+statement ok
+UPDATE al SET c=99 WHERE a=1
+
+query II nosort
+SELECT a, c FROM al ORDER BY a
+----
+1
+99
+2
+NULL
+
+# DROP COLUMN removes it; the remaining columns and their data are intact.
+statement ok
+ALTER TABLE al DROP COLUMN b
+
+query II nosort
+SELECT a, c FROM al ORDER BY a
+----
+1
+99
+2
+NULL
+
+# Referencing the dropped column is now an error.
+statement error
+SELECT b FROM al
+
+# Adding a duplicate column name is an error.
+statement error
+ALTER TABLE al ADD COLUMN a INTEGER
+
+# Dropping a non-existent column is an error.
+statement error
+ALTER TABLE al DROP COLUMN nope

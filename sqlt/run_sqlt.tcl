@@ -8,10 +8,10 @@
 # SQL engines, so it carries no SQLite-specific assumptions — which makes it the
 # natural body of black-box tests to point at sqr's SQL subset (`sqlsh`).
 #
-# This is a PROTOTYPE: it implements the slice of the format that sqr's subset
-# can actually exercise (no JOIN / aggregate / subquery / LIKE / IN), and parses
-# sqlsh's human-readable table output rather than a machine mode (see LIMITATIONS
-# in sqlt/README.md). It is pure Tcl + the system `md5sum`; no tcllib needed.
+# It implements the slice of the format that sqr's subset can actually exercise
+# (no JOIN / aggregate / subquery / LIKE / IN), and parses sqlsh's human-readable
+# table output rather than a machine mode (see LIMITATIONS in sqlt/README.md).
+# It is pure Tcl + the system `md5sum`; no tcllib needed.
 #
 # Usage:   tclsh run_sqlt.tcl <sqlsh-binary> <file.test> [more.test ...]
 # Exit:    0 if every record passed, 1 otherwise.

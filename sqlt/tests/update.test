@@ -1,0 +1,65 @@
+# update.test — UPDATE: single and multi-column assignment, with and without a
+# WHERE clause, and SET <col>=NULL. Expected values verified against sqlsh.
+
+statement ok
+CREATE TABLE u(a INTEGER, b TEXT, c REAL)
+
+statement ok
+INSERT INTO u VALUES(1, 'x', 1.0)
+
+statement ok
+INSERT INTO u VALUES(2, 'y', 2.0)
+
+statement ok
+INSERT INTO u VALUES(3, 'z', 3.0)
+
+# Update a single column for the rows matching WHERE; the rest are untouched.
+statement ok
+UPDATE u SET b='Y' WHERE a=2
+
+query IT nosort
+SELECT a, b FROM u ORDER BY a
+----
+1
+x
+2
+Y
+3
+z
+
+# Update several columns in one statement.
+statement ok
+UPDATE u SET b='two', c=20.0 WHERE a=2
+
+query TR nosort
+SELECT b, c FROM u WHERE a=2
+----
+two
+20.000
+
+# Set a column to NULL.
+statement ok
+UPDATE u SET b=NULL WHERE a=1
+
+query T nosort
+SELECT b FROM u WHERE a=1
+----
+NULL
+
+# An UPDATE with no WHERE touches every row.
+statement ok
+UPDATE u SET c=9.5
+
+query R rowsort
+SELECT c FROM u
+----
+9.500
+9.500
+9.500
+
+# Error paths: unknown column, unknown table.
+statement error
+UPDATE u SET nope=5
+
+statement error
+UPDATE missing SET a=1
