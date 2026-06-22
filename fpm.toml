@@ -19,10 +19,11 @@ copyright = "Copyright 2026, sgeard"
    implicit-external = false
    source-form = "free"
 
-# clib_wrap{,_sm}.f90 use #ifdef _WIN32 for the Windows/POSIX filesystem
-# split. fpm does not preprocess lowercase .f90 by default; enable cpp for
-# them. The Make build already preprocesses every .f90 (-cpp/-fpp), and the
-# code's `//` concatenations survive both, so this matches existing behaviour.
+# app/sqrsh.f90 uses #ifdef SQR_WITH_REGEX to gate the opt-in regex search.
+# fpm does not preprocess lowercase .f90 by default; enable cpp so the guarded
+# (off-by-default) source compiles. The OS/platform split no longer needs any
+# preprocessing here: it lives in src/osshim.c, which fpm compiles
+# automatically. The code's `//` concatenations survive cpp, as before.
 [preprocess]
 [preprocess.cpp]
    suffixes = [".f90", ".F90"]

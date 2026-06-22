@@ -56,7 +56,17 @@ else
 endif
 FAULT_SM_OBJ := $(ODIR)/sqr_fault_$(FAULT)_sm.o
 
-LIB_OBJ := $(addprefix $(ODIR)/,$(LIB_SRC:.f90=.o)) $(FAULT_SM_OBJ)
+# C shim (osshim.c) — the OS/platform split lives in C, where the C
+# preprocessor reliably predefines _WIN32. A plain C compiler suffices and its
+# objects are ABI-compatible with every Fortran compiler offered here.
+CC     ?= cc
+CFLAGS ?= -O2 -Wall -Wextra
+
+# The platform shim is C; everything else is Fortran.
+LIB_C_SRC := osshim.c
+LIB_C_OBJ := $(addprefix $(ODIR)/,$(LIB_C_SRC:.c=.o))
+
+LIB_OBJ := $(addprefix $(ODIR)/,$(LIB_SRC:.f90=.o)) $(LIB_C_OBJ) $(FAULT_SM_OBJ)
 LIB     := $(ODIR)/libsqr.a
 
 # Test binaries: one per test/utest_*.f90 (the fault sweep lives in
@@ -93,6 +103,11 @@ $(ODIR)/clib_wrap.o $(ODIR)/clib_wrap.mod &: $(SRC_DIR)/clib_wrap.f90 | $(ODIR)
 
 $(ODIR)/clib_wrap_sm.o: $(SRC_DIR)/clib_wrap_sm.f90 $(ODIR)/clib_wrap.mod | $(ODIR)
 	$(F) -c $(F_OPTS) -o $@ $<
+
+# Platform shim (C). No Fortran module dependencies; the bind(c) interfaces in
+# clib_wrap resolve to these symbols at link time.
+$(ODIR)/osshim.o: $(SRC_DIR)/osshim.c | $(ODIR)
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(ODIR)/b_tree.o $(ODIR)/b_tree.mod &: $(SRC_DIR)/b_tree.f90 | $(ODIR)
 	$(F) -c $(F_OPTS) -o $(ODIR)/b_tree.o $<
@@ -300,32 +315,36 @@ distclean: veryclean docs-clean
 
 # --- Windows cross-build (MinGW-w64, 64-bit) -------------------------------
 # Cross-compile the library + the unit-test executables to standalone Windows
-# .exe to exercise the Windows clib_wrap branch (run them on Windows, or under
-# wine). sqrsh is excluded — its cmdgraph engine is not part of this test build.
+# .exe to exercise the Windows (osshim.c) branch (run them on Windows, or under
+# wine). sqrsh is excluded — it links cmdgraph, which is not cross-built here.
 #
 # Two non-obvious points encoded below:
-#   * MinGW gfortran's Fortran preprocessor does NOT predefine _WIN32 (that is
-#     a C-preprocessor macro), so -D_WIN32 is passed explicitly to select the
-#     Windows branch. Without it the POSIX branch compiles and links against
-#     MinGW's POSIX-compat shims, but Windows rename() does not replace an open
-#     target, so db_compact fails.
+#   * The platform split now lives in osshim.c, compiled with the MinGW *C*
+#     compiler, which DOES predefine _WIN32 — so no -D is needed anywhere and
+#     the Fortran is compiled with no preprocessing at all. (The Win32
+#     rename-replace semantics db_compact relies on come from MoveFileEx in
+#     osshim.c, not from MinGW's POSIX-compat rename.)
 #   * -static yields a self-contained .exe; -Wl,-u,__strcpy_chk -lssp resolves
 #     a fortify symbol libgfortran's runtime pulls in (via its directory code)
 #     under -static on this toolchain.
 # 32-bit is intentionally not offered: the Win32 APIs are stdcall with
 # @N-decorated names on i686, which a plain bind(c) (cdecl) interface does not
 # match — that needs separate handling. 64-bit has one calling convention.
-WIN_FC    := x86_64-w64-mingw32-gfortran
-WIN_AR    := x86_64-w64-mingw32-ar
-WIN_ODIR  := obj_mingw64
-WIN_FLAGS := -cpp -D_WIN32 -O3
-WIN_LINK  := -static -Wl,-u,__strcpy_chk -lssp
+WIN_FC     := x86_64-w64-mingw32-gfortran
+WIN_CC     := x86_64-w64-mingw32-gcc
+WIN_AR     := x86_64-w64-mingw32-ar
+WIN_ODIR   := obj_mingw64
+WIN_FLAGS  := -O3
+WIN_CFLAGS := -O2 -Wall -Wextra
+WIN_LINK   := -static -Wl,-u,__strcpy_chk -lssp
 # Module/submodule order matters (parents before submodules).
 WIN_SRC   := clib_wrap b_tree sqr_fault sqr clib_wrap_sm b_tree_sm sqr_fault_off_sm sqr_base sqr_table sqr_record sqr_index sqr_admin sqr_rowbuf sqr_journal sql sql_base sql_parse sql_exec
 WIN_TESTS := utest_btree utest_sqr utest_sql
 
 windows:
 	@mkdir -p $(WIN_ODIR)
+	@echo "  CC  osshim"
+	$(WIN_CC) $(WIN_CFLAGS) -c $(SRC_DIR)/osshim.c -o $(WIN_ODIR)/osshim.o
 	@for f in $(WIN_SRC); do \
 	    echo "  FC  $$f"; \
 	    $(WIN_FC) $(WIN_FLAGS) -J$(WIN_ODIR) -I$(WIN_ODIR) \
@@ -334,7 +353,7 @@ windows:
 	$(WIN_AR) rcs $(WIN_ODIR)/libsqr.a $(WIN_ODIR)/*.o
 	@for t in $(WIN_TESTS); do \
 	    echo "  LD  $$t.exe"; \
-	    $(WIN_FC) $(WIN_FLAGS) -I$(WIN_ODIR) -o $(WIN_ODIR)/$$t.exe \
+	    $(WIN_FC) $(WIN_FLAGS) -J$(WIN_ODIR) -I$(WIN_ODIR) -o $(WIN_ODIR)/$$t.exe \
 	        $(TEST_DIR)/$$t.f90 $(WIN_ODIR)/libsqr.a $(WIN_LINK) || exit 1; \
 	done
 	@echo "Built standalone Windows 64-bit exes in $(WIN_ODIR)/ (run on Windows or via wine):"

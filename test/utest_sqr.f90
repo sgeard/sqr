@@ -1392,16 +1392,13 @@ contains
         call check(rs == SQR_INVALID, 'reject db dir with embedded .. component')
         call db_open(db, 'a' // char(9) // 'b', rs, emsg)
         call check(rs == SQR_INVALID, 'reject db dir with control char')
-#ifdef _WIN32
-        ! On Windows '\' is a path separator too, so a back-slash-delimited
-        ! '..' component must also be caught by the traversal guard. On POSIX
-        ! '\' is an ordinary filename byte, so this string is a single legal
-        ! component there and the assertion does not apply.
+        ! A '\' is folded to '/' on entry (norm_seps), so a back-slash-delimited
+        ! '..' component is caught by the traversal guard on every platform,
+        ! exactly as the '/' form is.
         call db_open(db, '..' // char(92) // 'escape', rs, emsg)
-        call check(rs == SQR_INVALID, 'reject db dir with leading ..\ component (Windows)')
+        call check(rs == SQR_INVALID, 'reject db dir with leading ..\ component')
         call db_open(db, 'a' // char(92) // '..' // char(92) // 'b', rs, emsg)
-        call check(rs == SQR_INVALID, 'reject db dir with embedded ..\ component (Windows)')
-#endif
+        call check(rs == SQR_INVALID, 'reject db dir with embedded ..\ component')
 
         ! --- Accept ordinary path characters now the shell is gone ---
         block

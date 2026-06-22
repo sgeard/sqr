@@ -19,17 +19,21 @@ contains
         logical,          intent(in),   optional  :: readonly
         integer :: rs, i, j, n
         character(len=SQR_NAME_LEN), allocatable :: names(:)
+        character(len=:), allocatable :: ndir
 
         rs = SQR_OK
+        ! Fold any '\' to '/' so the engine reasons about a single separator on
+        ! every platform (Windows accepts both); see norm_seps.
+        ndir = norm_seps(dir)
         open_seq: block
-            if (.not. valid_dir_name(dir)) then
+            if (.not. valid_dir_name(ndir)) then
                 rs = SQR_INVALID
                 call raise(rs, stat, errmsg, &
                            'invalid database directory name: "' // trim(dir) // '"')
                 exit open_seq
             end if
 
-            db%dir = trim(dir)
+            db%dir = trim(ndir)
             db%ntables  = 0
             allocate(db%tables(0))
             db%opened   = .false.

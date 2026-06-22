@@ -87,20 +87,31 @@ contains
 
     ! ===== Path helpers =====
 
-    ! Path-separator test. POSIX recognises only '/', and there '\' is an
-    ! ordinary filename byte that must NOT be read as a boundary. Windows
-    ! (the Win32 API and the CRT that clib_wrap and the Fortran runtime call)
-    ! accepts '/' and '\' interchangeably, so on _WIN32 both count as
-    ! component boundaries -- otherwise a native back-slash path slips past
-    ! the '..' traversal guard and mkdir_p fails to create its parents.
+    ! Path-separator test. Every sqr-internal path uses '/', and any
+    ! user-supplied path is folded to '/' on entry (norm_seps, called from
+    ! db_open), so '/' is the one and only separator the engine reasons about
+    ! -- no per-platform branch, no preprocessing.
     pure function is_sep(ch) result(yes)
         character(len=1), intent(in) :: ch
         logical :: yes
-#ifdef _WIN32
-        yes = ch == '/' .or. ch == char(92)
-#else
         yes = ch == '/'
-#endif
+    end function
+
+    ! Normalise a user-supplied path to the engine's single separator. Windows
+    ! accepts '/' and '\' interchangeably; folding '\' to '/' here means
+    ! validation, component splitting and mkdir_p all reason about '/' alone,
+    ! with no platform awareness anywhere in the Fortran. The one consequence
+    ! is that a database directory name may not contain a literal '\' (a legal
+    ! byte in a POSIX filename) -- an entirely acceptable restriction for a db
+    ! path, alongside the existing "no control characters, no '..'" rules.
+    pure function norm_seps(path) result(out)
+        character(len=*), intent(in)  :: path
+        character(len=:), allocatable :: out
+        integer :: k
+        out = path
+        do k = 1, len(out)
+            if (out(k:k) == char(92)) out(k:k) = '/'
+        end do
     end function
 
     pure function pathjoin(d, f) result(p)
@@ -262,9 +273,9 @@ contains
             end if
         end do ctrl_scan
         ! Reject any '..' path component. Walk separator-delimited segments;
-        ! a boundary is a path separator (is_sep: '/' always, '\' too on
-        ! Windows) or the end of the string. (.or. does not short-circuit, so
-        ! test the end-of-string case before indexing.)
+        ! a boundary is a path separator ('/', the engine's sole separator
+        ! after norm_seps) or the end of the string. (.or. does not
+        ! short-circuit, so test the end-of-string case before indexing.)
         cstart = 1
         comp_scan: do k = 1, n + 1
             boundary = (k == n + 1)
