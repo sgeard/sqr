@@ -232,21 +232,40 @@ contains
             if (present(stat)) stat = SQR_ERR
             return
         end if
+        ! Phase 1 — make the payload durable BEFORE the header names it.  On a
+        ! re-arm the payload is an append-only identical prefix of the previous
+        ! one, so a crash after this fsync but before the header lands leaves the
+        ! OLD header (old nrec/plen/cksum) over a still-valid prefix: recovery
+        ! reads only that prefix, its checksum matches, and every earlier undo
+        ! record survives.  This keeps "torn payload => arming never completed"
+        ! true for every arm, not just the first (see jrnl_recover).
         if (len(payload) > 0) then
             write(u, pos=JHEADER + 1, iostat=ios) payload
             call io_check(ios)
         end if
-        if (ios == 0) &
-            write(u, pos=1, iostat=ios) JMAGIC, JFMT, JSTATE_HOT, db%jrnl%nrec, &
-                                        checksum(payload), int(len(payload), int64)
+        if (ios == 0) flush(u, iostat=ios)
         call io_check(ios)
-        if (ios == 0) flush(u)
-        close(u)
+        if (ios == 0) then
+            ios = c_fsync_path(db%jrnl%path)     ! payload durable
+            call io_check(ios)
+        end if
+        if (ios /= 0) then
+            close(u, iostat=i)
+            if (present(stat)) stat = SQR_ERR
+            return
+        end if
+        ! Phase 2 — the header may now safely point at the durable payload.
+        write(u, pos=1, iostat=ios) JMAGIC, JFMT, JSTATE_HOT, db%jrnl%nrec, &
+                                    checksum(payload), int(len(payload), int64)
+        call io_check(ios)
+        if (ios == 0) flush(u, iostat=ios)
+        call io_check(ios)
+        close(u, iostat=i)
         if (ios /= 0) then
             if (present(stat)) stat = SQR_ERR
             return
         end if
-        ios = c_fsync_path(db%jrnl%path)
+        ios = c_fsync_path(db%jrnl%path)         ! header durable
         call io_check(ios)
         if (ios /= 0) st = SQR_ERR
         if (fresh) then
@@ -292,6 +311,11 @@ contains
                 ! recover to the pre-txn state.
                 rst = SQR_OK
                 call apply_rollback(db, rst)
+                ! Surface a failed unwind rather than masking it as a clean
+                ! commit failure: if the rollback could not finish, the journal
+                ! is left hot (apply_rollback only voids on success) and db_open
+                ! will recover, but the caller must still see the error.
+                if (rst /= SQR_OK) st = rst
             end if
         end if
         call clear_txn_state(db)
@@ -326,7 +350,7 @@ contains
         ! later resync closes these units — on a compiler that buffers record
         ! writes that close would otherwise flush the rolled-forward bytes back,
         ! clobbering the bytes apply_undo had just restored.
-        call flush_base_files(db)
+        call flush_base_files(db, st)
         ! Reverse order so an earlier capture of a region wins over a later one.
         do i = db%jrnl%nrec, 1, -1
             call apply_undo(db, db%jrnl%recs(i), st)
@@ -342,7 +366,10 @@ contains
         ! The index files are back to their pre-txn bytes; the open tree handles
         ! still cache the rolled-forward meta, so reload each before clearing.
         call clear_index_hooks(db, reload=.true., stat=st)
-        if (db%jrnl%armed) call void_header(db, st)
+        ! Void only on a clean unwind.  A failed undo/resync (transient EIO,
+        ! ENOSPC) must leave the journal hot so the next open re-applies the
+        ! (idempotent) undo records rather than serving a half-restored file.
+        if (db%jrnl%armed .and. st == SQR_OK) call void_header(db, st)
     end subroutine
 
     ! Tear down the in-memory transaction state after a commit or rollback.
@@ -384,7 +411,23 @@ contains
             if (present(stat)) stat = SQR_OK
             return
         end if
-        allocate(character(len=int(plen)) :: payload)
+        ! Guard the payload length before trusting it: it is not covered by the
+        ! checksum, int(plen) would truncate a >2 GiB value, and a corrupt huge
+        ! plen must not abort db_open inside the allocate.  An implausible or
+        ! unallocatable length means the header is corrupt -> void and move on.
+        if (plen < 0_int64 .or. plen > int(huge(0), int64)) then
+            close(u)
+            call void_header(db, st)
+            if (present(stat)) stat = st
+            return
+        end if
+        allocate(character(len=int(plen)) :: payload, stat=ios)
+        if (ios /= 0) then
+            close(u)
+            call void_header(db, st)
+            if (present(stat)) stat = st
+            return
+        end if
         if (plen > 0) read(u, pos=JHEADER + 1, iostat=ios) payload
         close(u)
         ! A torn or mismatched payload means arming never completed, so no base
@@ -403,7 +446,11 @@ contains
         do i = nrec, 1, -1               ! replay undo in reverse
             call apply_undo(db, recs(i), st)
         end do
-        call void_header(db, st)         ! invalidate once the base files are sound
+        ! Void only if every undo landed.  A transient I/O error mid-replay
+        ! leaves the base file half-restored; keeping the journal hot lets the
+        ! next open retry the (idempotent, absolute-write) undo records instead
+        ! of destroying the one record that can still repair the database.
+        if (st == SQR_OK) call void_header(db, st)
         if (present(stat)) stat = st
     end subroutine
 
@@ -436,13 +483,20 @@ contains
     ! committed writes before the journal captures pre-images and extents.  An
     ! open unit's sentinel is -1 (newunit hands out negative units, so a "> 0"
     ! test would be wrong).
-    subroutine flush_base_files(db)
-        class(db_t), intent(in) :: db
-        integer :: ti
+    subroutine flush_base_files(db, st)
+        class(db_t), intent(in)              :: db
+        integer,     intent(inout), optional :: st
+        integer :: ti, ios
         do ti = 1, db%ntables
             associate (t => db%tables(ti))
-                if (t%unit      /= -1) flush(t%unit)
-                if (t%blob_unit /= -1) flush(t%blob_unit)
+                if (t%unit /= -1) then
+                    flush(t%unit, iostat=ios)
+                    if (ios /= 0 .and. present(st)) st = SQR_ERR
+                end if
+                if (t%blob_unit /= -1) then
+                    flush(t%blob_unit, iostat=ios)
+                    if (ios /= 0 .and. present(st)) st = SQR_ERR
+                end if
             end associate
         end do
     end subroutine
@@ -458,7 +512,7 @@ contains
         integer,     intent(inout) :: st
         integer :: i, k, ios, ti, j, bs
         logical :: dup
-        call flush_base_files(db)
+        call flush_base_files(db, st)
         do ti = 1, db%ntables
             associate (t => db%tables(ti))
                 do j = 1, t%nindices
@@ -675,7 +729,7 @@ contains
         end if
         write(u, pos=1, iostat=ios) zeros
         call io_check(ios)
-        if (ios == 0) flush(u)
+        if (ios == 0) flush(u, iostat=ios)
         close(u)
         if (ios /= 0) then
             st = SQR_ERR
@@ -700,7 +754,7 @@ contains
         end if
         write(u, pos=1, iostat=ios) JMAGIC, JFMT, JSTATE_VOID, 0, 0, 0_int64
         call io_check(ios)
-        if (ios == 0) flush(u)
+        if (ios == 0) flush(u, iostat=ios)
         close(u)
         if (ios /= 0) then
             st = SQR_ERR
@@ -856,7 +910,7 @@ contains
              status='old', action='readwrite', iostat=ios)
         if (ios /= 0) return
         write(u, pos=offset, iostat=ios) bytes
-        if (ios == 0) flush(u)
+        if (ios == 0) flush(u, iostat=ios)
         close(u)
     end subroutine
 

@@ -167,7 +167,7 @@ contains
     module subroutine db_close(db, stat)
         class(db_t), intent(inout)         :: db
         integer,    intent(out), optional :: stat
-        integer :: i, j, rs, first
+        integer :: i, j, rs, first, cs
         first = SQR_OK
         if (present(stat)) stat = SQR_OK
         if (.not. db%opened) return
@@ -180,9 +180,17 @@ contains
                     call write_schema(db, t, rs)
                     if (rs /= SQR_OK .and. first == SQR_OK) first = rs
                 end if
-                if (t%unit /= -1) close(t%unit)
+                ! A close performs the final flush; capture (never let it abort)
+                ! an ENOSPC/EIO there so it surfaces as a stat, not error stop.
+                if (t%unit /= -1) then
+                    close(t%unit, iostat=cs)
+                    if (cs /= 0 .and. first == SQR_OK) first = SQR_ERR
+                end if
                 t%unit = -1
-                if (t%blob_unit /= -1) close(t%blob_unit)
+                if (t%blob_unit /= -1) then
+                    close(t%blob_unit, iostat=cs)
+                    if (cs /= 0 .and. first == SQR_OK) first = SQR_ERR
+                end if
                 t%blob_unit = -1
                 close_indices: do j = 1, t%nindices
                     if (idx_live(t%indices(j))) call bt_close(t%indices(j)%bt)
@@ -510,8 +518,14 @@ contains
                 if (present(stat)) stat = rs
                 return
             end if
-            close(ud)
-            if (has_text) close(ub)
+            ! Guard the temp closes: a failed final flush here means the temp is
+            ! not fully written, so abort before the swap rather than error stop.
+            close(ud, iostat=ios)
+            if (ios == 0 .and. has_text) close(ub, iostat=ios)
+            if (ios /= 0) then
+                if (present(stat)) stat = SQR_ERR
+                return
+            end if
 
             ! Phase B — swap in the compacted files, then rebuild derived
             ! state. rename(2) atomically replaces the destination, so no
@@ -811,11 +825,16 @@ contains
                 stat = rs
                 return
             end if
-            close(ud)
+            ! Guard the temp close (final flush) before committing the swap.
+            close(ud, iostat=ios)
+            if (ios /= 0) then
+                stat = SQR_ERR
+                return
+            end if
 
             ! ---- Commit: swap in the rewritten data, then persist the new
             ! schema. These two are kept adjacent — the residual crash window.
-            close(t%unit); t%unit = -1
+            close(t%unit, iostat=ios); t%unit = -1
             if (c_rename(dtmp, dpath) /= 0) then
                 stat = SQR_ERR
                 return

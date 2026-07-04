@@ -10,7 +10,7 @@
 ! the trailing db_close are run disarmed (db_close in particular has no
 ! error channel, so injecting there could not surface anyway).
 program utest_fault
-    use, intrinsic :: iso_fortran_env, only: int32
+    use, intrinsic :: iso_fortran_env, only: int32, int64
     use sqr
     use sqr_fault, only: fault_arm, fault_disarm, fault_count
     use clib_wrap, only: c_rmtree
@@ -63,6 +63,9 @@ program utest_fault
     ! Pinpoint the Phase-2 commit durability barrier: db_commit fsyncs every
     ! modified base file and only then voids the journal (the commit point).
     call commit_durability()
+
+    ! H1: a faulted undo replay must leave the journal hot, never voided.
+    call recover_fault()
 
     call cleanup()
     print '(a,i0,a,i0,a)', 'sqr fault tests: ', pass, ' passed, ', fail, ' failed'
@@ -501,5 +504,119 @@ contains
         call check(bad == 0, &
             'commit_durability: every commit-barrier fault aborts and rolls back')
     end subroutine commit_durability
+
+    ! H1 recovery-failure path.  A transient I/O error while replaying the undo
+    ! set must NOT void the journal: it stays hot so the next open retries the
+    ! (idempotent, absolute-write) undo rather than destroying the one record
+    ! that can still repair a half-restored base file.  Sweep a fault across a
+    ! genuine hot-journal recovery; every failed replay must leave the journal
+    ! hot, and a disarmed retry must then complete and restore the pre-crash
+    ! bytes.  (Recovery's undo write/fsync are the injectable io_check points;
+    ! the header reads are not, which is exactly the "mid-replay" fault we want.)
+    subroutine recover_fault()
+        type(db_t) :: db
+        character(len=*), parameter :: REL = 'jf.bin'
+        character(len=:), allocatable :: full
+        integer :: rs, n, nops, bad, r
+
+        call fault_disarm()
+        r = c_rmtree(DBDIR)
+        call db_open(db, DBDIR, rs)
+        full = trim(db%dir) // '/' // REL
+        call arm_region(db, full, REL)
+        call fault_arm(BIG)                       ! never fires; just counts
+        call jrnl_recover(db, rs)
+        nops = fault_count()
+        call fault_disarm()
+        call check(rs == SQR_OK, 'recover_fault: clean recovery succeeds')
+        call check(nops > 0,     'recover_fault: recovery performs undo I/O')
+        call check(jread_file(full, 16) == 'AAAAAAAAAAAAAAAA', &
+                   'recover_fault: clean recovery restores original')
+        call db_close(db)
+
+        ! Targeted H1 check: the undo write is the FIRST io_check in recovery
+        ! (apply_undo runs before void_header), so arming n=1 fails the replay
+        ! itself.  A failed replay must leave the journal HOT — the pre-fix code
+        ! voided it unconditionally, abandoning the one record that repairs the
+        ! base file.  A disarmed retry then completes and voids it cleanly.
+        r = c_rmtree(DBDIR)
+        call db_open(db, DBDIR, rs)
+        call arm_region(db, full, REL)
+        call fault_arm(1)
+        call jrnl_recover(db, rs)
+        call fault_disarm()
+        call check(rs /= SQR_OK,  'recover_fault: faulted replay reports failure')
+        call check(jrnl_hot(db),  'recover_fault: faulted replay leaves journal hot (not voided)')
+        call jrnl_recover(db, rs)
+        call check(rs == SQR_OK,  'recover_fault: disarmed retry completes')
+        call check(.not. jrnl_hot(db), 'recover_fault: retry voids the journal')
+        call check(jread_file(full, 16) == 'AAAAAAAAAAAAAAAA', &
+                   'recover_fault: retry restores the original')
+        call db_close(db)
+
+        ! Broad safety net: wherever a fault lands during recovery, a disarmed
+        ! retry must restore the original bytes and end with the journal voided.
+        bad = 0
+        sweep: do n = 1, nops
+            r = c_rmtree(DBDIR)
+            call db_open(db, DBDIR, rs)
+            call arm_region(db, full, REL)
+            call fault_arm(n)
+            call jrnl_recover(db, rs)
+            call fault_disarm()
+            if (rs /= SQR_OK) then
+                call jrnl_recover(db, rs)                 ! disarmed retry
+                if (rs /= SQR_OK) bad = bad + 1
+                if (jrnl_hot(db)) bad = bad + 1           ! retry must void it
+                if (jread_file(full, 16) /= 'AAAAAAAAAAAAAAAA') bad = bad + 1
+            end if
+            call db_close(db)
+        end do sweep
+        call check(bad == 0, &
+            'recover_fault: a disarmed retry restores after a fault at any point')
+    end subroutine recover_fault
+
+    ! Arm a hot journal capturing REL[5..8] and perform the uncommitted base
+    ! overwrite, leaving the file hot for recovery to roll back to 'AAAA...'.
+    subroutine arm_region(db, full, rel)
+        type(db_t),       intent(inout) :: db
+        character(len=*), intent(in)    :: full, rel
+        integer :: rs
+        call jwrite_file(full, 'AAAAAAAAAAAAAAAA')
+        call txn_begin(db, rs)
+        call jrnl_log_region(db, rel, 5_int64, 4_int64, stat=rs)
+        call txn_arm(db, rs)
+        call jwrite_region(full, 5_int64, 'CCCC')
+    end subroutine arm_region
+
+    subroutine jwrite_file(path, content)
+        character(len=*), intent(in) :: path, content
+        integer :: u, io
+        open(newunit=u, file=path, access='stream', form='unformatted', &
+             status='replace', iostat=io)
+        write(u) content
+        close(u)
+    end subroutine jwrite_file
+
+    subroutine jwrite_region(path, off, content)
+        character(len=*), intent(in) :: path, content
+        integer(int64),   intent(in) :: off
+        integer :: u, io
+        open(newunit=u, file=path, access='stream', form='unformatted', &
+             status='old', action='readwrite', iostat=io)
+        write(u, pos=off) content
+        close(u)
+    end subroutine jwrite_region
+
+    function jread_file(path, n) result(s)
+        character(len=*), intent(in) :: path
+        integer,          intent(in) :: n
+        character(len=n) :: s
+        integer :: u, io
+        open(newunit=u, file=path, access='stream', form='unformatted', &
+             status='old', action='read', iostat=io)
+        read(u, pos=1) s
+        close(u)
+    end function jread_file
 
 end program utest_fault

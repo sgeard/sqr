@@ -562,8 +562,12 @@ contains
     module subroutine bt_sync(bt, stat)
         type(btree_t), intent(in)            :: bt
         integer,       intent(out), optional :: stat
+        integer :: ios
         if (present(stat)) stat = BT_OK
-        if (bt%unit /= -1 .and. bt%writable) flush(bt%unit)
+        if (bt%unit /= -1 .and. bt%writable) then
+            flush(bt%unit, iostat=ios)
+            if (ios /= 0 .and. present(stat)) stat = BT_ERR
+        end if
     end subroutine
 
     ! Re-sync the cached meta fields from the on-disk meta page (page 1)
