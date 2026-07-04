@@ -54,6 +54,7 @@ module sqr
     integer, parameter, public :: SQR_INVALID   = 5  !! Bad argument or corrupt on-disk metadata
     integer, parameter, public :: SQR_READONLY  = 6  !! Write attempted on a read-only open
     integer, parameter, public :: SQR_LOCKED    = 7  !! Database held by another connection
+    integer, parameter, public :: SQR_NO_UNDO   = 8  !! Nothing on the undo (or redo) history to apply
 
     ! --- On-disk format version ---
     !! Current on-disk format version.  There is a single format: composite
@@ -171,6 +172,53 @@ module sqr
         type(tbl_snap_t), allocatable :: snaps(:)  !! Per-table counter snapshot, by table position, for the current txn
     end type
 
+    !! One changed byte-range of a base file within a committed gesture, holding
+    !! BOTH images: `undo_bytes` is what the region held before the gesture,
+    !! `redo_bytes` what it holds after.  A grown file contributes one tail range
+    !! at `offset = undo_len+1` whose `undo_bytes` is empty (the bytes did not
+    !! exist) and whose `redo_bytes` are the appended bytes — so undo truncates
+    !! them away and redo re-appends them.  Module-private.
+    type :: byterange_t
+        integer(int64)                :: offset = 0  !! 1-based byte offset
+        character(len=:), allocatable :: undo_bytes  !! Pre-gesture image ('' for a pure tail)
+        character(len=:), allocatable :: redo_bytes  !! Post-gesture image
+    end type
+
+    !! The before/after delta of one base file touched by a committed gesture.
+    !! Module-private — carried inside a `hist_step_t`.
+    type :: path_delta_t
+        character(len=:), allocatable :: path        !! File, relative to the db directory
+        integer(int64)                :: undo_len = 0  !! File length before the gesture
+        integer(int64)                :: redo_len = 0  !! File length after the gesture
+        type(byterange_t), allocatable :: ranges(:)  !! Changed ranges (both images)
+    end type
+
+    !! One committed gesture, stored bidirectionally so the SAME object drives
+    !! both undo and redo (undo applies the `undo_*` side and the step moves to
+    !! the redo stack; redo applies the `redo_*` side and it moves back).  The
+    !! counter snapshots restore the in-memory high-waters the file bytes alone
+    !! do not carry.  Module-private.
+    type :: hist_step_t
+        type(path_delta_t), allocatable :: deltas(:)  !! Per-file before/after images
+        type(tbl_snap_t),   allocatable :: before(:)  !! Counters before the gesture
+        type(tbl_snap_t),   allocatable :: after(:)   !! Counters after the gesture
+        character(len=:), allocatable   :: label      !! Caller's gesture name (menu text)
+    end type
+
+    !! Per-database in-memory Undo/Redo history.  Opaque to callers, carried as
+    !! a component of `db_t`.  Distinct from `journal_t`: that is the one-deep,
+    !! crash-durable rollback of the in-flight transaction; this is the
+    !! multi-level, session-only history of COMMITTED gestures.  A gesture is
+    !! recorded only when `db_begin` was given a `label`; `capturing` latches
+    !! that intent until the matching `db_commit` snapshots the step.
+    type, public :: history_t
+        type(hist_step_t), allocatable :: undo(:)  !! Committed steps, newest last
+        type(hist_step_t), allocatable :: redo(:)  !! Undone steps, newest last
+        integer        :: cap        = 100        !! Max retained undo steps (oldest dropped)
+        logical        :: capturing  = .false.    !! The in-flight explicit txn is a labelled gesture
+        character(len=:), allocatable :: pending_label  !! Label stashed by db_begin until commit
+    end type
+
     !! An open database handle.  Obtain with `db_open`; release with
     !! `db_close`.  A handle is bound to one directory for its lifetime.
     type, public :: db_t
@@ -182,6 +230,7 @@ module sqr
         integer                       :: generation = 0  !! Bumped by every mutating call; cursors snapshot it
         integer(c_int64_t)            :: lock_tok = -1  !! Advisory-lock token held while open (-1 = none)
         type(journal_t)               :: jrnl  !! Rollback journal state
+        type(history_t)               :: hist  !! In-memory Undo/Redo history of committed gestures
     contains
         !! Object-oriented spelling of the `db_*` operations: `call db%insert(...)`
         !! is exactly `call db_insert(db, ...)`.  The free `db_*` procedures remain
@@ -218,6 +267,11 @@ module sqr
         procedure :: begin        => db_begin
         procedure :: commit       => db_commit
         procedure :: rollback     => db_rollback
+        procedure :: undo         => db_undo
+        procedure :: redo         => db_redo
+        procedure :: can_undo     => db_can_undo
+        procedure :: can_redo     => db_can_redo
+        procedure :: reset_history => db_reset_history
         ! Overloaded operations: generic bindings over the same specifics that
         ! back the free generic interfaces below.
         procedure, private :: create_index_1 => db_create_index_1
@@ -282,6 +336,8 @@ module sqr
     public :: db_insert_many, db_verify
     ! Explicit transaction façade (what SQL BEGIN/COMMIT/ROLLBACK maps onto).
     public :: db_begin, db_commit, db_rollback
+    ! In-memory Undo/Redo history of committed (labelled) gestures.
+    public :: db_undo, db_redo, db_can_undo, db_can_redo, db_reset_history
     ! Rollback-journal internals (durability/atomicity layer). Public only so
     ! the b_tree adapter and the mutator paths in sibling submodules can reach
     ! them — application code should use the db_begin/commit/rollback façade
@@ -889,10 +945,53 @@ module sqr
         !! also marks the in-flight txn as user-owned so the auto-commit
         !! brackets leave it open and so re-entry is detected.  No nesting in
         !! v1: a `db_begin` while a transaction is already in flight fails
-        !! `SQR_INVALID`.  Maps onto SQL `BEGIN`.
-        module subroutine db_begin(db, stat)
+        !! `SQR_INVALID`.  Maps onto SQL `BEGIN`.  When `label` is supplied the
+        !! transaction is a user GESTURE: `db_commit` records it as one
+        !! Undo/Redo step under that name (see `db_undo`).  Without `label` the
+        !! transaction commits with no history entry (the SQL path).
+        module subroutine db_begin(db, stat, label)
             class(db_t), intent(inout), target :: db  !! Database handle
             integer,    intent(out),  optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(in), optional :: label  !! Gesture name (records a history step)
+        end subroutine
+
+        !! Undo the most recent committed gesture: restore every base file and
+        !! in-memory counter to its pre-gesture state and move the step onto the
+        !! redo history.  Returns `SQR_NO_UNDO` (and an empty `label`) when the
+        !! undo history is empty, `SQR_READONLY` on a read-only handle.  `label`
+        !! returns the undone gesture's name (for menu feedback).
+        module subroutine db_undo(db, stat, label)
+            class(db_t), intent(inout) :: db  !! Database handle
+            integer,    intent(out), optional :: stat  !! `SQR_OK`, `SQR_NO_UNDO`, ...
+            character(len=:), allocatable, intent(out), optional :: label  !! Undone gesture name
+        end subroutine
+
+        !! Redo the most recently undone gesture: re-apply it and move the step
+        !! back onto the undo history.  Mirror of `db_undo`; `SQR_NO_UNDO` when
+        !! the redo history is empty.
+        module subroutine db_redo(db, stat, label)
+            class(db_t), intent(inout) :: db  !! Database handle
+            integer,    intent(out), optional :: stat  !! `SQR_OK`, `SQR_NO_UNDO`, ...
+            character(len=:), allocatable, intent(out), optional :: label  !! Redone gesture name
+        end subroutine
+
+        !! `.true.` if there is at least one gesture on the undo history.
+        pure module function db_can_undo(db) result(yes)
+            class(db_t), intent(in) :: db  !! Database handle
+            logical                 :: yes
+        end function
+
+        !! `.true.` if there is at least one gesture on the redo history.
+        pure module function db_can_redo(db) result(yes)
+            class(db_t), intent(in) :: db  !! Database handle
+            logical                 :: yes
+        end function
+
+        !! Drop the whole Undo/Redo history (both stacks).  Call when the
+        !! document identity changes (a different file is now backing the handle)
+        !! so stale steps cannot be applied to unrelated bytes.
+        module subroutine db_reset_history(db)
+            class(db_t), intent(inout) :: db  !! Database handle
         end subroutine
 
         !! Commit the explicit transaction opened by `db_begin`, keeping every

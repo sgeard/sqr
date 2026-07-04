@@ -1,4 +1,6 @@
-! sqr_journal — the rollback (undo) journal for crash-safe atomicity.
+! sqr_journal — the rollback (undo) journal for crash-safe atomicity, and the
+! in-memory Undo/Redo history built on its capture (see the history section near
+! the end of the file).
 !
 ! Descendant of `sqr_base`: it inherits `int32`/`int64`, `io_check`, `pathjoin`
 ! and the basic filesystem shims by host association, and adds the durability
@@ -49,9 +51,10 @@ contains
     ! auto-commit bracket a single mutator opens around itself, and it is what
     ! makes nesting detectable.  v1 has no nested transactions.
 
-    module subroutine db_begin(db, stat)
+    module subroutine db_begin(db, stat, label)
         class(db_t), intent(inout), target :: db
         integer,    intent(out), optional  :: stat
+        character(len=*), intent(in), optional :: label
         integer :: st
         if (present(stat)) stat = SQR_OK
         if (db%jrnl%active) then          ! no nesting in v1
@@ -64,6 +67,11 @@ contains
             return
         end if
         db%jrnl%explicit = .true.
+        ! A labelled begin is a user gesture: latch the intent so the matching
+        ! commit records one Undo/Redo step.  txn_begin has just snapshotted the
+        ! pre-gesture counters into jrnl%snaps (the step's `before` image).
+        db%hist%capturing = present(label)
+        if (present(label)) db%hist%pending_label = label
     end subroutine
 
     module subroutine db_commit(db, stat)
@@ -74,6 +82,11 @@ contains
             if (present(stat)) stat = SQR_INVALID
             return
         end if
+        ! Snapshot this gesture as one Undo step BEFORE txn_commit discards the
+        ! in-memory undo set (jrnl%recs) and counters.  A no-op gesture (no
+        ! recs) records nothing, so an empty bracket stays invisible to Undo.
+        if (db%hist%capturing) call capture_step(db)
+        db%hist%capturing = .false.
         call txn_commit(db, stat)         ! also clears the explicit latch
     end subroutine
 
@@ -845,6 +858,351 @@ contains
         write(u, pos=offset, iostat=ios) bytes
         if (ios == 0) flush(u)
         close(u)
+    end subroutine
+
+    ! ===== in-memory Undo/Redo history (built on the journal's capture) =====
+    ! A committed gesture's undo set (jrnl%recs) is exactly the inverse image an
+    ! Undo needs.  capture_step turns it (plus the post-gesture bytes read back
+    ! from the flushed files) into one bidirectional hist_step_t; db_undo/db_redo
+    ! write the chosen side's bytes and reuse the rollback path's coherence dance
+    ! (restore counters, reopen units, reload index trees) to bring the in-memory
+    ! db back into step.  Session-only: never serialised, never crash-durable.
+
+    module subroutine db_undo(db, stat, label)
+        class(db_t), intent(inout) :: db
+        integer,     intent(out), optional :: stat
+        character(len=:), allocatable, intent(out), optional :: label
+        type(hist_step_t) :: step
+        integer :: st
+        st = SQR_OK
+        if (present(label)) label = ''
+        if (db%readonly) then
+            if (present(stat)) stat = SQR_READONLY
+            return
+        end if
+        if (.not. db_can_undo(db)) then
+            if (present(stat)) stat = SQR_NO_UNDO
+            return
+        end if
+        call pop_step(db%hist%undo, step)
+        call apply_step(db, step, redo=.false., st=st)
+        call push_step(db%hist%redo, step, db%hist%cap)
+        if (present(label) .and. allocated(step%label)) label = step%label
+        if (present(stat)) stat = st
+    end subroutine
+
+    module subroutine db_redo(db, stat, label)
+        class(db_t), intent(inout) :: db
+        integer,     intent(out), optional :: stat
+        character(len=:), allocatable, intent(out), optional :: label
+        type(hist_step_t) :: step
+        integer :: st
+        st = SQR_OK
+        if (present(label)) label = ''
+        if (db%readonly) then
+            if (present(stat)) stat = SQR_READONLY
+            return
+        end if
+        if (.not. db_can_redo(db)) then
+            if (present(stat)) stat = SQR_NO_UNDO
+            return
+        end if
+        call pop_step(db%hist%redo, step)
+        call apply_step(db, step, redo=.true., st=st)
+        call push_step(db%hist%undo, step, db%hist%cap)
+        if (present(label) .and. allocated(step%label)) label = step%label
+        if (present(stat)) stat = st
+    end subroutine
+
+    pure module function db_can_undo(db) result(yes)
+        class(db_t), intent(in) :: db
+        logical :: yes
+        yes = allocated(db%hist%undo)
+        if (yes) yes = size(db%hist%undo) > 0
+    end function
+
+    pure module function db_can_redo(db) result(yes)
+        class(db_t), intent(in) :: db
+        logical :: yes
+        yes = allocated(db%hist%redo)
+        if (yes) yes = size(db%hist%redo) > 0
+    end function
+
+    module subroutine db_reset_history(db)
+        class(db_t), intent(inout) :: db
+        if (allocated(db%hist%undo)) deallocate(db%hist%undo)
+        if (allocated(db%hist%redo)) deallocate(db%hist%redo)
+        if (allocated(db%hist%pending_label)) deallocate(db%hist%pending_label)
+        db%hist%capturing = .false.
+    end subroutine
+
+    ! Snapshot the committed gesture as one bidirectional history step and push
+    ! it onto the undo stack (clearing the redo stack — a new gesture forks the
+    ! timeline).  Must run BEFORE txn_commit discards jrnl%recs/snaps.  Reads the
+    ! post-gesture ("redo") bytes from disk, so flush every base unit AND sync
+    ! the index trees first (fsync_base_files does the tree sync at commit, but
+    ! that is after this point).
+    subroutine capture_step(db)
+        class(db_t), intent(inout) :: db
+        type(hist_step_t) :: step
+        integer :: ti, j, bs
+        if (db%jrnl%nrec == 0) return          ! a gesture that changed nothing
+        call flush_base_files(db)
+        do ti = 1, db%ntables
+            associate (t => db%tables(ti))
+                do j = 1, t%nindices
+                    if (idx_live(t%indices(j))) call bt_sync(t%indices(j)%bt, bs)
+                end do
+            end associate
+        end do
+        call build_deltas(db, step%deltas)
+        if (allocated(db%jrnl%snaps)) step%before = db%jrnl%snaps
+        step%after = snapshot_now(db)
+        if (allocated(db%hist%pending_label)) then
+            step%label = db%hist%pending_label
+        else
+            step%label = ''
+        end if
+        if (allocated(db%hist%redo)) deallocate(db%hist%redo)
+        call push_step(db%hist%undo, step, db%hist%cap)
+    end subroutine
+
+    ! Group the undo set by base file into per-path deltas, each holding both the
+    ! pre-gesture (undo) and post-gesture (redo) image.  An EXTEND record fixes a
+    ! path's pre-gesture length (the single growth point); REGION records give
+    ! the pre-image of each in-place overwrite.  finish_delta fills the post
+    ! images and the grown tail from the (now flushed) files.
+    subroutine build_deltas(db, deltas)
+        class(db_t),                     intent(in)  :: db
+        type(path_delta_t), allocatable, intent(out) :: deltas(:)
+        integer :: i, di
+        allocate(deltas(0))
+        do i = 1, db%jrnl%nrec
+            associate (r => db%jrnl%recs(i))
+                di = find_delta(deltas, r%path)
+                if (di == 0) di = add_delta(deltas, r%path)
+                select case (r%kind)
+                case (UNDO_EXTEND)
+                    deltas(di)%undo_len = r%orig_len   ! length before the growth
+                case (UNDO_REGION)
+                    call add_region(deltas(di), r%offset, r%bytes)
+                end select
+            end associate
+        end do
+        do di = 1, size(deltas)
+            call finish_delta(db, deltas(di))
+        end do
+    end subroutine
+
+    ! Complete one delta: read the current length and the post-gesture image of
+    ! every in-place range, then capture the grown tail (bytes that did not exist
+    ! before the gesture; undo truncates them away, redo re-appends them).
+    subroutine finish_delta(db, d)
+        class(db_t),        intent(in)    :: db
+        type(path_delta_t), intent(inout) :: d
+        character(len=:), allocatable :: full
+        integer :: k, ios
+        full = pathjoin(db%dir, d%path)
+        d%redo_len = file_len(full)
+        if (d%undo_len < 0) d%undo_len = d%redo_len      ! no growth this gesture
+        do k = 1, size(d%ranges)
+            call read_region(full, d%ranges(k)%offset, &
+                 int(len(d%ranges(k)%undo_bytes), int64), d%ranges(k)%redo_bytes, ios)
+            call io_check(ios)
+        end do
+        if (d%redo_len > d%undo_len) then
+            call add_region(d, d%undo_len + 1, '')       ! pure tail: empty pre-image
+            k = size(d%ranges)
+            call read_region(full, d%undo_len + 1, d%redo_len - d%undo_len, &
+                 d%ranges(k)%redo_bytes, ios)
+            call io_check(ios)
+        end if
+    end subroutine
+
+    ! Write one history step's bytes in the chosen direction, then restore the
+    ! matching counters and resync the open units + index trees from the bytes
+    ! just written — the same coherence sequence apply_rollback runs, but driven
+    ! by a stored step rather than the live undo set, and with no active txn.
+    subroutine apply_step(db, step, redo, st)
+        class(db_t),       intent(inout) :: db
+        type(hist_step_t), intent(in)    :: step
+        logical,           intent(in)    :: redo
+        integer,           intent(inout) :: st
+        character(len=:), allocatable :: full, img
+        integer :: di, k, ios
+        call flush_base_files(db)
+        do di = 1, size(step%deltas)
+            associate (d => step%deltas(di))
+                full = pathjoin(db%dir, d%path)
+                do k = 1, size(d%ranges)
+                    if (redo) then
+                        img = d%ranges(k)%redo_bytes
+                    else
+                        img = d%ranges(k)%undo_bytes
+                    end if
+                    if (len(img) > 0) then
+                        call write_region(full, d%ranges(k)%offset, img, ios)
+                        call io_check(ios)
+                        if (ios /= 0) st = SQR_ERR
+                    end if
+                end do
+                ! Undo shrinks a grown file back to its pre-gesture length; redo's
+                ! tail write has already grown it, so no truncate is needed there.
+                if (.not. redo .and. d%redo_len > d%undo_len) then
+                    ios = c_truncate(full, d%undo_len)
+                    call io_check(ios)
+                    if (ios /= 0) st = SQR_ERR
+                end if
+            end associate
+        end do
+        if (redo) then
+            call restore_counters_from(db, step%after)
+        else
+            call restore_counters_from(db, step%before)
+        end if
+        call resync_base_files(db, st)
+        call resync_index_trees(db, st)
+        db%generation = db%generation + 1      ! invalidate any open cursors
+    end subroutine
+
+    ! Reopen every live index tree from its (just-restored) file — the index
+    ! analogue of resync_base_files.  bt_reload alone is not enough here: unlike
+    ! a rollback, a history apply is followed by reads (the app re-broadcasts the
+    ! model), so the tree's open unit may hold a stale read-buffer of a page we
+    ! have since overwritten through a different unit, and on a redo the file may
+    ! have GROWN past that unit's cached end-of-file.  A clean close + reopen
+    ! discards both.  The unit carries only pending reads since the gesture
+    ! committed (its writes were flushed then), so a raw close flushes nothing
+    ! back; the on-disk bytes — meta page included — are already authoritative.
+    subroutine resync_index_trees(db, stat)
+        class(db_t), intent(inout) :: db
+        integer,     intent(inout) :: stat
+        integer :: ti, j, st
+        do ti = 1, db%ntables
+            associate (t => db%tables(ti))
+                do j = 1, t%nindices
+                    if (.not. idx_live(t%indices(j))) cycle
+                    if (t%indices(j)%bt%unit /= -1) then
+                        close(t%indices(j)%bt%unit)
+                        t%indices(j)%bt%unit = -1
+                    end if
+                    call open_index(db, t, t%indices(j), j, 'old', st)
+                    if (st /= SQR_OK .and. stat == SQR_OK) stat = st
+                end do
+            end associate
+        end do
+    end subroutine
+
+    ! Snapshot every table's current in-memory counters (the post-gesture image).
+    function snapshot_now(db) result(snaps)
+        class(db_t), intent(in) :: db
+        type(tbl_snap_t), allocatable :: snaps(:)
+        integer :: ti
+        allocate(snaps(db%ntables))
+        do ti = 1, db%ntables
+            associate (t => db%tables(ti))
+                snaps(ti)%next_id    = t%next_id
+                snaps(ti)%live_count = t%live_count
+                snaps(ti)%blob_next  = t%blob_next
+            end associate
+        end do
+    end function
+
+    ! Restore each table's counters from a stored snapshot (history analogue of
+    ! restore_counters, which reads the live txn snapshot instead).
+    subroutine restore_counters_from(db, snaps)
+        class(db_t),      intent(inout) :: db
+        type(tbl_snap_t), intent(in)    :: snaps(:)
+        integer :: ti
+        do ti = 1, min(db%ntables, size(snaps))
+            associate (t => db%tables(ti))
+                t%next_id    = snaps(ti)%next_id
+                t%live_count = snaps(ti)%live_count
+                t%blob_next  = snaps(ti)%blob_next
+            end associate
+        end do
+    end subroutine
+
+    ! ---- history stack + delta helpers ----
+
+    ! Push a step, retaining at most `cap` newest (oldest dropped at the front).
+    subroutine push_step(stack, step, cap)
+        type(hist_step_t), allocatable, intent(inout) :: stack(:)
+        type(hist_step_t),              intent(in)    :: step
+        integer,                        intent(in)    :: cap
+        type(hist_step_t), allocatable :: tmp(:)
+        integer :: n, keep, lo
+        n = 0
+        if (allocated(stack)) n = size(stack)
+        keep = min(n + 1, max(cap, 1))
+        allocate(tmp(keep))
+        lo = n - keep + 2                       ! first carried-over old element
+        if (keep > 1) tmp(1:keep-1) = stack(lo:n)
+        tmp(keep) = step
+        call move_alloc(tmp, stack)
+    end subroutine
+
+    ! Pop the newest (top) step off a non-empty stack.
+    subroutine pop_step(stack, step)
+        type(hist_step_t), allocatable, intent(inout) :: stack(:)
+        type(hist_step_t),              intent(out)   :: step
+        type(hist_step_t), allocatable :: tmp(:)
+        integer :: n
+        n = size(stack)
+        step = stack(n)
+        if (n > 1) then
+            allocate(tmp(n-1))
+            tmp(1:n-1) = stack(1:n-1)
+            call move_alloc(tmp, stack)
+        else
+            deallocate(stack)
+        end if
+    end subroutine
+
+    ! Index of the delta for `path`, or 0 if none yet.
+    integer function find_delta(deltas, path) result(di)
+        type(path_delta_t), intent(in) :: deltas(:)
+        character(len=*),   intent(in) :: path
+        integer :: i
+        di = 0
+        do i = 1, size(deltas)
+            if (deltas(i)%path == path) then
+                di = i
+                return
+            end if
+        end do
+    end function
+
+    ! Append a fresh delta for `path` (undo_len = -1: no growth seen yet).
+    integer function add_delta(deltas, path) result(di)
+        type(path_delta_t), allocatable, intent(inout) :: deltas(:)
+        character(len=*),                intent(in)    :: path
+        type(path_delta_t), allocatable :: tmp(:)
+        integer :: n
+        n = size(deltas)
+        allocate(tmp(n+1))
+        if (n > 0) tmp(1:n) = deltas(1:n)
+        tmp(n+1)%path     = path
+        tmp(n+1)%undo_len = -1_int64
+        allocate(tmp(n+1)%ranges(0))
+        call move_alloc(tmp, deltas)
+        di = n + 1
+    end function
+
+    ! Append one changed range (redo image filled later by finish_delta).
+    subroutine add_region(d, offset, bytes)
+        type(path_delta_t), intent(inout) :: d
+        integer(int64),     intent(in)    :: offset
+        character(len=*),   intent(in)    :: bytes
+        type(byterange_t), allocatable :: tmp(:)
+        integer :: n
+        n = size(d%ranges)
+        allocate(tmp(n+1))
+        if (n > 0) tmp(1:n) = d%ranges(1:n)
+        tmp(n+1)%offset     = offset
+        tmp(n+1)%undo_bytes = bytes
+        tmp(n+1)%redo_bytes = ''
+        call move_alloc(tmp, d%ranges)
     end subroutine
 
 end submodule sqr_journal
