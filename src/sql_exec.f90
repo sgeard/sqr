@@ -532,6 +532,13 @@ contains
         associate (col => db%tables(ti)%cols(ci))
             select case (col%dtype)
             case (DT_INT)
+                ! cond_true compares in real64 space, so a REAL literal can match
+                ! an INT column (WHERE i = 3.0). The index band is keyed on the
+                ! stored int32, and c%lit%ival is 0 for a REAL literal — driving it
+                ! would silently miss. Only an INT literal maps to an exact int key;
+                ! otherwise fall back to the scan (which handles the cross-type
+                ! compare correctly and identically).
+                if (c%lit%ltype /= LIT_INT) return
                 call db_find_range(db, trim(stmt%table), trim(c%col), &
                     c%lit%ival, c%lit%ival, cur, frs)
             case (DT_REAL)

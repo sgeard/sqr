@@ -31,6 +31,7 @@ program utest_sql
     call test_text_column()
     call test_update_delete()
     call test_index_scan_parity()
+    call test_index_scan_parity_sweep()
     call test_transactions()
     call test_exec_errors()
     call test_functional_example()
@@ -446,6 +447,73 @@ contains
         call check(same, 'parity: scan and index results identical')
 
         call db_close(db)
+    end subroutine
+
+    ! Build a table, populate it, run `qry` as a scan, then again with an index
+    ! on `idxcol`, and assert both plans return the same row count (and that the
+    ! scan count is the expected one).  The invariant under test: creating an
+    ! index must never change a query's result.  Covers the literal-type ×
+    ! column-type × trailing-blank matrix that the INT-on-INT test above misses.
+    subroutine parity_probe(tag, ddl, ins, idxcol, qry, expect)
+        character(len=*), intent(in) :: tag, ddl, ins, idxcol, qry
+        integer,          intent(in) :: expect
+        type(db_t) :: db
+        type(sql_result_t) :: res
+        integer :: rs, nscan
+
+        call fresh_db(db)
+        call run(db, ddl, res, rs)
+        call check(rs == SQR_OK, tag // ': table created')
+        call run(db, ins, res, rs)
+        call check(rs == SQR_OK, tag // ': rows inserted')
+
+        call run(db, qry, res, rs)
+        nscan = res%nrows
+        call check(rs == SQR_OK .and. nscan == expect, tag // ': scan count as expected')
+
+        call run(db, "CREATE INDEX ON " // trim(idxcol), res, rs)
+        call check(rs == SQR_OK, tag // ': index created')
+        call run(db, qry, res, rs)
+        call check(rs == SQR_OK .and. res%nrows == nscan, tag // ': index result == scan result')
+
+        call db_close(db)
+    end subroutine
+
+    ! The parity sweep proper: each case is a distinct planner divergence that a
+    ! plain INT-on-INT parity check would not surface.
+    subroutine test_index_scan_parity_sweep()
+        ! --- INT column, literal type varied (H4 divergence 1) ---
+        call parity_probe('sweep int/int', &
+            "CREATE TABLE t (i INTEGER)", "INSERT INTO t VALUES (1),(3),(3),(5)", &
+            't (i)', "SELECT i FROM t WHERE i = 3", 2)
+        call parity_probe('sweep int/real-integral', &
+            "CREATE TABLE t (i INTEGER)", "INSERT INTO t VALUES (1),(3),(3),(5)", &
+            't (i)', "SELECT i FROM t WHERE i = 3.0", 2)
+        call parity_probe('sweep int/real-fractional', &
+            "CREATE TABLE t (i INTEGER)", "INSERT INTO t VALUES (1),(3),(3),(5)", &
+            't (i)', "SELECT i FROM t WHERE i = 3.5", 0)
+
+        ! --- REAL column, literal type varied (already parity-safe; guard it) ---
+        call parity_probe('sweep real/int', &
+            "CREATE TABLE t (r REAL)", "INSERT INTO t VALUES (1.0),(3.0),(3.0),(5.0)", &
+            't (r)', "SELECT r FROM t WHERE r = 3", 2)
+        call parity_probe('sweep real/real', &
+            "CREATE TABLE t (r REAL)", "INSERT INTO t VALUES (1.0),(3.0),(3.0),(5.0)", &
+            't (r)', "SELECT r FROM t WHERE r = 3.0", 2)
+
+        ! --- CHAR column, trailing blanks in store and/or query (H4 divergence 2) ---
+        call parity_probe('sweep char plain', &
+            "CREATE TABLE t (c CHAR(8))", "INSERT INTO t VALUES ('a'),('b'),('a')", &
+            't (c)', "SELECT c FROM t WHERE c = 'a'", 2)
+        call parity_probe('sweep char query-blank', &
+            "CREATE TABLE t (c CHAR(8))", "INSERT INTO t VALUES ('a'),('b'),('a')", &
+            't (c)', "SELECT c FROM t WHERE c = 'a  '", 2)
+        call parity_probe('sweep char store-blank', &
+            "CREATE TABLE t (c CHAR(8))", "INSERT INTO t VALUES ('b  '),('x'),('b ')", &
+            't (c)', "SELECT c FROM t WHERE c = 'b'", 2)
+        call parity_probe('sweep char store+query-blank', &
+            "CREATE TABLE t (c CHAR(8))", "INSERT INTO t VALUES ('b  '),('x'),('b ')", &
+            't (c)', "SELECT c FROM t WHERE c = 'b '", 2)
     end subroutine
 
     ! ===================== transactions =====================

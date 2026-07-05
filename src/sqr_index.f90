@@ -310,10 +310,10 @@ contains
             if (present(stat)) stat = SQR_NOT_FOUND
             return
         end if
-        nc = min(ks, len(key))
+        nc = min(ks, len_trim(key))     ! trailing blanks insignificant: match the canonical key
         allocate(character(len=ks) :: kbuf)
         kbuf              = repeat(char(0), ks)
-        kbuf(1:nc) = key(1:nc)
+        if (nc > 0) kbuf(1:nc) = key(1:nc)
         call index_find(db, ti, j, kbuf, row_id, rs)
         if (present(stat)) stat = rs
     end subroutine
@@ -560,8 +560,13 @@ contains
             allocate(character(len=lw) :: lb, hb)
             lb = repeat(char(0), lw)
             hb = repeat(char(0), lw)
-            lb(1:min(lw, len(lo))) = lo(1:min(lw, len(lo)))
-            hb(1:min(lw, len(hi))) = hi(1:min(lw, len(hi)))
+            ! Trim trailing blanks from the bounds: they are insignificant padding
+            ! (see the len_trim reject above) and the stored keys are canonicalised
+            ! blank-free by extract_key, so a blank-padded bound would miss them.
+            associate (nlo => min(lw, len_trim(lo)), nhi => min(lw, len_trim(hi)))
+                if (nlo > 0) lb(1:nlo) = lo(1:nlo)
+                if (nhi > 0) hb(1:nhi) = hi(1:nhi)
+            end associate
             call build_leading_bounds(t, ix, lb, hb, lk, hk)
         end associate
         call open_range(db, ti, j, lk, hk, cur, rs)

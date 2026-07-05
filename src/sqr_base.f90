@@ -1147,11 +1147,31 @@ contains
         type(index_t),    intent(in)  :: ix
         character(len=*), intent(in)  :: rowbuf
         character(len=*), intent(out) :: key
-        integer :: m
+        integer :: m, k, vlen
         members: do m = 1, ix%ncols
             associate (c => t%cols(ix%col_idx(m)))
-                key(ix%key_off(m) : ix%key_off(m) + c%csize - 1) = &
-                    rowbuf(c%offset : c%offset + c%csize - 1)
+                if (c%dtype == DT_CHAR) then
+                    ! Canonicalise trailing blanks out of the key. The stored
+                    ! member is NUL-padded (row_set_char); its value runs to the
+                    ! first NUL. Every value comparison in the store trims trailing
+                    ! blanks (cond_true, db_find_by/range_char), so 'a', 'a ' and
+                    ! 'a  ' must yield one identical key — trim, then NUL-pad. Keeps
+                    ! the index and the scan in agreement on CHAR identity.
+                    associate (mb => rowbuf(c%offset : c%offset + c%csize - 1))
+                        k = scan(mb, char(0))
+                        if (k == 0) then
+                            vlen = len_trim(mb)
+                        else
+                            vlen = len_trim(mb(1:k-1))
+                        end if
+                    end associate
+                    key(ix%key_off(m) : ix%key_off(m) + c%csize - 1) = repeat(char(0), c%csize)
+                    if (vlen > 0) key(ix%key_off(m) : ix%key_off(m) + vlen - 1) = &
+                        rowbuf(c%offset : c%offset + vlen - 1)
+                else
+                    key(ix%key_off(m) : ix%key_off(m) + c%csize - 1) = &
+                        rowbuf(c%offset : c%offset + c%csize - 1)
+                end if
             end associate
         end do members
     end subroutine
