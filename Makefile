@@ -45,7 +45,7 @@ LFLAGS := $(F_LOPTS)
 # cmdgraph + dlist are vendored from github.com/sgeard/cmdgraph (fortran/src) so
 # the shell builds out-of-the-box with no sibling checkout; they go into libsqr.a
 # alongside the engine (the linker pulls cmdgraph objects only into sqrsh).
-LIB_SRC := clib_wrap.f90 clib_wrap_sm.f90 b_tree.f90 b_tree_sm.f90 sqr_fault.f90 sqr.f90 sqr_base.f90 sqr_table.f90 sqr_record.f90 sqr_index.f90 sqr_admin.f90 sqr_rowbuf.f90 sqr_journal.f90 sql.f90 sql_base.f90 sql_parse.f90 sql_exec.f90 dlist.f90 dlist_sm.f90 cmdgraph.f90 cmdgraph_sm.f90
+LIB_SRC := clib_wrap.f90 clib_wrap_sm.f90 b_tree.f90 b_tree_sm.f90 sqr_fault.f90 sqr.f90 sqr_base.f90 sqr_table.f90 sqr_record.f90 sqr_index.f90 sqr_admin.f90 sqr_rowbuf.f90 sqr_journal.f90 sqr_pack.f90 sql.f90 sql_base.f90 sql_parse.f90 sql_exec.f90 dlist.f90 dlist_sm.f90 cmdgraph.f90 cmdgraph_sm.f90
 
 # Selected fault submodule: off -> $(SRC_DIR) (production, fpm-shared);
 # on -> $(FAULT_DIR) (Make-only coverage/faulttest, never seen by fpm).
@@ -154,6 +154,9 @@ $(ODIR)/sqr_rowbuf.o: $(SRC_DIR)/sqr_rowbuf.f90 $(ODIR)/sqr.mod $(ODIR)/sqr_base
 	$(F) -c $(F_OPTS) -o $@ $<
 
 $(ODIR)/sqr_journal.o: $(SRC_DIR)/sqr_journal.f90 $(ODIR)/sqr.mod $(ODIR)/clib_wrap.mod $(ODIR)/sqr_base.o | $(ODIR)
+	$(F) -c $(F_OPTS) -o $@ $<
+
+$(ODIR)/sqr_pack.o: $(SRC_DIR)/sqr_pack.f90 $(ODIR)/sqr.mod $(ODIR)/clib_wrap.mod $(ODIR)/sqr_base.o | $(ODIR)
 	$(F) -c $(F_OPTS) -o $@ $<
 
 # --- SQL front-end layer (lexer/parser/executor; depends on sqr, not vice

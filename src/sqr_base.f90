@@ -204,6 +204,21 @@ contains
         p = pathjoin(db%dir, trim(name) // '.compacting')
     end function
 
+    ! Order-sensitive rolling checksum over a byte image, folded into a
+    ! non-negative int32. Used by the journal (torn-payload detection) and the
+    ! pack/unpack codec (truncated-container detection); one definition here so
+    ! both submodules share it by host association.
+    pure integer function checksum(buf) result(c)
+        character(len=*), intent(in) :: buf
+        integer(int64) :: acc
+        integer        :: i
+        acc = 0_int64
+        do i = 1, len(buf)
+            acc = mod(acc * 31_int64 + iachar(buf(i:i)), 2147483647_int64)
+        end do
+        c = int(acc)
+    end function
+
     ! The blob file name relative to the db directory — the form the journal
     ! records (it joins db%dir itself).  blob_path() prepends db%dir for opens.
     pure function blob_relpath(name) result(rel)

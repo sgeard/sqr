@@ -325,6 +325,7 @@ module sqr
     ! --- Public API ---
     public :: db_open, db_close, db_set_readonly
     public :: db_create_table, db_drop_table, db_compact
+    public :: db_pack, db_unpack
     public :: db_add_column, db_drop_column
     public :: db_list_tables, db_table_index, idx_live
     public :: db_insert, db_get, db_update, db_delete, db_scan
@@ -488,6 +489,35 @@ module sqr
         module subroutine db_compact(db, table_name, stat)
             class(db_t),       intent(inout)         :: db  !! Database handle
             character(len=*), intent(in)            :: table_name  !! Table to compact
+            integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+        end subroutine
+
+        !! Pack a database directory into a single-file `.sqr` container (a
+        !! trivial pure-Fortran archive: header + table-of-contents + raw file
+        !! bytes, with a whole-payload checksum).  A consistent snapshot: opens
+        !! the database read-only (shared lock, refuses a hot journal), skips
+        !! the advisory `_lock` and the transient `_journal.dat`, and writes the
+        !! container atomically (temp + rename + fsync).  Overwrites `file`.
+        !! Fails with `SQR_NOT_FOUND` (no such database), `SQR_READONLY` (needs
+        !! recovery — reopen read-write first), `SQR_LOCKED`, or `SQR_ERR` (I/O).
+        module subroutine db_pack(dir, file, stat)
+            character(len=*), intent(in)            :: dir   !! Database directory to pack
+            character(len=*), intent(in)            :: file  !! Container file to write
+            integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+        end subroutine
+
+        !! Unpack a `.sqr` container written by [[db_pack]] into a new database
+        !! directory.  Refuses to overwrite an existing `dir` (`SQR_DUP`, as
+        !! Save-As).  Verifies the checksum before writing anything (a truncated
+        !! transfer is `SQR_ERR`) and validates every archived name against path
+        !! traversal, then extracts into a temporary directory and renames it
+        !! into place so a failure leaves no partial database.  Fails with
+        !! `SQR_ERR` (bad magic/truncated/I-O), `SQR_VERSION` (newer format or
+        !! wrong byte order), `SQR_INVALID` (a malformed archived name), or
+        !! `SQR_DUP` (`dir` already exists).
+        module subroutine db_unpack(file, dir, stat)
+            character(len=*), intent(in)            :: file  !! Container file to read
+            character(len=*), intent(in)            :: dir   !! New database directory to create
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
         end subroutine
 

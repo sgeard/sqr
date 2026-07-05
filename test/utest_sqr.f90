@@ -1,7 +1,7 @@
 program utest_sqr
     use, intrinsic :: iso_fortran_env, only: int8, int32, int64, real64
     use sqr
-    use clib_wrap, only: c_rename, c_remove, c_mkdir, c_rmtree,             &
+    use clib_wrap, only: c_rename, c_remove, c_mkdir, c_rmtree, c_path_exists, &
                          c_fsync_path, c_fsync_dir, c_truncate, c_lock_release
     implicit none
 
@@ -51,6 +51,7 @@ program utest_sqr
     call test_compact_recovery()
     call test_deep_tree()
     call test_torn_journal()
+    call test_pack()
     call test_natural_keys()
     call test_null_columns()
     call test_leading_column()
@@ -2432,6 +2433,100 @@ contains
         call db_close(db)
 
         ios = c_rmtree(JDIR)
+    end subroutine
+
+    ! Step 7: pack a database directory into a single .sqr container and unpack
+    ! it back. Round-trip (open + verify + query match), plus the guards:
+    ! overwrite refusal, truncated-container rejection, hot-journal refusal, and
+    ! path-traversal rejection of a crafted archive name.
+    subroutine test_pack()
+        character(len=*), parameter :: PDIR  = 'utest_sqr_pack_db'
+        character(len=*), parameter :: PDIR2 = 'utest_sqr_pack_db2'
+        character(len=*), parameter :: EVIL  = 'utest_sqr_pack_evil'
+        character(len=*), parameter :: PFILE = 'utest_sqr_pack.sqr'
+        type(db_t) :: db
+        type(column_t) :: c(3)
+        integer :: rs, ios, ti, u, k
+        integer(int32) :: rid
+        integer(int64) :: fsz
+        character(len=:), allocatable :: buf, txt
+        character(len=16) :: body
+        character(len=128) :: emsg
+        logical :: ex
+
+        ios = c_rmtree(PDIR); ios = c_rmtree(PDIR2); ios = c_rmtree(EVIL)
+        ios = c_remove(PFILE)
+        c(1)%name = 'id'  ; c(1)%dtype = DT_INT  ; c(1)%csize = 4
+        c(2)%name = 'tag' ; c(2)%dtype = DT_CHAR ; c(2)%csize = 4
+        c(3)%name = 'body'; c(3)%dtype = DT_TEXT ; c(3)%csize = SQR_TEXT_DESC
+        call db_open(db, PDIR, rs, emsg)
+        call db_create_table(db, 'items', c, rs, emsg)
+        ti = db_table_index(db, 'items')
+        do k = 1, 3
+            call row_alloc(buf, db%tables(ti)%record_size)
+            call row_set_int (buf, db%tables(ti)%cols(1), int(10*k, int32))
+            write(body, '(a1,i1)') 't', k
+            call row_set_char(buf, db%tables(ti)%cols(2), trim(body))
+            call db_insert(db, 'items', buf, rid, rs)
+            write(body, '(a5,i1)') 'body-', k
+            call db_set_text(db, 'items', rid, 'body', trim(body), rs)
+        end do
+        call db_create_index(db, 'items', 'id', rs)
+        call db_close(db)
+
+        ! Round-trip.
+        call db_pack(PDIR, PFILE, rs)
+        call check(rs == SQR_OK, 'pack: db_pack succeeds')
+        inquire(file=PFILE, exist=ex)
+        call check(ex, 'pack: container file created')
+        call db_unpack(PFILE, PDIR2, rs)
+        call check(rs == SQR_OK, 'pack: db_unpack succeeds')
+
+        call db_open(db, PDIR2, rs, emsg)
+        call check(rs == SQR_OK, 'pack: unpacked db opens')
+        ti = db_table_index(db, 'items')
+        call check(db%tables(ti)%live_count == 3, 'pack: row count preserved')
+        call db_find_by_int(db, 'items', 'id', 20_int32, rid, rs)
+        call check(rs == SQR_OK .and. rid == 2, 'pack: index resolves in unpacked db')
+        call db_get_text(db, 'items', 2_int32, 'body', txt, rs)
+        call check(rs == SQR_OK .and. txt == 'body-2', 'pack: TEXT/blob preserved')
+        call db_verify(db, 'items', rs, emsg)
+        call check(rs == SQR_OK, 'pack: db_verify clean on unpacked db')
+        call db_close(db)
+
+        ! Unpack refuses to overwrite an existing directory.
+        call db_unpack(PFILE, PDIR2, rs)
+        call check(rs == SQR_DUP, 'pack: unpack refuses existing dir')
+
+        ! Truncated container rejected; no directory left behind.
+        ios = c_rmtree(PDIR2)
+        inquire(file=PFILE, size=fsz)
+        ios = c_truncate(PFILE, fsz - 8_int64)
+        call db_unpack(PFILE, PDIR2, rs)
+        call check(rs == SQR_ERR, 'pack: truncated container rejected')
+        call check(.not. c_path_exists(PDIR2), 'pack: no dir left after a failed unpack')
+
+        ! Hot journal refused by pack (a consistent snapshot only).
+        call write_hot_journal(PDIR // '/_journal.dat', 1, 0, '')
+        call db_pack(PDIR, 'utest_sqr_pack_hot.sqr', rs)
+        call check(rs == SQR_READONLY, 'pack: hot journal refused')
+        ios = c_remove(PDIR // '/_journal.dat')
+        ios = c_remove('utest_sqr_pack_hot.sqr')
+
+        ! A crafted container whose archived name escapes the directory is
+        ! rejected before any file is written.
+        open(newunit=u, file='utest_sqr_pack_evil.sqr', access='stream', &
+             form='unformatted', status='replace', action='write', iostat=ios)
+        write(u) 'SQRP', 1_int32, SQR_BOM, 1_int32, 0_int32
+        write(u) 7_int32, '../evil', 1_int64, 0_int64
+        write(u) 'x'
+        close(u)
+        call db_unpack('utest_sqr_pack_evil.sqr', EVIL, rs)
+        call check(rs == SQR_INVALID, 'pack: path-traversal archive name rejected')
+        call check(.not. c_path_exists(EVIL), 'pack: nothing written for a malicious archive')
+
+        ios = c_rmtree(PDIR); ios = c_rmtree(PDIR2); ios = c_rmtree(EVIL)
+        ios = c_remove(PFILE); ios = c_remove('utest_sqr_pack_evil.sqr')
     end subroutine
 
     ! Set sku/region/qty into a freshly-cleared row buffer.

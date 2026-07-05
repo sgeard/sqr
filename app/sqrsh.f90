@@ -157,6 +157,50 @@ contains
         write(*,'(a)') 'closed'
     end function
 
+    function act_pack(args, ctx) result(rv)
+        type(dlist_t),    intent(in) :: args
+        character(len=*), intent(in) :: ctx
+        type(action_result_t) :: rv
+        class(dlist_node_data_t), allocatable :: n
+        character(len=:), allocatable :: dir, file
+        integer :: rs
+        if (args%size() /= 2) then
+            write(*,'(a)') 'usage: pack <dir> <file>'
+            return
+        end if
+        n = args%get(1); dir  = node_as_char(n)
+        n = args%get(2); file = node_as_char(n)
+        call db_pack(dir, file, rs)
+        if (rs /= SQR_OK) then
+            write(*,'(3a,i0)') 'pack of "', dir, '" failed: ', rs
+            rv%errored = .true.
+            return
+        end if
+        write(*,'(4a)') 'packed ', dir, ' -> ', file
+    end function
+
+    function act_unpack(args, ctx) result(rv)
+        type(dlist_t),    intent(in) :: args
+        character(len=*), intent(in) :: ctx
+        type(action_result_t) :: rv
+        class(dlist_node_data_t), allocatable :: n
+        character(len=:), allocatable :: file, dir
+        integer :: rs
+        if (args%size() /= 2) then
+            write(*,'(a)') 'usage: unpack <file> <dir>'
+            return
+        end if
+        n = args%get(1); file = node_as_char(n)
+        n = args%get(2); dir  = node_as_char(n)
+        call db_unpack(file, dir, rs)
+        if (rs /= SQR_OK) then
+            write(*,'(3a,i0)') 'unpack of "', file, '" failed: ', rs
+            rv%errored = .true.
+            return
+        end if
+        write(*,'(4a)') 'unpacked ', file, ' -> ', dir
+    end function
+
     function act_readonly(args, ctx) result(rv)
         type(dlist_t),    intent(in) :: args
         character(len=*), intent(in) :: ctx
@@ -1153,6 +1197,8 @@ program sqrsh
     call ui%add_command("root", "u(se)",    EDGE_DO_GOTO, target="table",   proc=act_use, &
                         help="use <table> — operate on a table")
     call ui%add_command("root", "dr(op)",   EDGE_ACTION, proc=act_drop,   help="drop <table>")
+    call ui%add_command("root", "pack",     EDGE_ACTION, proc=act_pack,   help="pack <dir> <file>")
+    call ui%add_command("root", "unpack",   EDGE_ACTION, proc=act_unpack, help="unpack <file> <dir>")
     call ui%add_command("root", "q(uit)",   EDGE_QUIT,                    help="exit")
 
     ! creator state — defining a new table's columns

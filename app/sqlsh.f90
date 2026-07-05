@@ -136,6 +136,10 @@ contains
             call meta_tables()
         case ('.schema')
             call meta_schema(rest)
+        case ('.pack')
+            call meta_pack(rest)
+        case ('.unpack')
+            call meta_unpack(rest)
         case default
             write(error_unit,'(2a)') 'unknown command: ', trim(cmd)
         end select
@@ -147,6 +151,8 @@ contains
         write(error_unit,'(a)') '  .close          close the current database'
         write(error_unit,'(a)') '  .tables         list tables (rows, columns)'
         write(error_unit,'(a)') '  .schema [table] show column/index definitions'
+        write(error_unit,'(a)') '  .pack <dir> <file>   archive a database dir into one .sqr file'
+        write(error_unit,'(a)') '  .unpack <file> <dir> restore a .sqr file into a new database dir'
         write(error_unit,'(a)') '  .help           this help'
         write(error_unit,'(a)') '  .quit           exit'
         write(error_unit,'(a)') 'Anything else is run as SQL (SELECT/INSERT/UPDATE/DELETE/CREATE/DROP/ALTER/BEGIN/COMMIT/ROLLBACK).'
@@ -243,6 +249,59 @@ contains
         case default;   s = '?'
         end select
     end function
+
+    subroutine meta_pack(args)
+        character(len=*), intent(in) :: args
+        character(len=:), allocatable :: dir, file
+        integer :: rs
+        call two_args(args, dir, file)
+        if (len_trim(file) == 0) then
+            write(error_unit,'(a)') 'usage: .pack <dir> <file>'
+            return
+        end if
+        call db_pack(dir, file, rs)
+        if (rs /= SQR_OK) then
+            write(error_unit,'(3a,i0)') 'pack of "', trim(dir), '" failed: ', rs
+        else if (interactive) then
+            write(error_unit,'(4a)') 'packed ', trim(dir), ' -> ', trim(file)
+        end if
+    end subroutine
+
+    subroutine meta_unpack(args)
+        character(len=*), intent(in) :: args
+        character(len=:), allocatable :: file, dir
+        integer :: rs
+        call two_args(args, file, dir)
+        if (len_trim(dir) == 0) then
+            write(error_unit,'(a)') 'usage: .unpack <file> <dir>'
+            return
+        end if
+        call db_unpack(file, dir, rs)
+        if (rs /= SQR_OK) then
+            write(error_unit,'(3a,i0)') 'unpack of "', trim(file), '" failed: ', rs
+        else if (interactive) then
+            write(error_unit,'(4a)') 'unpacked ', trim(file), ' -> ', trim(dir)
+        end if
+    end subroutine
+
+    ! Split a string on its first run of blanks into two trimmed tokens.
+    subroutine two_args(s, a, b)
+        character(len=*),              intent(in)  :: s
+        character(len=:), allocatable, intent(out) :: a, b
+        integer :: sp
+        sp = index(trim(adjustl(s)), ' ')
+        if (sp == 0) then
+            a = trim(adjustl(s))
+            b = ''
+        else
+            block
+                character(len=:), allocatable :: t
+                t = trim(adjustl(s))
+                a = t(1:sp-1)
+                b = trim(adjustl(t(sp+1:)))
+            end block
+        end if
+    end subroutine
 
     ! ---- helpers ----
 

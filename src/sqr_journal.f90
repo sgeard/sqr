@@ -901,16 +901,8 @@ contains
     end function
 
     ! Order-sensitive rolling checksum over the record payload.
-    pure integer function checksum(buf) result(c)
-        character(len=*), intent(in) :: buf
-        integer(int64) :: acc
-        integer        :: i
-        acc = 0_int64
-        do i = 1, len(buf)
-            acc = mod(acc * 31_int64 + iachar(buf(i:i)), 2147483647_int64)
-        end do
-        c = int(acc)
-    end function
+    ! checksum() lives in the parent sqr_base (host-associated here) so the
+    ! pack/unpack codec can share the one definition.
 
     ! ---- raw byte file IO ----
 
