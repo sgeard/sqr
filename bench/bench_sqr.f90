@@ -9,6 +9,7 @@
 program bench_sqr
     use, intrinsic :: iso_fortran_env, only: int32, int64, real64, output_unit
     use sqr
+    use sql
     use clib_wrap, only: c_rmtree
     implicit none
 
@@ -29,6 +30,10 @@ program bench_sqr
     integer, parameter :: COMPACT_ROWS = 20000
     integer, parameter :: TEXT_ROWS    = 5000
     integer, parameter :: TEXT_BYTES   = 200
+    integer, parameter :: SQL_ROWS     = 50000   ! WHERE-scan table
+    integer, parameter :: SQL_REPS     = 5       ! timed scan queries
+    integer, parameter :: ORDER_ROWS   = 10000   ! ORDER BY result size
+    integer, parameter :: LIT_LEN      = 50000   ! long string literal (lexer)
 
     call system_clock(count_rate=clk_rate)
     call cleanup()
@@ -41,6 +46,7 @@ program bench_sqr
     call bench_lookup()
     call bench_delete_compact()
     call bench_text()
+    call bench_sql()
 
     call cleanup()
     print '(a)', ''
@@ -376,12 +382,95 @@ contains
             1.0e6_real64 * s / real(n, real64), ' us/op over ', n, ' ops'
     end subroutine
 
+    ! --- 6. SQL layer: WHERE scan, ORDER BY, long-literal lexing -------
+    ! Targets the review's bottlenecks 4+5: cond_true's per-row column
+    ! re-resolution (multi-condition scan), the O(n^2) ORDER BY insertion
+    ! sort, and lex_string's O(len^2) one-char-at-a-time buffer growth.
+    subroutine bench_sql()
+        type(db_t) :: db
+        type(sql_result_t) :: res
+        type(sql_stmt_t)   :: stmt
+        character(len=:), allocatable :: buf, longlit
+        integer :: rs, i, r, ti
+        integer(int32) :: rid
+        integer(int64) :: t0, t1, st
+        type(column_t) :: c(4)
+
+        call cleanup()
+        c(1)%name = 'id'; c(1)%dtype = DT_INT ; c(1)%csize = 4
+        c(2)%name = 'v' ; c(2)%dtype = DT_INT ; c(2)%csize = 4
+        c(3)%name = 'w' ; c(3)%dtype = DT_REAL; c(3)%csize = 8
+        c(4)%name = 'c' ; c(4)%dtype = DT_CHAR; c(4)%csize = 8
+        call db_open(db, DBDIR, rs);  call die('sql open', rs)
+        call db_create_table(db, 's', c, rs);  call die('sql create', rs)
+        ti = db_table_index(db, 's')
+        call row_alloc(buf, db_record_size(db, 's'))
+        st = 42_int64
+        ! One explicit transaction around the fill: a single commit fsync
+        ! instead of one per row (the fill is setup, not what is timed).
+        call sql_run(db, "BEGIN", res, rs);  call die('sql begin', rs)
+        fill: do i = 1, SQL_ROWS
+            st = lcg(st)
+            call row_set_int (buf, db%tables(ti)%cols(1), int(i, int32))
+            call row_set_int (buf, db%tables(ti)%cols(2), int(modulo(st, 1000_int64), int32))
+            call row_set_real(buf, db%tables(ti)%cols(3), real(st, real64))
+            call row_set_char(buf, db%tables(ti)%cols(4), 'k' // achar(97 + int(modulo(st, 26_int64))))
+            call db_insert(db, 's', buf, rid, rs)
+        end do fill
+        call sql_run(db, "COMMIT", res, rs);  call die('sql commit', rs)
+
+        print '(a)', '-- 6. SQL layer --'
+
+        ! (a) multi-condition WHERE over a full scan (no index): three
+        !     conditions x SQL_ROWS rows x SQL_REPS queries of cond_true.
+        call system_clock(t0)
+        do r = 1, SQL_REPS
+            call sql_run(db, &
+                "SELECT id FROM s WHERE v >= 0 AND w >= 0.0 AND c >= 'a'", res, rs)
+            call die('sql where', rs)
+        end do
+        call system_clock(t1)
+        call report_per_op('3-cond WHERE scan (us/row)', SQL_ROWS * SQL_REPS, secs(t0, t1))
+
+        ! (b) ORDER BY over an ORDER_ROWS-row result (sort cost dominates).
+        call system_clock(t0)
+        call sql_run(db, "SELECT id FROM s WHERE id <= " // itoa_b(ORDER_ROWS) // &
+                         " ORDER BY w", res, rs)
+        call die('sql order', rs)
+        call system_clock(t1)
+        print '(a,i0,a,f8.3,a)', '   ORDER BY over ', ORDER_ROWS, ' rows: ', secs(t0, t1), ' s'
+
+        ! (c) lexing a statement carrying one long string literal.
+        allocate(character(len=LIT_LEN) :: longlit)
+        longlit = repeat('x', LIT_LEN)
+        call system_clock(t0)
+        call sql_parse("SELECT id FROM s WHERE c = '" // longlit // "'", stmt, rs)
+        call die('sql lex', rs)
+        call system_clock(t1)
+        print '(a,i0,a,f8.3,a)', '   lex ', LIT_LEN, '-char literal: ', secs(t0, t1), ' s'
+        print '(a)', ''
+
+        call db_close(db)
+        call cleanup()
+    end subroutine
+
+    ! Plain int-to-string for composing bench SQL text.
+    pure function itoa_b(n) result(s)
+        integer, intent(in) :: n
+        character(len=:), allocatable :: s
+        character(len=16) :: b
+        write(b, '(i0)') n
+        s = trim(b)
+    end function
+
     ! Full-scan match callback for the lookup comparison.
-    subroutine scan_match(rid, rbuf, ctx, stop)
+    subroutine scan_match(scan_db, rid, rbuf, ctx, stop)
+        class(db_t),      intent(inout) :: scan_db
         integer(int32),   intent(in)    :: rid
         character(len=*), intent(in)    :: rbuf
         class(*),         intent(inout) :: ctx
         logical,          intent(out)   :: stop
+        ! associate (unused => scan_db)   ! present only to satisfy scan_cb
         stop = .false.
         select type (ctx)
         type is (scan_ctx_t)

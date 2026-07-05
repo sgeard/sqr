@@ -153,9 +153,14 @@ contains
             integer,          intent(in)    :: slen
             integer,          intent(inout) :: i
             integer,          intent(out)   :: start
-            character(len=:), allocatable :: body
+            character(len=:), allocatable :: body, grown
+            integer :: n
             start = i
-            body = ''
+            ! Capacity-doubling buffer + length counter: appending one char
+            ! at a time to an allocatable reallocates (and copies) the whole
+            ! body per character — O(len^2) on a long literal.
+            allocate(character(len=64) :: body)
+            n = 0
             i = i + 1   ! past opening quote
             do
                 if (i > slen) then
@@ -164,10 +169,16 @@ contains
                     i = -1
                     return
                 end if
+                if (n == len(body)) then              ! double the capacity
+                    allocate(character(len=2*len(body)) :: grown)
+                    grown(1:n) = body(1:n)
+                    call move_alloc(grown, body)
+                end if
                 if (s(i:i) == "'") then
                     if (i < slen) then
                         if (s(i+1:i+1) == "'") then   ! escaped quote
-                            body = body // "'"
+                            n = n + 1
+                            body(n:n) = "'"
                             i = i + 2
                             cycle
                         end if
@@ -175,12 +186,13 @@ contains
                     i = i + 1   ! closing quote
                     exit
                 end if
-                body = body // s(i:i)
+                n = n + 1
+                body(n:n) = s(i:i)
                 i = i + 1
             end do
             ntok = ntok + 1
             toks(ntok)%kind = TK_STR
-            toks(ntok)%text = body
+            toks(ntok)%text = body(1:n)
             toks(ntok)%col  = start
         end subroutine
 

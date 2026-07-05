@@ -190,15 +190,14 @@ contains
         integer(int32) :: rid
         logical :: ok
         character(len=:), allocatable :: ckey, rbuf
-        type(kc_ctx_t) :: cx
         type(bt_cursor_t) :: cur
         row_id = 0
         stat   = SQR_NOT_FOUND
         associate (t => db%tables(ti), ix => db%tables(ti)%indices(j))
             allocate(character(len=ix%key_size) :: ckey)
             allocate(character(len=t%record_size) :: rbuf)
-            cx = make_kc_ctx(t, ix)
-            call bt_seek(ix%bt, probe, bt_key_cmp, cx, cur, bs)
+            call ensure_kc_ctx(t, ix)
+            call bt_seek(ix%bt, probe, bt_key_cmp, ix%kc, cur, bs)
             if (bs /= BT_OK) then
                 stat = SQR_ERR
                 return
@@ -464,14 +463,14 @@ contains
         type(db_cursor_t), intent(out)   :: cur
         integer,           intent(out)   :: stat
         integer :: bs
-        type(kc_ctx_t) :: cx
         cur%ti      = ti
         cur%j       = j
         cur%bounded = .true.
         cur%hikey   = hikey
         cur%gen     = db%generation
-        cx = make_kc_ctx(db%tables(ti), db%tables(ti)%indices(j))
-        call bt_seek(db%tables(ti)%indices(j)%bt, lokey, bt_key_cmp, cx, cur%bt, bs)
+        call ensure_kc_ctx(db%tables(ti), db%tables(ti)%indices(j))
+        call bt_seek(db%tables(ti)%indices(j)%bt, lokey, bt_key_cmp, &
+                     db%tables(ti)%indices(j)%kc, cur%bt, bs)
         cur%active = bs == BT_OK
         stat = sqr_of_bt(bs)
     end subroutine
@@ -593,7 +592,6 @@ contains
         integer :: bs, ios
         integer(int32) :: rid
         logical :: got
-        character(len=:), allocatable :: ckey, rbuf
         row_id = 0
         ok     = .false.
         ! A mutating call (or close) since this cursor was opened may have
@@ -613,8 +611,13 @@ contains
             return
         end if
         associate (t => db%tables(cur%ti), ix => db%tables(cur%ti)%indices(cur%j))
-            allocate(character(len=ix%key_size)  :: ckey)
-            allocate(character(len=t%record_size) :: rbuf)
+            ! Per-cursor scratch: one allocation for the cursor's lifetime
+            ! instead of one per yielded row.
+            if (.not. allocated(cur%ckey)) then
+                allocate(character(len=ix%key_size)  :: cur%ckey)
+                allocate(character(len=t%record_size) :: cur%rbuf)
+            end if
+            associate (ckey => cur%ckey, rbuf => cur%rbuf)
             scan: do
                 call bt_next(ix%bt, cur%bt, ckey, rid, got, bs)
                 if (bs /= BT_OK) then
@@ -649,6 +652,7 @@ contains
                     return
                 end if
             end do scan
+            end associate
         end associate
     end subroutine
 

@@ -173,18 +173,34 @@ contains
                 if (present(stat)) stat = SQR_NOT_FOUND
                 return
             end if
-            allocate(character(len=t%record_size) :: rbuf)
-            read(t%unit, rec=row_id, iostat=ios) rbuf
-            call io_check(ios)
-            if (ios /= 0) then          ! I/O failure is not "row absent"
-                if (present(stat)) stat = SQR_ERR
-                return
-            end if
-            if (row_status(rbuf) /= ROW_ALIVE) then
-                if (present(stat)) stat = SQR_NOT_FOUND
-                return
-            end if
-            buf = rbuf
+            fast: if (len(buf) == t%record_size) then
+                ! The caller's buffer IS the record image — read straight
+                ! into it: no intermediate allocation, no copy.
+                read(t%unit, rec=row_id, iostat=ios) buf
+                call io_check(ios)
+                if (ios /= 0) then      ! I/O failure is not "row absent"
+                    if (present(stat)) stat = SQR_ERR
+                    return
+                end if
+                if (row_status(buf) /= ROW_ALIVE) then
+                    if (present(stat)) stat = SQR_NOT_FOUND
+                    return
+                end if
+            else fast
+                ! Tolerant path: truncate / blank-pad through a scratch image.
+                allocate(character(len=t%record_size) :: rbuf)
+                read(t%unit, rec=row_id, iostat=ios) rbuf
+                call io_check(ios)
+                if (ios /= 0) then      ! I/O failure is not "row absent"
+                    if (present(stat)) stat = SQR_ERR
+                    return
+                end if
+                if (row_status(rbuf) /= ROW_ALIVE) then
+                    if (present(stat)) stat = SQR_NOT_FOUND
+                    return
+                end if
+                buf = rbuf
+            end if fast
         end associate
         if (present(stat)) stat = SQR_OK
     end subroutine
@@ -683,15 +699,14 @@ contains
         character(len=*), intent(in)    :: buf
         integer,          intent(out)   :: stat
         character(len=:), allocatable :: key
-        type(kc_ctx_t) :: cx
         integer :: bs
         associate (t => db%tables(ti), ix => db%tables(ti)%indices(j))
             stat = SQR_OK
             if (key_has_null(t, ix, buf)) return   ! NULL member ⇒ not indexed
             allocate(character(len=ix%key_size) :: key)
             call extract_key(t, ix, buf, key)
-            cx = make_kc_ctx(t, ix)
-            call bt_insert(ix%bt, key, row_id, bt_key_cmp, cx, bs)
+            call ensure_kc_ctx(t, ix)
+            call bt_insert(ix%bt, key, row_id, bt_key_cmp, ix%kc, bs)
             stat = sqr_of_bt(bs)
             if (stat == SQR_OK) ix%nentries = int(ix%bt%nentries)
         end associate
@@ -705,12 +720,11 @@ contains
         integer(int32),   intent(in)    :: row_id
         character(len=*), intent(in)    :: key
         integer,          intent(out)   :: stat
-        type(kc_ctx_t) :: cx
         integer :: bs
         logical :: found
         associate (t => db%tables(ti), ix => db%tables(ti)%indices(j))
-            cx = make_kc_ctx(t, ix)
-            call bt_remove(ix%bt, key, row_id, bt_key_cmp, cx, found, bs)
+            call ensure_kc_ctx(t, ix)
+            call bt_remove(ix%bt, key, row_id, bt_key_cmp, ix%kc, found, bs)
             stat = sqr_of_bt(bs)
             if (stat == SQR_OK) then
                 ix%nentries = int(ix%bt%nentries)

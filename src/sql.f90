@@ -85,7 +85,8 @@ module sql
         character(len=SQR_NAME_LEN) :: col = ''
         integer          :: op = 0
         type(sql_lit_t)  :: lit
-        type(sql_lit_t)  :: lit2   !! BETWEEN upper bound only
+        type(sql_lit_t)  :: lit2     !! BETWEEN upper bound only
+        integer          :: col_ord = 0  !! Cached column ordinal in the target table (0 = unresolved); filled once per statement so per-row evaluation skips the name lookup
     end type
 
     !! One AND-group of conditions.  A WHERE clause is a disjunction (OR) of

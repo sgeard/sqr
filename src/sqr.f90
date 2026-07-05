@@ -103,6 +103,19 @@ module sqr
         integer :: null_bit = 0  !! 0-based bit ordinal in the per-row NULL bitmap
     end type
 
+    !! Opaque comparator context threaded through the B+-tree: a compact
+    !! snapshot of an index's per-member key geometry so the comparator
+    !! stays pure (no table_t/index_t pointer chasing) and matches the
+    !! member-by-member, per-dtype order key_cmp_ix imposes.  Built once
+    !! per index and cached in `index_t%kc` (invalidated whenever the
+    !! geometry could change); engine-internal despite being public.
+    type, public :: kc_ctx_t
+        integer              :: nmem = 0
+        integer, allocatable :: koff(:)  !! per-member offset within the key
+        integer, allocatable :: csz(:)   !! per-member byte width
+        integer, allocatable :: dt(:)    !! per-member dtype
+    end type
+
     !! A (possibly composite) secondary index.  The key is the member
     !! column bytes concatenated in declared order; a single-column index
     !! is just arity 1.  `unique` enforces that no two live rows share a
@@ -117,6 +130,8 @@ module sqr
         type(btree_t) :: bt  !! On-disk B+-tree mapping the key to the `int32` row id
         logical :: unique   = .false.  !! Enforce no duplicate live keys
         class(*), pointer :: jctx => null()  !! Heap-owned `bt_jhook_ctx_t` while a txn's journal hook is installed on `bt`; freed at txn end
+        type(kc_ctx_t) :: kc  !! Cached comparator geometry — transient (never on disk), rebuilt on demand
+        logical :: kc_valid = .false.  !! `kc` matches the current geometry (cleared by rebuild_index)
     end type
 
     !! One open table: schema, derived layout, open units and index set.
@@ -316,6 +331,8 @@ module sqr
         character(len=:), allocatable :: hikey  !! Inclusive upper-bound key bytes
         logical :: active = .false.  !! `.true.` while more rows may be yielded
         integer :: gen = -1  !! `db%generation` snapshot; mismatch ⇒ invalidated
+        character(len=:), allocatable :: ckey  !! Per-cursor scratch: current entry key (allocated on first next)
+        character(len=:), allocatable :: rbuf  !! Per-cursor scratch: current row image
     end type
 
     !! Context passed to `bt_journal_adapter` — the bridge that turns a

@@ -51,16 +51,8 @@ submodule (sqr) sqr_base
                          bt_cursor_t, bt_set_journal_hook, BT_OK, BT_VERSION
     implicit none
 
-    ! Opaque comparator context threaded through the B+-tree: a compact
-    ! snapshot of the index's per-member key geometry so the comparator
-    ! stays pure (no table_t/index_t pointer chasing) and matches the
-    ! member-by-member, per-dtype order key_cmp_ix imposes.
-    type :: kc_ctx_t
-        integer              :: nmem = 0
-        integer, allocatable :: koff(:)   ! per-member offset within the key
-        integer, allocatable :: csz(:)    ! per-member byte width
-        integer, allocatable :: dt(:)     ! per-member dtype
-    end type
+    ! (kc_ctx_t, the opaque comparator context threaded through the
+    ! B+-tree, lives in the sqr module now that index_t caches one.)
 
     character(len=4), parameter :: CATALOG_MAGIC = 'SQRC'
     character(len=*), parameter :: CATALOG_FILE  = '_catalog.dat'
@@ -1015,6 +1007,17 @@ contains
         end do members
     end function
 
+    ! Get-or-build the cached comparator context: the geometry changes
+    ! only on schema evolution / index rebuild (which clear kc_valid), so
+    ! every index touch after the first is allocation-free.
+    subroutine ensure_kc_ctx(t, ix)
+        type(table_t), intent(in)    :: t
+        type(index_t), intent(inout) :: ix
+        if (ix%kc_valid) return
+        ix%kc = make_kc_ctx(t, ix)
+        ix%kc_valid = .true.
+    end subroutine
+
     ! Open the per-table blob file for a table that has >=1 DT_TEXT column.
     ! mode is the OPEN status: 'old' for an existing db, 'replace' on create.
     subroutine open_blob(db, tbl, mode, stat)
@@ -1344,8 +1347,8 @@ contains
         character(len=:), allocatable :: rbuf
         character(len=:), allocatable :: keys(:)
         integer(int32),   allocatable :: pays(:)
-        type(kc_ctx_t) :: cx
         associate (t => db%tables(ti), ix => db%tables(ti)%indices(j))
+            ix%kc_valid = .false.   ! geometry may have changed (add/drop column)
             if (ix%bt%unit /= -1) then
                 close(ix%bt%unit)
                 ix%bt%unit = -1
@@ -1415,9 +1418,9 @@ contains
                 end if
                 pays(nlive) = rid
             end do gather
-            cx = make_kc_ctx(t, ix)
+            call ensure_kc_ctx(t, ix)
             call bt_bulk_load(ix%bt, keys(1:nlive), pays(1:nlive), &
-                              bt_key_cmp, cx, bs)
+                              bt_key_cmp, ix%kc, bs)
             stat = sqr_of_bt(bs)
             if (stat == SQR_OK) ix%nentries = int(ix%bt%nentries)
         end associate
@@ -1461,15 +1464,14 @@ contains
         integer(int32) :: rid
         logical :: ok
         character(len=:), allocatable :: ckey, rbuf
-        type(kc_ctx_t) :: cx
         type(bt_cursor_t) :: cur
         viol = .false.
         stat = SQR_OK
         associate (t => db%tables(ti), ix => db%tables(ti)%indices(j))
             allocate(character(len=ix%key_size) :: ckey)
             allocate(character(len=t%record_size) :: rbuf)
-            cx = make_kc_ctx(t, ix)
-            call bt_seek(ix%bt, key, bt_key_cmp, cx, cur, bs)
+            call ensure_kc_ctx(t, ix)
+            call bt_seek(ix%bt, key, bt_key_cmp, ix%kc, cur, bs)
             if (bs /= BT_OK) then
                 stat = SQR_ERR
                 return

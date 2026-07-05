@@ -499,7 +499,23 @@ contains
         g%t => db%tables(ti)
         g%reclen = db%tables(ti)%record_size
         g%has_where = stmt%has_where
-        if (stmt%has_where) g%groups = stmt%where_groups
+        if (stmt%has_where) then
+            g%groups = stmt%where_groups
+            resolve: block
+                ! Resolve every condition's column ordinal ONCE (the
+                ! columns were proven to exist by validate_where): the
+                ! per-row cond_true then indexes cols(:) directly instead
+                ! of a linear name lookup per condition per row.
+                integer :: gi, ci
+                do gi = 1, size(g%groups)
+                    do ci = 1, size(g%groups(gi)%conds)
+                        associate (c => g%groups(gi)%conds(ci))
+                            c%col_ord = col_index(db%tables(ti), trim(c%col))
+                        end associate
+                    end do
+                end do
+            end block resolve
+        end if
         g%n = 0
 
         used_index = .false.
@@ -721,7 +737,8 @@ contains
         real(real64) :: v
         character(len=:), allocatable :: s
         yes = .false.
-        ci = col_index(t, trim(c%col))
+        ci = c%col_ord                       ! resolved once in gather
+        if (ci == 0) ci = col_index(t, trim(c%col))   ! unresolved caller: look up
         if (ci == 0) return
         associate (col => t%cols(ci))
             isnull = row_is_null(buf, col)
@@ -997,22 +1014,54 @@ contains
 
     ! Stable insertion sort of `perm` ordering rows by column `oc`.  Ascending
     ! puts NULLs last; descending inverts the comparison (NULLs first).
+    ! Stable bottom-up merge sort of the row permutation: O(n log n) where
+    ! the previous insertion sort was O(n^2).  Stability (ties keep gather
+    ! order) comes from the merge taking the LEFT run's element unless the
+    ! right's strictly precedes it.
     subroutine order_rows(g, oc, desc, perm)
         type(row_match_ctx_t), intent(in)    :: g
         integer,               intent(in)    :: oc
         logical,               intent(in)    :: desc
         integer,               intent(inout) :: perm(:)
-        integer :: i, j, key
-        do i = 2, size(perm)
-            key = perm(i)
-            j = i - 1
-            do while (j >= 1)
-                if (.not. row_gt(g, oc, perm(j), key, desc)) exit
-                perm(j + 1) = perm(j)
-                j = j - 1
-            end do
-            perm(j + 1) = key
-        end do
+        integer, allocatable :: work(:)
+        integer :: n, width, lo, mid, hi
+        n = size(perm)
+        allocate(work(n))
+        width = 1
+        passes: do while (width < n)
+            lo = 1
+            runs: do while (lo + width <= n)
+                mid = lo + width - 1
+                hi  = min(lo + 2*width - 1, n)
+                call merge_runs(g, oc, desc, perm, work, lo, mid, hi)
+                lo = hi + 1
+            end do runs
+            width = 2 * width
+        end do passes
+    end subroutine
+
+    ! Merge perm(lo:mid) and perm(mid+1:hi) (each already ordered) through
+    ! the scratch array.
+    subroutine merge_runs(g, oc, desc, perm, work, lo, mid, hi)
+        type(row_match_ctx_t), intent(in)    :: g
+        integer,               intent(in)    :: oc, lo, mid, hi
+        logical,               intent(in)    :: desc
+        integer,               intent(inout) :: perm(:), work(:)
+        integer :: i, j, k
+        i = lo
+        j = mid + 1
+        k = lo
+        both: do while (i <= mid .and. j <= hi)
+            if (row_gt(g, oc, perm(i), perm(j), desc)) then   ! right strictly first
+                work(k) = perm(j);  j = j + 1
+            else                                              ! ties take LEFT: stable
+                work(k) = perm(i);  i = i + 1
+            end if
+            k = k + 1
+        end do both
+        work(k:k+(mid-i)) = perm(i:mid)   ! left tail (right tail is in place below)
+        k = k + (mid - i + 1)
+        perm(lo:k-1) = work(lo:k-1)       ! right tail perm(j:hi) already sits at k..hi
     end subroutine
 
     ! Should row a sort after row b (i.e. a > b in the requested order)?
