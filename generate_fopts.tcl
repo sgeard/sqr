@@ -58,15 +58,24 @@ F_LOPTS  := $(F_LOPTS_LF)
 
 dict set c flang {
 ODIR     := obj_flang_$(BUILD)
-MOD_OPTS := -J$(ODIR) -I$(ODIR)
-F_BASE   := -cpp -DNO_PDT $(F_EXTRA_FL)
+MOD_OPTS := -module-dir $(ODIR) -I$(ODIR)
+# -Qunused-arguments: F_OPTS (incl. MOD_OPTS) is reused on the link step, where
+# flang's driver warns that -module-dir is unused for a pure link.  ifx/gfortran
+# don't warn on the equivalent; this driver flag silences it (a -Wno-... form is
+# rejected by flang's frontend, which errors on unknown diagnostic options).
+F_BASE   := -cpp -DNO_PDT -Qunused-arguments $(F_EXTRA_FL)
 ifdef debug
     F_BUILD := -g
 else
     F_BUILD := -O3
 endif
 ifeq ($(shell uname -m),x86_64)
-    F_LOPTS  := -L/usr/lib/gcc/x86_64-mageia-linux/12 -B/usr/lib/gcc/x86_64-mageia-linux/12
+    # -no-pie: flang links a PIE by default, but the C shims projects link
+    # (osshim.c in libsqr.a, cmdwin_spawn.c) are compiled without -fPIC, so their
+    # absolute relocations are rejected in a PIE (R_X86_64_32). ifx and gfortran
+    # do not force PIE; match them. Android (the aarch64 branch below) MUST stay
+    # PIE, so this is x86_64-only.
+    F_LOPTS  := -no-pie -L/usr/lib/gcc/x86_64-mageia-linux/12 -B/usr/lib/gcc/x86_64-mageia-linux/12
 else
     F_LOPTS  := -L/data/data/com.termux/files/usr/lib/clang/21/lib
 endif
