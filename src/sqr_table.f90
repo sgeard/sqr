@@ -821,6 +821,16 @@ contains
         idx = 0
     end function
 
+    pure module function db_record_size(db, name) result(sz)
+        class(db_t),       intent(in) :: db
+        character(len=*), intent(in) :: name
+        integer                      :: sz
+        integer :: ti
+        sz = 0
+        ti = db_table_index(db, name)
+        if (ti /= 0) sz = db%tables(ti)%record_size
+    end function
+
     ! ===== Schema evolution: add / drop column =====
 
     module subroutine db_add_column(db, table_name, col, stat, errmsg)

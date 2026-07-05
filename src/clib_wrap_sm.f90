@@ -41,6 +41,15 @@ contains
         ierr = int(sqr_os_mkdir(p))
     end function
 
+    module function c_chmod(path, mode) result(ierr)
+        character(len=*), intent(in) :: path
+        integer,          intent(in) :: mode
+        integer :: ierr
+        character(kind=c_char) :: p(len_trim(path) + 1)
+        call to_cstr(path, p)
+        ierr = int(sqr_os_chmod(p, int(mode, c_int)))
+    end function
+
     module function c_path_exists(path) result(yes)
         character(len=*), intent(in) :: path
         logical :: yes

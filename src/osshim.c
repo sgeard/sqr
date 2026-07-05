@@ -32,7 +32,8 @@
 #ifdef _WIN32
 /* ===== Windows (CRT + Win32 API) ===== */
 #include <windows.h>
-#include <io.h>      /* _access, _open, _close, _commit, _chsize_s, _isatty */
+#include <io.h>      /* _access, _open, _close, _commit, _chsize_s, _isatty, _chmod */
+#include <sys/stat.h>/* _S_IREAD, _S_IWRITE */
 #include <direct.h>  /* _mkdir */
 #include <fcntl.h>   /* _O_RDWR */
 #include <stdio.h>   /* remove, snprintf */
@@ -51,6 +52,12 @@ int sqr_os_remove(const char *p) {
 
 int sqr_os_mkdir(const char *p) {
     return _mkdir(p);           /* no mode argument on Windows */
+}
+
+int sqr_os_chmod(const char *p, int mode) {
+    /* Windows has only the read-only attribute: any owner-write bit in the
+       POSIX-style mode maps to writable. */
+    return _chmod(p, (mode & 0200) ? (_S_IREAD | _S_IWRITE) : _S_IREAD) ? 1 : 0;
 }
 
 int sqr_os_path_exists(const char *p) {
@@ -132,6 +139,13 @@ int sqr_os_lock_try(const char *p, int exclusive, int64_t *tok) {
                            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     *tok = -1;
+    if (h == INVALID_HANDLE_VALUE && !exclusive) {
+        /* Read-only media: retry read-only for a shared lock (the file must
+           already exist) — mirrors the POSIX O_RDONLY fallback. */
+        h = CreateFileA(p, GENERIC_READ,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    }
     if (h == INVALID_HANDLE_VALUE) return 2;
     memset(&ov, 0, sizeof ov);          /* lock from offset 0 */
     flags = LOCKFILE_FAIL_IMMEDIATELY;  /* non-blocking */
@@ -195,6 +209,10 @@ int sqr_os_mkdir(const char *p) {
     return mkdir(p, 0777);              /* 0777 & umask */
 }
 
+int sqr_os_chmod(const char *p, int mode) {
+    return chmod(p, (mode_t)mode) ? 1 : 0;
+}
+
 int sqr_os_path_exists(const char *p) {
     return access(p, F_OK) == 0 ? 1 : 0;
 }
@@ -245,6 +263,13 @@ int sqr_os_lock_try(const char *p, int exclusive, int64_t *tok) {
        renderer) — a child holding it would pin the lock past our release.
        (c_lock_release does an explicit LOCK_UN, so this is belt-and-braces.) */
     fd = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0 && !exclusive) {
+        /* Read-only media: the lock file cannot be opened for write, but a
+           read-only fd still takes LOCK_SH, so shared (reader) locks work —
+           provided the file already exists (some earlier read-write open
+           created it; a db dir copied without its _lock stays unopenable). */
+        fd = open(p, O_RDONLY | O_CLOEXEC);
+    }
     if (fd < 0) return 2;               /* cannot open/create the lock file */
     op = (exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB;
     if (flock(fd, op) == 0) {

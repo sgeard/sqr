@@ -1,7 +1,7 @@
 program utest_sqr
     use, intrinsic :: iso_fortran_env, only: int8, int32, int64, real64
     use sqr
-    use clib_wrap, only: c_rename, c_remove, c_mkdir, c_rmtree, c_path_exists, &
+    use clib_wrap, only: c_rename, c_remove, c_mkdir, c_chmod, c_rmtree, c_path_exists, &
                          c_fsync_path, c_fsync_dir, c_truncate, c_lock_release
     implicit none
 
@@ -60,6 +60,10 @@ program utest_sqr
     call test_verify_dup_split_by_dead()
     call test_list_tables_closed()
     call test_create_table_cleanup()
+    call test_record_size()
+    call test_strict_write_length()
+    call test_row_id_exhaustion()
+    call test_readonly_media_lock()
     call test_insert_many()
     call test_alter_column()
     call test_oo_bindings()
@@ -3662,6 +3666,154 @@ contains
 
         call db_close(db)
         ios = c_rmtree(CDIR)
+    end subroutine
+
+    ! Slice B: the db_record_size enquiry apps size their buffers with.
+    subroutine test_record_size()
+        character(len=*), parameter :: RDIR = 'utest_sqr_rsz_db'
+        type(db_t) :: db, never_opened
+        type(column_t) :: c(2)
+        integer :: rs, ios, ti
+        character(len=128) :: emsg
+        ios = c_rmtree(RDIR)
+        c(1)%name = 'id'; c(1)%dtype = DT_INT ; c(1)%csize = 4
+        c(2)%name = 'nm'; c(2)%dtype = DT_CHAR; c(2)%csize = 8
+        call db_open(db, RDIR, rs, emsg)
+        call db_create_table(db, 't', c, rs, emsg)
+        ti = db_table_index(db, 't')
+        call check(db_record_size(db, 't') == db%tables(ti)%record_size, &
+                   'record_size: matches the table layout')
+        call check(db_record_size(db, 't') > 0, 'record_size: positive for a real table')
+        call check(db_record_size(db, 'nosuch') == 0, 'record_size: unknown table -> 0')
+        call check(db_record_size(never_opened, 't') == 0, 'record_size: closed handle -> 0')
+        call check(db%record_size('t') == db_record_size(db, 't'), 'record_size: type-bound form')
+        call db_close(db)
+        ios = c_rmtree(RDIR)
+    end subroutine
+
+    ! Slice B: writes reject a wrong-length buffer with SQR_INVALID;
+    ! reads stay tolerant of the caller's buffer length.
+    subroutine test_strict_write_length()
+        character(len=*), parameter :: WDIR = 'utest_sqr_strict_db'
+        type(db_t) :: db
+        type(column_t) :: c(2)
+        integer :: rs, ios, ti, rsz
+        integer(int32) :: rid, rids(2)
+        character(len=:), allocatable :: buf, short, long
+        character(len=8)   :: sbuf
+        character(len=300) :: lbuf
+        character(len=128) :: emsg
+        ios = c_rmtree(WDIR)
+        c(1)%name = 'id'; c(1)%dtype = DT_INT ; c(1)%csize = 4
+        c(2)%name = 'nm'; c(2)%dtype = DT_CHAR; c(2)%csize = 8
+        call db_open(db, WDIR, rs, emsg)
+        call db_create_table(db, 't', c, rs, emsg)
+        ti = db_table_index(db, 't')
+        rsz = db_record_size(db, 't')
+
+        short = repeat(char(0), rsz - 1)
+        long  = repeat(char(0), rsz + 1)
+        call db_insert(db, 't', short, rid, rs)
+        call check(rs == SQR_INVALID .and. rid == 0, 'strict: short insert rejected')
+        call db_insert(db, 't', long, rid, rs)
+        call check(rs == SQR_INVALID, 'strict: long insert rejected')
+
+        call row_alloc(buf, rsz)
+        call row_set_int (buf, db%tables(ti)%cols(1), 7_int32)
+        call row_set_char(buf, db%tables(ti)%cols(2), 'seven')
+        call db_insert(db, 't', buf, rid, rs)
+        call check(rs == SQR_OK, 'strict: exact-length insert accepted')
+
+        call db_update(db, 't', rid, short, rs)
+        call check(rs == SQR_INVALID, 'strict: short update rejected')
+        call db_update(db, 't', rid, long, rs)
+        call check(rs == SQR_INVALID, 'strict: long update rejected')
+
+        call db_insert_many(db, 't', [short, short], rids, rs)
+        call check(rs == SQR_INVALID, 'strict: wrong-length batch rejected')
+
+        ! Reads fill whatever they are given: short truncates, long blank-pads.
+        sbuf = ''
+        call db_get(db, 't', rid, sbuf, rs)
+        call check(rs == SQR_OK, 'tolerant: short read buffer accepted')
+        lbuf = ''
+        call db_get(db, 't', rid, lbuf, rs)
+        call check(rs == SQR_OK, 'tolerant: long read buffer accepted')
+        call check(row_get_int(lbuf, db%tables(ti)%cols(1)) == 7_int32, &
+                   'tolerant: long read returns the record')
+        call db_close(db)
+        ios = c_rmtree(WDIR)
+    end subroutine
+
+    ! Slice B: the int32 row-id space is guarded (SQR_FULL), not wrapped.
+    subroutine test_row_id_exhaustion()
+        character(len=*), parameter :: FDIR = 'utest_sqr_full_db'
+        type(db_t) :: db
+        type(column_t) :: c(1)
+        integer :: rs, ios, ti
+        integer(int32) :: rid, rids(2)
+        character(len=:), allocatable :: buf
+        character(len=128) :: emsg
+        ios = c_rmtree(FDIR)
+        c(1)%name = 'id'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        call db_open(db, FDIR, rs, emsg)
+        call db_create_table(db, 't', c, rs, emsg)
+        ti = db_table_index(db, 't')
+        call row_alloc(buf, db_record_size(db, 't'))
+        call row_set_int(buf, db%tables(ti)%cols(1), 1_int32)
+        ! Simulate an exhausted table by advancing the id high-water mark
+        ! directly (2^31 real inserts are not a unit test).  The guard
+        ! fires before anything touches disk.
+        db%tables(ti)%next_id = huge(0_int32)
+        call db_insert(db, 't', buf, rid, rs)
+        call check(rs == SQR_FULL .and. rid == 0, 'full: insert refused at id exhaustion')
+        db%tables(ti)%next_id = huge(0_int32) - 1
+        call db_insert_many(db, 't', [buf, buf], rids, rs)
+        call check(rs == SQR_FULL, 'full: batch overrunning the id space refused')
+        call db_close(db)
+        ios = c_rmtree(FDIR)
+    end subroutine
+
+    ! Slice B: a read-only open works when the lock file itself cannot be
+    ! opened for write (read-only media) — the C shim falls back to
+    ! O_RDONLY, which still takes a shared lock.  A read-write open on
+    ! the same database must still be refused.
+    subroutine test_readonly_media_lock()
+        character(len=*), parameter :: MDIR = 'utest_sqr_romedia_db'
+        type(db_t) :: db
+        type(column_t) :: c(1)
+        integer :: rs, ios, ti
+        integer(int32) :: rid
+        character(len=:), allocatable :: buf
+        character(len=128) :: emsg
+        ios = c_rmtree(MDIR)
+        c(1)%name = 'id'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        call db_open(db, MDIR, rs, emsg)
+        call db_create_table(db, 't', c, rs, emsg)
+        ti = db_table_index(db, 't')
+        call row_alloc(buf, db_record_size(db, 't'))
+        call row_set_int(buf, db%tables(ti)%cols(1), 42_int32)
+        call db_insert(db, 't', buf, rid, rs)
+        call db_close(db)
+
+        ! Approximate read-only media at the exact failure point: the lock
+        ! file no longer opens read-write.
+        ios = c_chmod(MDIR // '/_lock', int(o'444'))
+        call check(ios == 0, 'ro media: chmod _lock read-only')
+        call db_open(db, MDIR, rs, emsg)
+        call check(rs /= SQR_OK, 'ro media: read-write open refused')
+        emsg = ''
+        call db_open(db, MDIR, rs, emsg, readonly=.true.)
+        call check(rs == SQR_OK, 'ro media: read-only open succeeds')
+        if (rs == SQR_OK) then
+            ti = db_table_index(db, 't')
+            call db_get(db, 't', rid, buf, rs)
+            call check(rs == SQR_OK .and. row_get_int(buf, db%tables(ti)%cols(1)) == 42_int32, &
+                       'ro media: row readable')
+            call db_close(db)
+        end if
+        ios = c_chmod(MDIR // '/_lock', int(o'644'))
+        ios = c_rmtree(MDIR)
     end subroutine
 
     ! ===== 5.3 db_insert_many =====

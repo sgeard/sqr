@@ -21,6 +21,7 @@ module clib_wrap
     public :: c_rename      !! atomic rename/replace (same filesystem)
     public :: c_remove      !! unlink a file or remove an empty directory
     public :: c_mkdir       !! create one directory (mode 0777 & umask on POSIX)
+    public :: c_chmod       !! change a path's permission bits
     public :: c_path_exists !! does the path exist?
     public :: c_rmtree      !! recursively remove a directory tree
     public :: c_fsync_path  !! flush a file's data to stable storage
@@ -53,6 +54,13 @@ module clib_wrap
             import :: c_char, c_int
             character(kind=c_char), intent(in) :: p(*)
             integer(c_int)                     :: r
+        end function
+
+        function sqr_os_chmod(p, mode) bind(c, name='sqr_os_chmod') result(r)
+            import :: c_char, c_int
+            character(kind=c_char), intent(in)        :: p(*)
+            integer(c_int),         intent(in), value :: mode
+            integer(c_int)                            :: r
         end function
 
         ! Returns 1 if the path exists, 0 otherwise.
@@ -135,6 +143,16 @@ module clib_wrap
         !! on success, nonzero on failure (including "already exists").
         module function c_mkdir(path) result(ierr)
             character(len=*), intent(in) :: path  !! Directory to create
+            integer                      :: ierr  !! 0 on success, nonzero on failure
+        end function
+
+        !! Change a path's permission bits (`chmod`; pass an octal literal
+        !! such as `int(o'444')`).  On Windows only the read-only attribute
+        !! exists: any owner-write bit means writable.  Returns 0 on
+        !! success, nonzero on failure.
+        module function c_chmod(path, mode) result(ierr)
+            character(len=*), intent(in) :: path  !! Path to change
+            integer,          intent(in) :: mode  !! POSIX-style permission bits
             integer                      :: ierr  !! 0 on success, nonzero on failure
         end function
 

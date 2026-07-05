@@ -126,13 +126,22 @@ contains
             return
         end if
         associate (t => db%tables(ti))
-            ! Build the padded row images once (status alive, text descriptors
+            ! Strict on write — see ins_core (bufs is an array of one
+            ! length, so a single check covers every row).
+            if (len(bufs) /= t%record_size) then
+                if (present(stat)) stat = SQR_INVALID
+                return
+            end if
+            ! Refuse the whole batch if it would exhaust the int32 id space.
+            if (t%next_id > huge(0_int32) - n) then
+                if (present(stat)) stat = SQR_FULL
+                return
+            end if
+            ! Build the row images once (status alive, text descriptors
             ! zeroed), mirroring db_insert's per-row preparation.
             allocate(character(len=t%record_size) :: wrows(n))
             build: do k = 1, n
-                wrows(k) = bufs(k)(1:min(len(bufs(k)), t%record_size))
-                if (len(bufs(k)) < t%record_size) &
-                    wrows(k)(len(bufs(k))+1:) = char(0)
+                wrows(k) = bufs(k)
                 call row_set_status(wrows(k), ROW_ALIVE)
                 do ci = 1, t%ncols
                     if (t%cols(ci)%dtype == DT_TEXT) &

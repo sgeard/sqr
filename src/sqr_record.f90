@@ -62,10 +62,24 @@ contains
             return
         end if
         associate (t => db%tables(idx))
+            ! Strict on write: a wrong-length buffer is a caller bug —
+            ! padding or truncating silently would store a malformed row.
+            ! Reads stay tolerant; size buffers with db_record_size().
+            if (len(buf) /= t%record_size) then
+                if (present(stat)) stat = SQR_INVALID
+                row_id = 0
+                return
+            end if
+            ! Row ids are int32 record slots: refuse rather than wrap once
+            ! the id space is exhausted (db_compact reclaims it).
+            if (t%next_id == huge(0_int32)) then
+                if (present(stat)) stat = SQR_FULL
+                row_id = 0
+                return
+            end if
             row_id = t%next_id
             allocate(character(len=t%record_size) :: wbuf)
-            wbuf = buf(1:min(len(buf), t%record_size))
-            if (len(buf) < t%record_size) wbuf(len(buf)+1:) = char(0)
+            wbuf = buf
             call row_set_status(wbuf, ROW_ALIVE)
             ! Fresh rows start with empty text; db_set_text fills them later.
             zero_text: do ci = 1, t%ncols
@@ -215,6 +229,12 @@ contains
             return
         end if
         associate (t => db%tables(idx))
+            ! Strict on write — see ins_core: a wrong-length buffer is a
+            ! caller bug, not something to pad or truncate silently.
+            if (len(buf) /= t%record_size) then
+                if (present(stat)) stat = SQR_INVALID
+                return
+            end if
             if (row_id < 1 .or. row_id >= t%next_id) then
                 if (present(stat)) stat = SQR_NOT_FOUND
                 return
@@ -233,8 +253,7 @@ contains
 
             ! Build the new record image from the caller buffer.
             allocate(character(len=t%record_size) :: wbuf)
-            wbuf = buf(1:min(len(buf), t%record_size))
-            if (len(buf) < t%record_size) wbuf(len(buf)+1:) = char(0)
+            wbuf = buf
             call row_set_status(wbuf, ROW_ALIVE)
 
             ! TEXT is blob-backed and changed via db_set_text; the caller's

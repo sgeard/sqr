@@ -907,7 +907,12 @@ contains
         if (mode == 'old') then
             inquire(unit=u, size=fsize)
             if (fsize > 0) then
-                recovered = int(fsize / tbl%record_size, int32) + 1_int32
+                ! Compute in int64: a file implying more records than the
+                ! int32 id space can address is clamped — the rows beyond
+                ! huge(int32)-1 are unreachable and the insert guard then
+                ! refuses new rows with SQR_FULL.
+                recovered = int(min(fsize / int(tbl%record_size, int64) + 1_int64, &
+                                    int(huge(0_int32), int64)), int32)
                 if (recovered > tbl%next_id) then
                     ! A crash left both counters stale together. Having moved
                     ! next_id to the true high-water, recount the live rows so

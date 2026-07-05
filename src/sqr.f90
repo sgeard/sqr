@@ -17,6 +17,11 @@
 !! the composite key bytes to the `int32` row id — see the generic
 !! `b_tree` module.
 !!
+!! Row ids are `int32` record slots, so a table holds at most ~2.1e9
+!! rows; once the id space is exhausted inserts fail with `SQR_FULL`.
+!! Deleting rows does not free ids (tombstones keep their slots) —
+!! `db_compact` rewrites the table and reclaims the space.
+!!
 !! A fixed magic + version is written into every `.schema` file; a
 !! mismatch on open returns `SQR_VERSION`.  Errors are reported via
 !! optional `stat`/`errmsg` out arguments — there is no `error stop` in
@@ -55,6 +60,7 @@ module sqr
     integer, parameter, public :: SQR_READONLY  = 6  !! Write attempted on a read-only open
     integer, parameter, public :: SQR_LOCKED    = 7  !! Database held by another connection
     integer, parameter, public :: SQR_NO_UNDO   = 8  !! Nothing on the undo (or redo) history to apply
+    integer, parameter, public :: SQR_FULL      = 9  !! Row-id space exhausted (`int32` ids: ~2.1e9 rows per table)
 
     ! --- On-disk format version ---
     !! Current on-disk format version.  There is a single format: composite
@@ -247,6 +253,7 @@ module sqr
         procedure :: compact      => db_compact
         procedure :: list_tables  => db_list_tables
         procedure :: table_index  => db_table_index
+        procedure :: record_size  => db_record_size
         procedure :: insert       => db_insert
         procedure :: insert_many  => db_insert_many
         procedure :: get          => db_get
@@ -327,7 +334,7 @@ module sqr
     public :: db_create_table, db_drop_table, db_compact
     public :: db_pack, db_unpack
     public :: db_add_column, db_drop_column
-    public :: db_list_tables, db_table_index, idx_live
+    public :: db_list_tables, db_table_index, db_record_size, idx_live
     public :: db_insert, db_get, db_update, db_delete, db_scan
     public :: db_set_text, db_get_text
     public :: db_create_index, db_drop_index
@@ -582,6 +589,18 @@ module sqr
             integer                      :: idx  !! Slot in `db%tables`, 0 if absent
         end function
 
+        !! Exact buffer length (bytes) required by `db_insert`/`db_update`/
+        !! `db_get` for `name`'s rows — size caller buffers with this
+        !! (`allocate(character(len=db%record_size('t')) :: buf)`).  Writes
+        !! reject any other length with `SQR_INVALID`; reads fill whatever
+        !! buffer is supplied.  0 if there is no such table (or the handle
+        !! is closed).
+        pure module function db_record_size(db, name) result(sz)
+            class(db_t),       intent(in) :: db  !! Database handle
+            character(len=*), intent(in) :: name  !! Table name to look up
+            integer                      :: sz  !! Record size in bytes, 0 if absent
+        end function
+
         !! `.true.` if an index slot is live; `.false.` if it has been dropped
         !! (tombstoned with `ncols = 0`).  Callers walking `table_t%indices`
         !! must skip dead slots — their `columns` array is deallocated.
@@ -591,9 +610,13 @@ module sqr
         end function
 
         !! Insert a row.  `buf` is a row-shaped buffer filled via the
-        !! `row_set_*` helpers; `DT_TEXT` columns are zeroed here and
+        !! `row_set_*` helpers; its length must be exactly
+        !! `db_record_size(db, table_name)` — anything else is rejected
+        !! with `SQR_INVALID` (padding or truncating silently would store
+        !! a malformed row).  `DT_TEXT` columns are zeroed here and
         !! populated afterwards with `db_set_text`.  A unique-index
-        !! violation fails with `SQR_DUP` and writes no row.
+        !! violation fails with `SQR_DUP` and writes no row; an exhausted
+        !! row-id space fails with `SQR_FULL`.
         module subroutine db_insert(db, table_name, buf, row_id, stat)
             class(db_t),       intent(inout)        :: db  !! Database handle
             character(len=*), intent(in)           :: table_name  !! Target table
@@ -603,7 +626,10 @@ module sqr
         end subroutine
 
         !! Fetch a live row by id into `buf`.  A tombstoned or
-        !! out-of-range row returns `SQR_NOT_FOUND`.
+        !! out-of-range row returns `SQR_NOT_FOUND`.  Reads are tolerant of
+        !! the buffer length (the record is truncated or blank-padded to
+        !! fit), but `db_record_size(db, table_name)` is the length that
+        !! captures the whole record.
         module subroutine db_get(db, table_name, row_id, buf, stat)
             class(db_t),       intent(inout)        :: db  !! Database handle
             character(len=*), intent(in)           :: table_name  !! Target table
@@ -616,7 +642,9 @@ module sqr
         !! so the on-disk slot never changes; index entries are maintained
         !! for any indexed column whose key bytes change.  `DT_TEXT`
         !! descriptors are preserved from the stored row (text is changed
-        !! via `db_set_text`, as for insert).
+        !! via `db_set_text`, as for insert).  As for insert, `buf` must be
+        !! exactly `db_record_size(db, table_name)` long or the update is
+        !! rejected with `SQR_INVALID`.
         module subroutine db_update(db, table_name, row_id, buf, stat)
             class(db_t),       intent(inout)        :: db  !! Database handle
             character(len=*), intent(in)           :: table_name  !! Target table
@@ -714,7 +742,8 @@ module sqr
         !! against the existing index *and* within the batch) before anything is
         !! written, so a `SQR_DUP` / `SQR_INVALID` violation rejects the whole
         !! batch with nothing inserted (`row_ids = 0`).  `row_ids` must be at
-        !! least `size(bufs)` long.
+        !! least `size(bufs)` long, and — as for `db_insert` — the buffers
+        !! exactly `db_record_size(db, table_name)` long.
         module subroutine db_insert_many(db, table_name, bufs, row_ids, stat)
             class(db_t),       intent(inout)         :: db  !! Database handle
             character(len=*), intent(in)            :: table_name  !! Target table
