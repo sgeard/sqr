@@ -4,12 +4,17 @@
 !! of `sql_base` by host association.
 !!
 !! The planner is intentionally small: a SELECT/DELETE/UPDATE whose WHERE is a
-!! single equality on an indexed column is driven through `db_find_range`
-!! (an ordered cursor); everything else is a full `db_scan`.  Either way the
-!! complete WHERE predicate is re-evaluated on every gathered row, so an
-!! index-driven plan and a scan plan always yield identical results.
+!! single band-shaped condition (`=`, `BETWEEN`, `<`, `<=`, `>`, `>=`) on an
+!! indexed column is driven through `db_find_range` (an ordered cursor);
+!! everything else is a full `db_scan`.  Either way the complete WHERE
+!! predicate is re-evaluated on every gathered row, so an index-driven plan
+!! and a scan plan always yield identical results — the open half of an
+!! exclusive bound (`<`, `>`) is included in the band and filtered by that
+!! re-evaluation, so no key arithmetic is needed.
 
 submodule (sql:sql_base) sql_executor
+    use, intrinsic :: ieee_arithmetic, only: ieee_value, &
+                                             ieee_negative_inf, ieee_positive_inf
     implicit none
 
     !! Gathering context for a `db_scan` (and reused by the cursor path): the
@@ -506,10 +511,14 @@ contains
         if (rs /= SQR_OK .and. present(errmsg)) errmsg = 'scan failed'
     end subroutine
 
-    ! If the WHERE is exactly one equality (`col = literal`) on a column with a
-    ! usable index, drive it through db_find_range as a single-key band and set
-    ! used_index.  Any non-equality, multi-condition, or un-indexed case leaves
-    ! used_index .false. (caller falls back to a scan).
+    ! If the WHERE is exactly one band-shaped condition (`=`, `BETWEEN`,
+    ! `<`, `<=`, `>`, `>=`) on a column with a usable index, drive it
+    ! through db_find_range as an inclusive band and set used_index.  An
+    ! exclusive bound's endpoint is inside the band; row_matches filters
+    ! it on the way out, so every plan yields exactly the scan's rows.
+    ! Any other shape — multi-condition, OR groups, `<>`, IS [NOT] NULL,
+    ! un-indexed or literal/column type mismatch — leaves used_index
+    ! .false. (caller falls back to a scan).
     subroutine try_index_gather(db, ti, stmt, g, used_index, rs, errmsg)
         type(db_t),            intent(inout), target :: db
         integer,               intent(in)    :: ti
@@ -530,39 +539,90 @@ contains
         if (size(stmt%where_groups) /= 1) return
         if (size(stmt%where_groups(1)%conds) /= 1) return
         c = stmt%where_groups(1)%conds(1)
-        if (c%op /= OP_EQ) return
+        select case (c%op)
+        case (OP_EQ, OP_BETWEEN, OP_LT, OP_LE, OP_GT, OP_GE)
+            continue                        ! a band the index can serve
+        case default
+            return                          ! <>, IS [NOT] NULL: scan
+        end select
         ci = col_index(db%tables(ti), trim(c%col))
         if (ci == 0) return
 
-        ! Open a single-key band on the column's type; SQR_NOT_FOUND ⇒ no index.
+        ! Open the band on the column's type.
         associate (col => db%tables(ti)%cols(ci))
             select case (col%dtype)
             case (DT_INT)
                 ! cond_true compares in real64 space, so a REAL literal can match
                 ! an INT column (WHERE i = 3.0). The index band is keyed on the
                 ! stored int32, and c%lit%ival is 0 for a REAL literal — driving it
-                ! would silently miss. Only an INT literal maps to an exact int key;
+                ! would silently miss. Only INT literals map to exact int keys;
                 ! otherwise fall back to the scan (which handles the cross-type
                 ! compare correctly and identically).
                 if (c%lit%ltype /= LIT_INT) return
-                call db_find_range(db, trim(stmt%table), trim(c%col), &
-                    c%lit%ival, c%lit%ival, cur, frs)
+                if (c%op == OP_BETWEEN .and. c%lit2%ltype /= LIT_INT) return
+                block
+                    integer(int32) :: ilo, ihi
+                    select case (c%op)
+                    case (OP_EQ)
+                        ilo = c%lit%ival;             ihi = c%lit%ival
+                    case (OP_BETWEEN)
+                        ilo = c%lit%ival;             ihi = c%lit2%ival
+                    case (OP_GT, OP_GE)
+                        ilo = c%lit%ival;             ihi = huge(0_int32)
+                    case default                      ! OP_LT, OP_LE
+                        ilo = -huge(0_int32) - 1_int32; ihi = c%lit%ival
+                    end select
+                    call db_find_range(db, trim(stmt%table), trim(c%col), &
+                                       ilo, ihi, cur, frs)
+                end block
             case (DT_REAL)
                 block
-                    real(real64) :: key
-                    key = lit_num(c%lit)
-                    call db_find_range(db, trim(stmt%table), trim(c%col), key, key, cur, frs)
+                    real(real64) :: rlo, rhi
+                    ! Open ends are the IEEE infinities, not ±huge: a stored
+                    ! ±inf must fall inside "any value" for the band to match
+                    ! the scan.
+                    select case (c%op)
+                    case (OP_EQ)
+                        rlo = lit_num(c%lit);  rhi = rlo
+                    case (OP_BETWEEN)
+                        rlo = lit_num(c%lit);  rhi = lit_num(c%lit2)
+                    case (OP_GT, OP_GE)
+                        rlo = lit_num(c%lit);  rhi = ieee_value(rhi, ieee_positive_inf)
+                    case default                      ! OP_LT, OP_LE
+                        rlo = ieee_value(rlo, ieee_negative_inf);  rhi = lit_num(c%lit)
+                    end select
+                    call db_find_range(db, trim(stmt%table), trim(c%col), &
+                                       rlo, rhi, cur, frs)
                 end block
             case (DT_CHAR)
                 if (c%lit%ltype /= LIT_STR) return
-                call db_find_range(db, trim(stmt%table), trim(c%col), &
-                    c%lit%sval, c%lit%sval, cur, frs)
+                if (c%op == OP_BETWEEN .and. c%lit2%ltype /= LIT_STR) return
+                block
+                    character(len=:), allocatable :: slo, shi
+                    ! '' trims to the all-NUL minimum; char(255)×width is
+                    ! member_max's byte-lexicographic maximum.
+                    select case (c%op)
+                    case (OP_EQ)
+                        slo = c%lit%sval;  shi = c%lit%sval
+                    case (OP_BETWEEN)
+                        slo = c%lit%sval;  shi = c%lit2%sval
+                    case (OP_GT, OP_GE)
+                        slo = c%lit%sval;  shi = repeat(char(255), col%csize)
+                    case default                      ! OP_LT, OP_LE
+                        slo = '';          shi = c%lit%sval
+                    end select
+                    call db_find_range(db, trim(stmt%table), trim(c%col), &
+                                       slo, shi, cur, frs)
+                end block
             case default
                 return                      ! TEXT or unknown: scan
             end select
         end associate
 
         if (frs == SQR_NOT_FOUND) return    ! no index on the column: fall back to scan
+        if (frs == SQR_INVALID) return      ! band the index can't express (e.g. a
+                                            ! bound wider than the column): the scan
+                                            ! compares it correctly instead
         if (frs /= SQR_OK) then
             rs = frs
             if (present(errmsg)) errmsg = 'index lookup failed'

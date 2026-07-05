@@ -32,6 +32,8 @@ program utest_sql
     call test_update_delete()
     call test_index_scan_parity()
     call test_index_scan_parity_sweep()
+    call test_index_band_parity_sweep()
+    call test_band_uses_index()
     call test_transactions()
     call test_exec_errors()
     call test_insert_dup_column()
@@ -517,6 +519,100 @@ contains
         call parity_probe('sweep char store+query-blank', &
             "CREATE TABLE t (c CHAR(8))", "INSERT INTO t VALUES ('b  '),('x'),('b ')", &
             't (c)', "SELECT c FROM t WHERE c = 'b '", 2)
+    end subroutine
+
+    ! Band-shaped predicates (BETWEEN, <, <=, >, >=) driven through the
+    ! index must yield exactly the scan's rows — endpoints (exclusive vs
+    ! inclusive), empty bands, open ends at the sentinels, and the
+    ! literal-type fallbacks all swept per column type.
+    subroutine test_index_band_parity_sweep()
+        character(len=*), parameter :: IDDL = "CREATE TABLE t (i INTEGER)"
+        character(len=*), parameter :: IINS = "INSERT INTO t VALUES (1),(3),(3),(5)"
+        character(len=*), parameter :: RDDL = "CREATE TABLE t (r REAL)"
+        character(len=*), parameter :: RINS = "INSERT INTO t VALUES (1.0),(3.0),(3.0),(5.0)"
+        character(len=*), parameter :: CDDL = "CREATE TABLE t (c CHAR(8))"
+        character(len=*), parameter :: CINS = "INSERT INTO t VALUES ('a'),('b'),('a'),('c ')"
+
+        ! --- INT column ---
+        call parity_probe('band int between', IDDL, IINS, 't (i)', &
+            "SELECT i FROM t WHERE i BETWEEN 2 AND 4", 2)
+        call parity_probe('band int between point', IDDL, IINS, 't (i)', &
+            "SELECT i FROM t WHERE i BETWEEN 3 AND 3", 2)
+        call parity_probe('band int between empty', IDDL, IINS, 't (i)', &
+            "SELECT i FROM t WHERE i BETWEEN 4 AND 2", 0)
+        call parity_probe('band int lt', IDDL, IINS, 't (i)', &
+            "SELECT i FROM t WHERE i < 3", 1)
+        call parity_probe('band int le', IDDL, IINS, 't (i)', &
+            "SELECT i FROM t WHERE i <= 3", 3)
+        call parity_probe('band int gt', IDDL, IINS, 't (i)', &
+            "SELECT i FROM t WHERE i > 3", 1)
+        call parity_probe('band int ge', IDDL, IINS, 't (i)', &
+            "SELECT i FROM t WHERE i >= 3", 3)
+        call parity_probe('band int gt max stored', IDDL, IINS, 't (i)', &
+            "SELECT i FROM t WHERE i > 5", 0)
+        call parity_probe('band int ge int-min', IDDL, IINS, 't (i)', &
+            "SELECT i FROM t WHERE i >= -2147483648", 4)
+        call parity_probe('band int real literal', IDDL, IINS, 't (i)', &
+            "SELECT i FROM t WHERE i < 3.5", 3)
+        call parity_probe('band int between mixed literals', IDDL, IINS, 't (i)', &
+            "SELECT i FROM t WHERE i BETWEEN 1 AND 3.5", 3)
+
+        ! --- REAL column ---
+        call parity_probe('band real between', RDDL, RINS, 't (r)', &
+            "SELECT r FROM t WHERE r BETWEEN 2.0 AND 4.0", 2)
+        call parity_probe('band real lt', RDDL, RINS, 't (r)', &
+            "SELECT r FROM t WHERE r < 3.0", 1)
+        call parity_probe('band real ge', RDDL, RINS, 't (r)', &
+            "SELECT r FROM t WHERE r >= 3.0", 3)
+        call parity_probe('band real gt int literal', RDDL, RINS, 't (r)', &
+            "SELECT r FROM t WHERE r > 5", 0)
+        call parity_probe('band real le int literal', RDDL, RINS, 't (r)', &
+            "SELECT r FROM t WHERE r <= 1", 1)
+
+        ! --- CHAR column (store includes a trailing-blank row) ---
+        call parity_probe('band char between', CDDL, CINS, 't (c)', &
+            "SELECT c FROM t WHERE c BETWEEN 'a' AND 'b'", 3)
+        call parity_probe('band char between all', CDDL, CINS, 't (c)', &
+            "SELECT c FROM t WHERE c BETWEEN 'a' AND 'c'", 4)
+        call parity_probe('band char lt', CDDL, CINS, 't (c)', &
+            "SELECT c FROM t WHERE c < 'b'", 2)
+        call parity_probe('band char le', CDDL, CINS, 't (c)', &
+            "SELECT c FROM t WHERE c <= 'b'", 3)
+        call parity_probe('band char gt', CDDL, CINS, 't (c)', &
+            "SELECT c FROM t WHERE c > 'a'", 2)
+        call parity_probe('band char ge', CDDL, CINS, 't (c)', &
+            "SELECT c FROM t WHERE c >= 'b'", 2)
+        call parity_probe('band char gt mid-key', CDDL, CINS, 't (c)', &
+            "SELECT c FROM t WHERE c > 'aa'", 2)
+        call parity_probe('band char lt over-wide bound', CDDL, CINS, 't (c)', &
+            "SELECT c FROM t WHERE c < 'zzzzzzzzzz'", 4)
+    end subroutine
+
+    ! Parity proves band plans return the right rows; this proves they
+    ! actually go through the index: without ORDER BY an index-driven
+    ! gather yields key order, a scan yields rowid (insertion) order.
+    subroutine test_band_uses_index()
+        type(db_t) :: db
+        type(sql_result_t) :: res
+        integer :: rs
+        call fresh_db(db)
+        call run(db, "CREATE TABLE t (i INTEGER)", res, rs)
+        call run(db, "INSERT INTO t VALUES (5),(1),(3)", res, rs)
+        call run(db, "SELECT i FROM t WHERE i > 0", res, rs)
+        call check(res%nrows == 3 .and. cell(res,1,1) == '5', &
+                   'band plan: unindexed > scans in rowid order')
+        call run(db, "CREATE INDEX ON t (i)", res, rs)
+        call run(db, "SELECT i FROM t WHERE i > 0", res, rs)
+        call check(rs == SQR_OK .and. res%nrows == 3 .and. &
+                   cell(res,1,1) == '1' .and. cell(res,3,1) == '5', &
+                   'band plan: > drives the index (key order)')
+        call run(db, "SELECT i FROM t WHERE i BETWEEN 1 AND 5", res, rs)
+        call check(res%nrows == 3 .and. cell(res,1,1) == '1', &
+                   'band plan: BETWEEN drives the index')
+        call run(db, "SELECT i FROM t WHERE i <= 3", res, rs)
+        call check(res%nrows == 2 .and. cell(res,1,1) == '1' .and. cell(res,2,1) == '3', &
+                   'band plan: <= drives the index')
+        call db_close(db)
     end subroutine
 
     ! ===================== transactions =====================
