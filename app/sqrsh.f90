@@ -1165,7 +1165,7 @@ program sqrsh
     implicit none
 
     type(engine_t) :: ui
-    character(len=256) :: arg
+    character(len=4096) :: arg   ! generous path buffer, matches sqlsh
 
 #ifdef SQR_WITH_REGEX
     ! The regex `match` command is supplied as an external procedure by the

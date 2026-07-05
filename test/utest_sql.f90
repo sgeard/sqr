@@ -34,6 +34,9 @@ program utest_sql
     call test_index_scan_parity_sweep()
     call test_transactions()
     call test_exec_errors()
+    call test_insert_dup_column()
+    call test_int_min_literal()
+    call test_bare_semicolon()
     call test_functional_example()
 
     call cleanup_dir()
@@ -627,6 +630,57 @@ contains
         call run(db, "SELECT * FROM employee", res, rs)
         call check(res%nrows == 4, 'example: final headcount')
 
+        call db_close(db)
+    end subroutine
+
+    ! Review §3: INSERT naming the same column twice silently took the
+    ! later value — it must be rejected.
+    subroutine test_insert_dup_column()
+        type(db_t) :: db
+        type(sql_result_t) :: res
+        integer :: rs
+        call fresh_db(db)
+        call run(db, 'CREATE TABLE t (a INTEGER, b INTEGER)', res, rs)
+        call run(db, 'INSERT INTO t (a, a) VALUES (1, 2)', res, rs)
+        call check(rs == SQR_INVALID, 'insert: duplicate column rejected')
+        call run(db, 'SELECT * FROM t', res, rs)
+        call check(res%nrows == 0, 'insert: rejected row not stored')
+        call run(db, 'INSERT INTO t (a, b) VALUES (1, 2)', res, rs)
+        call check(rs == SQR_OK, 'insert: distinct columns still accepted')
+        call db_close(db)
+    end subroutine
+
+    ! Review §3: the int32 minimum was rejected because the magnitude was
+    ! read before the sign was applied.
+    subroutine test_int_min_literal()
+        type(db_t) :: db
+        type(sql_result_t) :: res
+        integer :: rs
+        call fresh_db(db)
+        call run(db, 'CREATE TABLE t (a INTEGER)', res, rs)
+        call run(db, 'INSERT INTO t VALUES (-2147483648)', res, rs)
+        call check(rs == SQR_OK, 'literal: -2147483648 accepted')
+        call run(db, 'SELECT a FROM t WHERE a = -2147483648', res, rs)
+        call check(rs == SQR_OK .and. res%nrows == 1, 'literal: int32 minimum round-trips')
+        call check(cell(res,1,1) == '-2147483648', 'literal: rendered value exact')
+        call run(db, 'INSERT INTO t VALUES (2147483648)', res, rs)
+        call check(rs == SQR_INVALID, 'literal: 2147483648 still out of range')
+        call run(db, 'INSERT INTO t VALUES (-2147483649)', res, rs)
+        call check(rs == SQR_INVALID, 'literal: -2147483649 out of range')
+        call db_close(db)
+    end subroutine
+
+    ! Review §3: a bare ';' is an empty statement, not a parse error.
+    subroutine test_bare_semicolon()
+        type(db_t) :: db
+        type(sql_result_t) :: res
+        integer :: rs
+        call fresh_db(db)
+        call run(db, ';', res, rs)
+        call check(rs == SQR_OK, 'parse: bare semicolon is a no-op')
+        call check(res%kind == SQLRES_NONE, 'parse: bare semicolon yields empty result')
+        call run(db, '  ;  ', res, rs)
+        call check(rs == SQR_OK, 'parse: padded semicolon is a no-op')
         call db_close(db)
     end subroutine
 

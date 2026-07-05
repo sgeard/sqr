@@ -381,12 +381,14 @@ contains
         end if
         call open_data(db, tbl, 'new', rs)
         if (rs /= SQR_OK) then
+            call discard_new_table(db, tbl)   ! remove the schema file
             if (present(stat)) stat = rs
             return
         end if
         if (table_has_text(tbl)) then
             call open_blob(db, tbl, 'replace', rs)
             if (rs /= SQR_OK) then
+                call discard_new_table(db, tbl)   ! close+delete .dat, remove schema
                 if (present(stat)) stat = rs
                 return
             end if
@@ -400,11 +402,36 @@ contains
 
         call write_catalog(db, rs)
         if (rs /= SQR_OK) then
+            ! The on-disk catalog does not name the table: take it back out
+            ! of memory (the slot beyond ntables is never referenced) and
+            ! remove its files so no orphans remain.
+            db%ntables = db%ntables - 1
+            call discard_new_table(db, tbl)
             if (present(stat)) stat = rs
             return
         end if
 
         if (present(stat)) stat = SQR_OK
+    end subroutine
+
+    !! Undo a half-created table: close its open units (deleting the files
+    !! they are connected to) and remove the schema file.  Used only by the
+    !! db_create_table failure tails, where the contract is "no trace left"
+    !! rather than leaked units and orphan files.
+    subroutine discard_new_table(db, tbl)
+        type(db_t),    intent(in)    :: db
+        type(table_t), intent(inout) :: tbl
+        integer :: u, ios
+        if (tbl%unit /= -1) then
+            close(tbl%unit, status='delete', iostat=ios)
+            tbl%unit = -1
+        end if
+        if (tbl%blob_unit /= -1) then
+            close(tbl%blob_unit, status='delete', iostat=ios)
+            tbl%blob_unit = -1
+        end if
+        open(newunit=u, file=schema_path(db, trim(tbl%name)), status='old', iostat=ios)
+        if (ios == 0) close(u, status='delete')
     end subroutine
 
     module subroutine db_drop_table(db, name, stat)
@@ -773,6 +800,12 @@ contains
     module subroutine db_list_tables(db, names)
         class(db_t),                               intent(in)  :: db
         character(len=SQR_NAME_LEN), allocatable, intent(out) :: names(:)
+        ! A handle that was never opened has db%tables unallocated — even a
+        ! zero-length section of it is not referenceable.
+        if (.not. allocated(db%tables)) then
+            allocate(names(0))
+            return
+        end if
         names = db%tables(1:db%ntables)%name
     end subroutine
 

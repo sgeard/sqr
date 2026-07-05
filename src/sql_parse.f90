@@ -240,6 +240,10 @@ contains
         end if
 
         p = 1
+        if (is_punct(tk(), ';') .and. ntok == 1) then
+            stmt%kind = ST_NONE     ! a bare ';' — an empty statement, no-op
+            return
+        end if
         call parse_statement()
         if (had_err) then
             call set_err(stat, errmsg, SQR_INVALID, emsg)
@@ -425,6 +429,7 @@ contains
             type(sql_lit_t), intent(out) :: lit
             logical :: neg
             integer :: ios
+            integer(int64) :: big
             character(len=:), allocatable :: s
             neg = .false.
             if (is_punct(tk(), '-')) then
@@ -436,12 +441,22 @@ contains
             case (TK_INT)
                 lit%ltype = LIT_INT
                 s = cur_text()
-                read(s, *, iostat=ios) lit%ival
+                ! The token is an unsigned magnitude; the sign is applied
+                ! afterwards.  Read in int64 and range-check the *signed*
+                ! value so -2147483648 (whose magnitude overflows int32)
+                ! is accepted.
+                read(s, *, iostat=ios) big
                 if (ios /= 0) then
                     call errf(cur_col(), 'integer literal out of range')
                     return
                 end if
-                if (neg) lit%ival = -lit%ival
+                if (neg) big = -big
+                if (big > int(huge(0_int32), int64) .or. &
+                    big < -int(huge(0_int32), int64) - 1_int64) then
+                    call errf(cur_col(), 'integer literal out of range')
+                    return
+                end if
+                lit%ival = int(big, int32)
                 call adv()
             case (TK_REAL)
                 lit%ltype = LIT_REAL

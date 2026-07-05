@@ -787,12 +787,15 @@ module sqr
 
         !! Equality lookup on an indexed `real64` column.
         !!
-        !! Exact, bit-for-bit equality — deliberately no epsilon.  Storage
-        !! is a pure binary `transfer` with no decimal round-trip, so the
-        !! same `real64` value that was inserted matches; a value the
-        !! caller recomputes differently (`0.1+0.2` vs a stored `0.3`)
-        !! will not — that is inherent to floating point.  Tolerance
-        !! matching is a range query, not an equality lookup.
+        !! Exact value equality — deliberately no epsilon.  Keys are
+        !! compared as decoded `real64` values, so `-0.0` and `+0.0` are
+        !! equal (and duplicates of each other under a unique index)
+        !! despite differing bit patterns.  Storage is a pure binary
+        !! `transfer` with no decimal round-trip, so the same `real64`
+        !! value that was inserted matches; a value the caller recomputes
+        !! differently (`0.1+0.2` vs a stored `0.3`) will not — that is
+        !! inherent to floating point.  Tolerance matching is a range
+        !! query, not an equality lookup.
         module subroutine db_find_by_real(db, table_name, col_name, key, row_id, stat)
             class(db_t),       intent(inout)        :: db  !! Database handle
             character(len=*), intent(in)           :: table_name  !! Target table

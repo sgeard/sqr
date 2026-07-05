@@ -60,7 +60,9 @@ FAULT_SM_OBJ := $(ODIR)/sqr_fault_$(FAULT)_sm.o
 # preprocessor reliably predefines _WIN32. A plain C compiler suffices and its
 # objects are ABI-compatible with every Fortran compiler offered here.
 CC     ?= cc
-CFLAGS ?= -O2 -Wall -Wextra
+# -D_FILE_OFFSET_BITS=64: a 64-bit off_t on 32-bit glibc targets, so
+# sqr_os_truncate's int64 length survives the cast (no-op on 64-bit hosts).
+CFLAGS ?= -O2 -Wall -Wextra -D_FILE_OFFSET_BITS=64
 
 # The platform shim is C; everything else is Fortran.
 LIB_C_SRC := osshim.c

@@ -67,7 +67,9 @@ static int rmtree_win(const char *path) {
     HANDLE h;
     int ierr = 0;
 
-    snprintf(pat, sizeof pat, "%s\\*", path);
+    /* A truncated path would make us list/delete the wrong tree — treat
+       overflow as a failure rather than acting on the mangled name. */
+    if (snprintf(pat, sizeof pat, "%s\\*", path) >= (int)sizeof pat) return 1;
     h = FindFirstFileA(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) {
         /* No listing — remove the (presumably empty) directory itself. */
@@ -77,7 +79,10 @@ static int rmtree_win(const char *path) {
         const char *name = fd.cFileName;
         char child[MAX_PATH];
         if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
-        snprintf(child, sizeof child, "%s\\%s", path, name);
+        if (snprintf(child, sizeof child, "%s\\%s", path, name) >= (int)sizeof child) {
+            ierr = 1;                   /* name too long: skip, report failure */
+            continue;
+        }
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             if (rmtree_win(child) != 0) ierr = 1;
         } else {
@@ -236,7 +241,10 @@ int sqr_os_truncate(const char *p, int64_t length) {
 int sqr_os_lock_try(const char *p, int exclusive, int64_t *tok) {
     int fd, op;
     *tok = -1;
-    fd = open(p, O_RDWR | O_CREAT, 0644);
+    /* O_CLOEXEC: don't leak the lock fd into spawned children (e.g. a Tk
+       renderer) — a child holding it would pin the lock past our release.
+       (c_lock_release does an explicit LOCK_UN, so this is belt-and-braces.) */
+    fd = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (fd < 0) return 2;               /* cannot open/create the lock file */
     op = (exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB;
     if (flock(fd, op) == 0) {

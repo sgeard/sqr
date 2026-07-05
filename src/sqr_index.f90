@@ -245,7 +245,8 @@ contains
         if (present(stat)) stat = rs
     end subroutine
 
-    ! Exact bit-for-bit equality — see the interface comment in sqr.f90.
+    ! Exact decoded-value equality (±0.0 equal) — see the interface
+    ! comment in sqr.f90.
     module subroutine db_find_by_real(db, table_name, col_name, key, row_id, stat)
         class(db_t),       intent(inout)        :: db
         character(len=*), intent(in)           :: table_name

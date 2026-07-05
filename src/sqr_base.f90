@@ -1483,10 +1483,12 @@ contains
     end subroutine
 
 
-    ! Walk index j in ascending (key,row_id) order; report whether two
-    ! consecutive entries share a key and both point at live rows. `found`
-    ! is in/out: the unique flag goes in, .true. comes back iff a
-    ! duplicate live key exists.
+    ! Walk index j in ascending (key,row_id) order; report whether two live
+    ! rows share a key. Dead entries are skipped, not treated as run
+    ! breakers: the previous key kept for comparison is the last *live* key
+    ! seen, so (k,live)(k,dead)(k,live) is still a duplicate. `found` is
+    ! in/out: the unique flag goes in, .true. comes back iff a duplicate
+    ! live key exists.
     subroutine has_dup_live_keys(db, ti, j, found, stat)
         type(db_t), intent(inout) :: db
         integer,    intent(in)    :: ti, j
@@ -1494,7 +1496,7 @@ contains
         integer,    intent(out)   :: stat
         integer :: bs, ios
         integer(int32) :: rid
-        logical :: ok, have_prev, alive, alive_prev
+        logical :: ok, have_live
         character(len=:), allocatable :: ckey, pkey, rbuf
         type(bt_cursor_t) :: cur
         found = .false.
@@ -1507,8 +1509,7 @@ contains
                 stat = SQR_ERR
                 return
             end if
-            have_prev  = .false.
-            alive_prev = .false.
+            have_live = .false.
             pairs: do
                 call bt_next(ix%bt, cur, ckey, rid, ok, bs)
                 if (bs /= BT_OK) then
@@ -1522,16 +1523,15 @@ contains
                     stat = SQR_ERR
                     return
                 end if
-                alive = row_status(rbuf) == ROW_ALIVE
-                if (have_prev .and. alive .and. alive_prev) then
+                if (row_status(rbuf) /= ROW_ALIVE) cycle pairs
+                if (have_live) then
                     if (key_cmp_ix(t, ix, pkey, ckey) == 0) then
                         found = .true.
                         return
                     end if
                 end if
-                pkey       = ckey
-                alive_prev = alive
-                have_prev  = .true.
+                pkey      = ckey
+                have_live = .true.
             end do pairs
         end associate
     end subroutine

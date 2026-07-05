@@ -57,6 +57,9 @@ program utest_sqr
     call test_leading_column()
     call test_drop_index()
     call test_db_verify()
+    call test_verify_dup_split_by_dead()
+    call test_list_tables_closed()
+    call test_create_table_cleanup()
     call test_insert_many()
     call test_alter_column()
     call test_oo_bindings()
@@ -3557,6 +3560,108 @@ contains
 
         call db_close(db)
         ios = c_rmtree(VDIR)
+    end subroutine
+
+    ! Review §3: has_dup_live_keys must catch (k,live)(k,dead)(k,live) —
+    ! adjacent-pair comparison missed a duplicate split by a dead entry.
+    subroutine test_verify_dup_split_by_dead()
+        character(len=*), parameter :: VDIR = 'utest_sqr_dupdead_db'
+        type(db_t) :: db
+        type(column_t) :: c(3)
+        integer :: rs, ios, ti, rsz, u
+        character(len=:), allocatable :: buf
+        character(len=128) :: emsg
+
+        ios = c_rmtree(VDIR)
+        c(1)%name = 'id'  ; c(1)%dtype = DT_INT ; c(1)%csize = 4
+        c(2)%name = 'age' ; c(2)%dtype = DT_INT ; c(2)%csize = 4
+        c(3)%name = 'name'; c(3)%dtype = DT_CHAR; c(3)%csize = 8
+        call db_open(db, VDIR, rs, emsg)
+        call db_create_table(db, 'p', c, rs, emsg)
+        call db_create_index(db, 'p', 'age', rs, unique=.true.)
+        ti = db_table_index(db, 'p')
+        ! Three same-key inserts with deletes in between are legal under a
+        ! unique index (dead rows don't count); deletes never touch the
+        ! index, so it keeps all three key-50 entries in rid order.
+        call ins_ic3(db, 'p', ti, 1_int32, 50_int32, 'a', buf)
+        call db_delete(db, 'p', 1_int32, rs)
+        call ins_ic3(db, 'p', ti, 2_int32, 50_int32, 'b', buf)
+        call db_delete(db, 'p', 2_int32, rs)
+        call ins_ic3(db, 'p', ti, 3_int32, 50_int32, 'c', buf)
+        call ins_ic3(db, 'p', ti, 4_int32, 70_int32, 'd', buf)
+        call db_verify(db, 'p', rs, emsg)
+        call check(rs == SQR_OK, 'dup-by-dead: legal history verifies clean')
+
+        ! Corrupt: resurrect rid1 and tombstone rid4. Live-row recount and
+        ! per-index matched-entry counts still balance, so only the
+        ! duplicate-key walk can see the fault: the key-50 entries are now
+        ! (50,rid1)live (50,rid2)dead (50,rid3)live.
+        rsz = db%tables(ti)%record_size
+        call db_close(db)
+        open(newunit=u, file=VDIR // '/p.dat', access='stream', form='unformatted', &
+             status='old', action='readwrite', iostat=ios)
+        write(u, pos=int(1 - 1, kind=8)*rsz + 1) ROW_ALIVE
+        write(u, pos=int(4 - 1, kind=8)*rsz + 1) ROW_TOMBSTONE
+        close(u)
+        call db_open(db, VDIR, rs, emsg)
+        call db_verify(db, 'p', rs, emsg)
+        call check(rs == SQR_INVALID, 'dup-by-dead: duplicate split by dead entry detected')
+        call db_close(db)
+        ios = c_rmtree(VDIR)
+    end subroutine
+
+    ! Review §3: db_list_tables on a handle that was never opened must
+    ! return an empty list, not reference an unallocated array.
+    subroutine test_list_tables_closed()
+        type(db_t) :: db
+        character(len=SQR_NAME_LEN), allocatable :: names(:)
+        call db_list_tables(db, names)
+        call check(size(names) == 0, 'list_tables: closed handle -> empty list')
+    end subroutine
+
+    ! Review §3: a mid-failure in db_create_table must leave no trace —
+    ! no leaked unit, no orphan .dat/.schema files, no phantom table.
+    subroutine test_create_table_cleanup()
+        character(len=*), parameter :: CDIR = 'utest_sqr_ctfail_db'
+        type(db_t) :: db
+        type(column_t) :: c(2), ct(2)
+        integer :: rs, ios, u
+        character(len=128) :: emsg
+
+        ios = c_rmtree(CDIR)
+        c(1)%name = 'id' ; c(1)%dtype = DT_INT ; c(1)%csize = 4
+        c(2)%name = 'nm' ; c(2)%dtype = DT_CHAR; c(2)%csize = 8
+        ct(1) = c(1)
+        ct(2)%name = 'note'; ct(2)%dtype = DT_TEXT; ct(2)%csize = SQR_TEXT_DESC
+        call db_open(db, CDIR, rs, emsg)
+
+        ! (a) open_data fails: a blocking file where the fresh '.dat' must go.
+        open(newunit=u, file=CDIR // '/t.dat', status='new', iostat=ios)
+        close(u)
+        call db_create_table(db, 't', c, rs, emsg)
+        call check(rs /= SQR_OK, 'create cleanup: blocked .dat fails')
+        call check(.not. c_path_exists(CDIR // '/t.schema'), &
+                   'create cleanup: schema removed after data-open failure')
+        call check(db_table_index(db, 't') == 0, 'create cleanup: no phantom table (a)')
+        ios = c_remove(CDIR // '/t.dat')
+        call db_create_table(db, 't', c, rs, emsg)
+        call check(rs == SQR_OK, 'create cleanup: succeeds once unblocked')
+
+        ! (b) open_blob fails: a directory squatting on the '.blob' path.
+        ios = c_mkdir(CDIR // '/u.blob')
+        call db_create_table(db, 'u', ct, rs, emsg)
+        call check(rs /= SQR_OK, 'create cleanup: blocked .blob fails')
+        call check(.not. c_path_exists(CDIR // '/u.dat'), &
+                   'create cleanup: data file removed after blob failure')
+        call check(.not. c_path_exists(CDIR // '/u.schema'), &
+                   'create cleanup: schema removed after blob failure')
+        call check(db_table_index(db, 'u') == 0, 'create cleanup: no phantom table (b)')
+        ios = c_rmtree(CDIR // '/u.blob')
+        call db_create_table(db, 'u', ct, rs, emsg)
+        call check(rs == SQR_OK, 'create cleanup: text table succeeds once unblocked')
+
+        call db_close(db)
+        ios = c_rmtree(CDIR)
     end subroutine
 
     ! ===== 5.3 db_insert_many =====

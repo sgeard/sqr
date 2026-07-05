@@ -654,6 +654,7 @@ contains
             if (nk <= mk) then
                 call set_node(pg, K_LEAF, int(nk, int32))
                 call write_page(bt, pid, pg, stat)
+                if (stat /= BT_OK) return   ! nothing landed: don't count it
                 bt%nentries = bt%nentries + 1_int64
                 return
             end if

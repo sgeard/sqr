@@ -228,6 +228,12 @@ contains
                         call set_err(stat, errmsg, SQR_INVALID, 'no such column: ' // trim(stmt%names(c)))
                         return
                     end if
+                    ! A column named twice would silently take the later
+                    ! value — reject rather than guess intent.
+                    if (any(target(1:c-1) == ci)) then
+                        call set_err(stat, errmsg, SQR_INVALID, 'duplicate column: ' // trim(stmt%names(c)))
+                        return
+                    end if
                     target(c) = ci
                 end do
             else
