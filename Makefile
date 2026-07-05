@@ -1,4 +1,4 @@
-.PHONY: all clean veryclean distclean utest sqlttest faulttest run-faulttest bench run-bench coverage coverage-gcov coverage-clean docs docs-clean help windows win-build sqrsh-regex test-regex
+.PHONY: all clean veryclean distclean utest sqlttest faulttest run-faulttest proctest bench run-bench coverage coverage-gcov coverage-clean docs docs-clean help windows win-build sqrsh-regex test-regex
 .SUFFIXES:
 .DEFAULT_GOAL := all
 
@@ -267,6 +267,22 @@ faulttest:
 run-faulttest: $(FAULT_TEST_BIN)
 	@echo "==> $(FAULT_TEST_BIN)" && $(FAULT_TEST_BIN)
 
+# Two-process crash/recovery test (POSIX only). A real child process crashes
+# with a hot journal; the parent recovers it. Links a tiny test-only C shim
+# (procshim.c, fork/exec/waitpid) kept out of libsqr. Not in the default
+# `utest` sweep (forks a subprocess, POSIX-only) — run explicitly.
+PROC_TEST_BIN  := $(ODIR)/proctest$(EXT)
+PROC_SHIM_OBJ  := $(ODIR)/procshim.o
+
+$(PROC_SHIM_OBJ): $(TEST_DIR)/procshim.c | $(ODIR)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+$(PROC_TEST_BIN): $(TEST_DIR)/proctest.f90 $(LIB) $(PROC_SHIM_OBJ) | $(ODIR)
+	$(F) $(F_OPTS) -o $@ $< $(PROC_SHIM_OBJ) $(LIB) $(LFLAGS)
+
+proctest: $(PROC_TEST_BIN)
+	@echo "==> $(PROC_TEST_BIN)" && $(PROC_TEST_BIN)
+
 # Performance benchmark. Always the production (FAULT=off) library and
 # the default optimised build — never debug — so timings are
 # representative. Recursive make pins F through unchanged.
@@ -305,7 +321,7 @@ docs-clean:
 	@rm -vfr $(DOCS_DIR)
 
 clean:
-	@rm -vf $(ODIR)/*.o $(ODIR)/*.mod $(ODIR)/*.smod $(LIB) $(TEST_BIN) $(FAULT_TEST_BIN) $(BENCH_BIN) $(APP_BIN) depends.mk $(OPTIONS_FNAME) *~ *.mod *.smod
+	@rm -vf $(ODIR)/*.o $(ODIR)/*.mod $(ODIR)/*.smod $(LIB) $(TEST_BIN) $(FAULT_TEST_BIN) $(PROC_TEST_BIN) $(PROC_SHIM_OBJ) $(BENCH_BIN) $(APP_BIN) depends.mk $(OPTIONS_FNAME) *~ *.mod *.smod
 
 veryclean: clean
 	@rm -vfr obj_* *.gcov

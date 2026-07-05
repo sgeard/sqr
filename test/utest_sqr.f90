@@ -49,6 +49,8 @@ program utest_sqr
     call test_large_blob()
     call test_compact()
     call test_compact_recovery()
+    call test_deep_tree()
+    call test_torn_journal()
     call test_natural_keys()
     call test_null_columns()
     call test_leading_column()
@@ -2257,6 +2259,179 @@ contains
 
         ios = c_rmtree(RDIR)
         ios = c_rmtree(REF)
+    end subroutine
+
+    ! Test gap 1: drive a multi-level B+-tree entirely through the public API
+    ! (the largest indexed table elsewhere fits in one leaf). Insert thousands
+    ! of keys in batches to force splits and internal nodes, exercise point and
+    ! range lookups across them, then split inside a transaction and roll back.
+    subroutine test_deep_tree()
+        character(len=*), parameter :: DDIR = 'utest_sqr_deep_db'
+        integer, parameter :: NROW = 5000, BATCH = 500
+        type(db_t) :: db
+        type(db_cursor_t) :: cur
+        type(column_t) :: c(2)
+        integer :: rs, ios, ti, k, b, base, cnt
+        integer(int32) :: rid, rids(BATCH)
+        character(len=:), allocatable :: bufs(:), buf
+        character(len=128) :: emsg
+        logical :: ok
+
+        ios = c_rmtree(DDIR)
+        c(1)%name = 'id'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        c(2)%name = 'k' ; c(2)%dtype = DT_INT; c(2)%csize = 4
+        call db_open(db, DDIR, rs, emsg)
+        call db_create_table(db, 't', c, rs, emsg)
+        ti = db_table_index(db, 't')
+        call db_create_index(db, 't', 'k', rs)
+        allocate(character(len=db%tables(ti)%record_size) :: bufs(BATCH))
+
+        ! Keys k = 2*id (all even), inserted 500 at a time.
+        base = 0
+        fill: do b = 1, NROW / BATCH
+            do k = 1, BATCH
+                bufs(k) = repeat(char(0), db%tables(ti)%record_size)
+                call row_set_int(bufs(k), db%tables(ti)%cols(1), int(base + k, int32))
+                call row_set_int(bufs(k), db%tables(ti)%cols(2), int(2*(base + k), int32))
+            end do
+            call db_insert_many(db, 't', bufs, rids, rs)
+            if (rs /= SQR_OK) exit fill
+            base = base + BATCH
+        end do fill
+        call check(rs == SQR_OK .and. base == NROW, 'deep: 5000 rows inserted in batches')
+        call check(db%tables(ti)%live_count == NROW, 'deep: live_count 5000')
+
+        ! Point lookups at both ends and a guaranteed-absent odd key.
+        call db_find_by_int(db, 't', 'k', 2_int32, rid, rs)
+        call check(rs == SQR_OK .and. rid == 1, 'deep: first key resolves')
+        call db_find_by_int(db, 't', 'k', int(2*NROW, int32), rid, rs)
+        call check(rs == SQR_OK .and. rid == NROW, 'deep: last key resolves')
+        call db_find_by_int(db, 't', 'k', 3_int32, rid, rs)
+        call check(rs == SQR_NOT_FOUND, 'deep: absent odd key -> NOT_FOUND')
+
+        ! Range scan over [1000,2000] inclusive: even keys 1000..2000 = 501.
+        call row_alloc(buf, db%tables(ti)%record_size)
+        call db_find_range(db, 't', 'k', 1000_int32, 2000_int32, cur, rs)
+        cnt = 0
+        scan: do
+            call db_cursor_next(db, cur, rid, buf, ok, rs)
+            if (.not. ok) exit scan
+            cnt = cnt + 1
+        end do scan
+        call check(rs == SQR_OK .and. cnt == 501, 'deep: range scan spans internal nodes')
+
+        call db_verify(db, 't', rs, emsg)
+        call check(rs == SQR_OK, 'deep: db_verify clean over multi-level tree')
+
+        ! Split inside a transaction, then roll back: the index must return to
+        ! its exact pre-txn shape (db_verify walks it against a full scan).
+        call db_begin(db, rs)
+        do k = 1, BATCH
+            bufs(k) = repeat(char(0), db%tables(ti)%record_size)
+            call row_set_int(bufs(k), db%tables(ti)%cols(1), int(NROW + k, int32))
+            call row_set_int(bufs(k), db%tables(ti)%cols(2), int(2*NROW + 2*k, int32))
+        end do
+        call db_insert_many(db, 't', bufs, rids, rs)
+        call check(rs == SQR_OK .and. db%tables(ti)%live_count == NROW + BATCH, &
+                   'deep: txn insert grows the tree')
+        call db_rollback(db, rs)
+        call check(rs == SQR_OK .and. db%tables(ti)%live_count == NROW, &
+                   'deep: rollback restores live_count')
+        call db_find_by_int(db, 't', 'k', int(2*NROW + 2, int32), rid, rs)
+        call check(rs == SQR_NOT_FOUND, 'deep: rolled-back key absent from index')
+        call db_verify(db, 't', rs, emsg)
+        call check(rs == SQR_OK, 'deep: db_verify clean after split-in-txn rollback')
+
+        call db_close(db)
+        ios = c_rmtree(DDIR)
+    end subroutine
+
+    ! Write a hot journal header + payload directly (test gap 3 helper). The
+    ! on-disk layout is magic|fmt|state|nrec|cksum|plen then payload at
+    ! JHEADER+1; these constants mirror sqr_journal's format.
+    subroutine write_hot_journal(path, nrec, cksum, payload)
+        character(len=*), intent(in) :: path, payload
+        integer,          intent(in) :: nrec, cksum
+        integer, parameter :: JFMT = 1, JSTATE_HOT = 1
+        integer(int64), parameter :: JHEADER = 64_int64
+        integer :: u, ios
+        open(newunit=u, file=path, access='stream', form='unformatted', &
+             status='replace', action='write', iostat=ios)
+        write(u, pos=1) 'SQRJ', JFMT, JSTATE_HOT, nrec, cksum, int(len(payload), int64)
+        if (len(payload) > 0) write(u, pos=JHEADER + 1) payload
+        close(u)
+    end subroutine
+
+    ! Write a hot journal claiming an arbitrary payload length with no payload
+    ! (test gap 3 helper for the length-guard path).
+    subroutine write_hot_journal_plen(path, plen)
+        character(len=*), intent(in) :: path
+        integer(int64),   intent(in) :: plen
+        integer, parameter :: JFMT = 1, JSTATE_HOT = 1
+        integer :: u, ios
+        open(newunit=u, file=path, access='stream', form='unformatted', &
+             status='replace', action='write', iostat=ios)
+        write(u, pos=1) 'SQRJ', JFMT, JSTATE_HOT, 1, 0, plen
+        close(u)
+    end subroutine
+
+    ! Test gap 3: recovery is otherwise only tested against journals the API
+    ! itself armed. Construct corrupt/torn _journal.dat files by hand and prove
+    ! the open path discards them gracefully (never replays garbage) and leaves
+    ! the committed data intact — the checksum/length/short-header guards where
+    ! H1/H6 live had zero coverage.
+    subroutine test_torn_journal()
+        character(len=*), parameter :: JDIR = 'utest_sqr_torn_db'
+        type(db_t) :: db
+        type(column_t) :: c(1)
+        integer :: rs, ios, u
+        integer(int32) :: rid
+        character(len=:), allocatable :: buf, jpath
+        character(len=128) :: emsg
+
+        ios = c_rmtree(JDIR)
+        c(1)%name = 'v'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        call db_open(db, JDIR, rs, emsg)
+        call db_create_table(db, 't', c, rs, emsg)
+        call row_alloc(buf, db%tables(1)%record_size)
+        call row_set_int(buf, db%tables(1)%cols(1), 7_int32)
+        call db_insert(db, 't', buf, rid, rs)
+        call db_close(db)                       ! one committed row, journal gone
+        jpath = JDIR // '/_journal.dat'
+
+        ! Case 1: hot header + garbage payload with a mismatched checksum. The
+        ! payload is either checksum-rejected or fails to deserialise; either
+        ! way it must be voided, never replayed, and the committed row survives.
+        call write_hot_journal(jpath, 1, 123456, 'XXXXXXXX')
+        call db_open(db, JDIR, rs, emsg)
+        call check(rs == SQR_OK, 'torn: open recovers past corrupt-payload journal')
+        call check(db%tables(1)%live_count == 1, 'torn: committed row survives')
+        call db_get(db, 't', 1_int32, buf, rs)
+        call check(rs == SQR_OK .and. row_get_int(buf, db%tables(1)%cols(1)) == 7, &
+                   'torn: committed row value intact')
+        call db_verify(db, 't', rs, emsg)
+        call check(rs == SQR_OK, 'torn: db_verify clean after corrupt-payload recovery')
+        call db_close(db)
+
+        ! Case 2: hot header claiming an absurd payload length — must be rejected
+        ! by the length guard, not trusted into a huge allocate.
+        call write_hot_journal_plen(jpath, huge(0_int64))
+        call db_open(db, JDIR, rs, emsg)
+        call check(rs == SQR_OK, 'torn: open voids absurd-length journal')
+        call db_close(db)
+
+        ! Case 3: truncated file (magic only) — treated as foreign/absent.
+        open(newunit=u, file=jpath, access='stream', form='unformatted', &
+             status='replace', action='write', iostat=ios)
+        write(u) 'SQRJ'
+        close(u)
+        call db_open(db, JDIR, rs, emsg)
+        call check(rs == SQR_OK, 'torn: open ignores truncated journal header')
+        call db_get(db, 't', 1_int32, buf, rs)
+        call check(rs == SQR_OK, 'torn: row still readable after truncated-journal open')
+        call db_close(db)
+
+        ios = c_rmtree(JDIR)
     end subroutine
 
     ! Set sku/region/qty into a freshly-cleared row buffer.

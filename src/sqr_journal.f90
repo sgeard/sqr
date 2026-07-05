@@ -351,6 +351,13 @@ contains
         ! writes that close would otherwise flush the rolled-forward bytes back,
         ! clobbering the bytes apply_undo had just restored.
         call flush_base_files(db, st)
+        ! Same for the index trees: clear_index_hooks below reopens each by
+        ! close+open, so any page write still buffered in a tree's unit must
+        ! reach disk before apply_undo restores the file — otherwise that close
+        ! flushes the rolled-forward pages back over the restored bytes (surfaces
+        ! only on a compiler that buffers direct-access writes, and only when the
+        ! txn split a tree).
+        call flush_index_trees(db, st)
         ! Reverse order so an earlier capture of a region wins over a later one.
         do i = db%jrnl%nrec, 1, -1
             call apply_undo(db, db%jrnl%recs(i), st)
@@ -501,6 +508,24 @@ contains
         end do
     end subroutine
 
+    ! Drain every open index tree's write buffer to disk — the index analogue of
+    ! flush_base_files, used before a rollback restores the files and reopens the
+    ! trees (see apply_rollback).
+    subroutine flush_index_trees(db, st)
+        class(db_t), intent(in)              :: db
+        integer,     intent(inout), optional :: st
+        integer :: ti, j, bs
+        do ti = 1, db%ntables
+            associate (t => db%tables(ti))
+                do j = 1, t%nindices
+                    if (.not. idx_live(t%indices(j))) cycle
+                    call bt_sync(t%indices(j)%bt, bs)
+                    if (bs /= BT_OK .and. present(st)) st = SQR_ERR
+                end do
+            end associate
+        end do
+    end subroutine
+
     ! Force every base file this transaction modified to stable storage — the
     ! commit durability barrier.  First drain each open unit's buffer to the OS
     ! (data and blob units, then every live index tree via bt_sync), then fsync
@@ -641,14 +666,24 @@ contains
             associate (t => db%tables(ti))
                 do j = 1, t%nindices
                     if (.not. idx_live(t%indices(j))) cycle
-                    call bt_set_journal_hook(t%indices(j)%bt)   ! clears hook + ctx ptr
                     if (reload) then
-                        call bt_reload(t%indices(j)%bt, rst)
-                        if (rst == BT_OK) then
-                            t%indices(j)%nentries = int(t%indices(j)%bt%nentries)
-                        else if (stat == SQR_OK) then
-                            stat = SQR_ERR
+                        ! The on-disk index was just restored through a different
+                        ! unit, so this tree's open unit may cache stale pages or
+                        ! a stale EOF — and after a rollback that split the tree,
+                        ! its cached root/high-water point past the restored file,
+                        ! so a later seek on the same handle walks phantom pages.
+                        ! bt_reload re-reads the meta page through that same stale
+                        ! unit, so it is not enough (see resync_index_trees); a
+                        ! clean close + reopen discards the buffer. bt_open resets
+                        ! the handle, which also clears the journal hook.
+                        if (t%indices(j)%bt%unit /= -1) then
+                            close(t%indices(j)%bt%unit)
+                            t%indices(j)%bt%unit = -1
                         end if
+                        call open_index(db, t, t%indices(j), j, 'old', rst)
+                        if (rst /= SQR_OK .and. stat == SQR_OK) stat = rst
+                    else
+                        call bt_set_journal_hook(t%indices(j)%bt)   ! clears hook + ctx ptr
                     end if
                     if (associated(t%indices(j)%jctx)) deallocate(t%indices(j)%jctx)
                 end do
