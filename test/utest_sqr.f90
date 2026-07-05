@@ -48,6 +48,7 @@ program utest_sqr
     call test_high_findings()
     call test_large_blob()
     call test_compact()
+    call test_compact_recovery()
     call test_natural_keys()
     call test_null_columns()
     call test_leading_column()
@@ -2103,6 +2104,159 @@ contains
         call db_close(db)
 
         ios = c_rmtree(CDIR)
+    end subroutine
+
+    ! Byte-copy a whole file (helper for the compact-recovery fixture).
+    subroutine copy_file(src, dst, ok)
+        character(len=*), intent(in)  :: src, dst
+        logical,          intent(out) :: ok
+        integer :: us, ud, ios
+        integer(int64) :: sz
+        character(len=:), allocatable :: b
+        ok = .false.
+        open(newunit=us, file=src, access='stream', form='unformatted', &
+             status='old', action='read', iostat=ios)
+        if (ios /= 0) return
+        inquire(unit=us, size=sz)
+        allocate(character(len=int(sz)) :: b)
+        read(us, iostat=ios) b
+        close(us)
+        if (ios /= 0) return
+        open(newunit=ud, file=dst, access='stream', form='unformatted', &
+             status='replace', action='write', iostat=ios)
+        if (ios /= 0) return
+        write(ud, iostat=ios) b
+        close(ud)
+        ok = (ios == 0)
+    end subroutine
+
+    ! Create a zero-content file (used to fabricate the compact marker).
+    subroutine touch_file(path)
+        character(len=*), intent(in) :: path
+        integer :: u, ios
+        open(newunit=u, file=path, access='stream', form='unformatted', &
+             status='replace', action='write', iostat=ios)
+        if (ios == 0) close(u)
+    end subroutine
+
+    ! H2 — db_open must finish an interrupted db_compact detected via the
+    ! ".compacting" marker: roll a surviving ".dat.compact" temp forward, then
+    ! rederive next_id / live_count and rebuild the indices from the renumbered
+    ! file. Two windows: (B) marker + temp present (rename-forward), and (A)
+    ! marker present with the temp already consumed (idempotent re-run).
+    subroutine test_compact_recovery()
+        character(len=*), parameter :: RDIR = 'utest_sqr_reco_db'
+        character(len=*), parameter :: REF  = 'utest_sqr_reco_ref'
+        type(db_t) :: db
+        type(column_t) :: c(2)
+        integer :: rs, ios, ti
+        integer(int32) :: rid
+        character(len=:), allocatable :: buf
+        character(len=128) :: emsg
+        logical :: ok, exists
+
+        ios = c_rmtree(RDIR)
+        ios = c_rmtree(REF)
+        c(1)%name = 'id'  ; c(1)%dtype = DT_INT  ; c(1)%csize = 4
+        c(2)%name = 'tag' ; c(2)%dtype = DT_CHAR ; c(2)%csize = 4
+
+        ! Main db: five rows, tombstone 2 and 4 -> survivors old rows 1,3,5
+        ! (id columns 10,30,50). Left un-compacted on disk.
+        call db_open(db, RDIR, rs, emsg)
+        call db_create_table(db, 'reco', c, rs, emsg)
+        block
+            integer :: k
+            character(len=2) :: tg
+            do k = 1, 5
+                call row_alloc(buf, db%tables(1)%record_size)
+                call row_set_int (buf, db%tables(1)%cols(1), int(10*k, int32))
+                write(tg, '(a1,i1)') 't', k
+                call row_set_char(buf, db%tables(1)%cols(2), tg)
+                call db_insert(db, 'reco', buf, rid, rs)
+            end do
+        end block
+        call db_create_index(db, 'reco', 'id', rs)
+        call db_create_index(db, 'reco', 'tag', rs)
+        call db_delete(db, 'reco', 2_int32, rs)
+        call db_delete(db, 'reco', 4_int32, rs)
+        call db_close(db)
+
+        ! Reference db: the same survivors inserted fresh in scan order — its
+        ! data file is byte-identical to what a completed compact produces
+        ! (compact preserves column bytes and status; only the record slot is
+        ! renumbered), so it stands in for the ".dat.compact" temp.
+        call db_open(db, REF, rs, emsg)
+        call db_create_table(db, 'reco', c, rs, emsg)
+        block
+            integer :: k
+            character(len=2) :: tg
+            do k = 1, 5, 2
+                call row_alloc(buf, db%tables(1)%record_size)
+                call row_set_int (buf, db%tables(1)%cols(1), int(10*k, int32))
+                write(tg, '(a1,i1)') 't', k
+                call row_set_char(buf, db%tables(1)%cols(2), tg)
+                call db_insert(db, 'reco', buf, rid, rs)
+            end do
+        end block
+        call db_close(db)
+
+        ! ---- Window B: marker + surviving temp -> rename forward. ----
+        call copy_file(REF // '/reco.dat', RDIR // '/reco.dat.compact', ok)
+        call check(ok, 'reco: fabricate .dat.compact temp')
+        call touch_file(RDIR // '/reco.compacting')
+
+        call db_open(db, RDIR, rs, emsg)
+        call check(rs == SQR_OK, 'reco: reopen finishes interrupted compact')
+        ti = db_table_index(db, 'reco')
+        call check(db%tables(ti)%live_count == 3, 'reco: live_count rederived to 3')
+        call check(db%tables(ti)%next_id == 4,    'reco: next_id rederived to 4')
+
+        call row_alloc(buf, db%tables(ti)%record_size)
+        call db_get(db, 'reco', 1_int32, buf, rs)
+        call check(rs == SQR_OK .and. row_get_int(buf, db%tables(ti)%cols(1)) == 10, &
+                   'reco: renumbered row 1 is old id 10')
+        call db_get(db, 'reco', 3_int32, buf, rs)
+        call check(rs == SQR_OK .and. row_get_int(buf, db%tables(ti)%cols(1)) == 50, &
+                   'reco: renumbered row 3 is old id 50')
+        call db_get(db, 'reco', 4_int32, buf, rs)
+        call check(rs == SQR_NOT_FOUND, 'reco: old tombstone slot gone')
+
+        ! Indices rebuilt against the renumbered rows.
+        call db_find_by_int(db, 'reco', 'id', 30_int32, rid, rs)
+        call check(rs == SQR_OK .and. rid == 2, 'reco: id index -> renumbered row 2')
+        call db_find_by_char(db, 'reco', 'tag', 't5', rid, rs)
+        call check(rs == SQR_OK .and. rid == 3, 'reco: tag index -> renumbered row 3')
+
+        call db_verify(db, 'reco', rs, emsg)
+        call check(rs == SQR_OK, 'reco: db_verify clean after recovery')
+        call db_close(db)
+
+        ! Marker and temp are retired.
+        inquire(file=RDIR // '/reco.compacting', exist=exists)
+        call check(.not. exists, 'reco: marker cleared after recovery')
+        inquire(file=RDIR // '/reco.dat.compact', exist=exists)
+        call check(.not. exists, 'reco: temp consumed by rename')
+
+        ! ---- Window A: marker present, temp already gone -> idempotent. ----
+        call touch_file(RDIR // '/reco.compacting')
+        call db_open(db, RDIR, rs, emsg)
+        call check(rs == SQR_OK, 'reco: idempotent re-run with no temp')
+        ti = db_table_index(db, 'reco')
+        call check(db%tables(ti)%live_count == 3, 'reco: live_count still 3')
+        call db_verify(db, 'reco', rs, emsg)
+        call check(rs == SQR_OK, 'reco: db_verify clean after idempotent re-run')
+        call db_close(db)
+        inquire(file=RDIR // '/reco.compacting', exist=exists)
+        call check(.not. exists, 'reco: marker cleared on idempotent re-run')
+
+        ! ---- Read-only handle refuses to run recovery. ----
+        call touch_file(RDIR // '/reco.compacting')
+        call db_open(db, RDIR, rs, emsg, readonly=.true.)
+        call check(rs == SQR_READONLY, 'reco: read-only open refuses recovery')
+        ios = c_remove(RDIR // '/reco.compacting')
+
+        ios = c_rmtree(RDIR)
+        ios = c_rmtree(REF)
     end subroutine
 
     ! Set sku/region/qty into a freshly-cleared row buffer.

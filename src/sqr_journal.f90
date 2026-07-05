@@ -30,7 +30,7 @@
 !     kind int32 | pathlen int32 | path(pathlen) | orig_len int64
 !                | offset int64 | length int64 | byteslen int64 | bytes(byteslen)
 submodule (sqr:sqr_base) sqr_journal
-    use :: clib_wrap, only: c_fsync_path, c_fsync_dir, c_truncate, c_remove
+    use :: clib_wrap, only: c_truncate, c_remove   ! c_fsync_path/c_fsync_dir host-associated from sqr_base
     implicit none
 
     character(len=4), parameter :: JMAGIC      = 'SQRJ'

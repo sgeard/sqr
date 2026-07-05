@@ -43,7 +43,8 @@
 submodule (sqr) sqr_base
     use, intrinsic :: iso_fortran_env, only: error_unit  ! int8/int32/int64/real64 via host association from sqr
     use, intrinsic :: ieee_arithmetic, only: ieee_is_nan
-    use :: clib_wrap, only: c_mkdir, c_path_exists, c_lock_release
+    use :: clib_wrap, only: c_mkdir, c_path_exists, c_lock_release, &
+                            c_rename, c_fsync_path, c_fsync_dir
     use :: sqr_fault, only: io_check
     use :: b_tree, only: btree_t, bt_open, bt_close, bt_reload, bt_sync, bt_insert, &
                          bt_remove, bt_bulk_load, bt_seek, bt_first, bt_next, &
@@ -190,6 +191,17 @@ contains
         character(len=*), intent(in)  :: name
         character(len=:), allocatable :: p
         p = pathjoin(db%dir, blob_relpath(name))
+    end function
+
+    ! Marker dropped by db_compact between building the compacted temp files
+    ! and clearing them after a durable swap.  Its presence on open means a
+    ! compact was interrupted mid-swap and must be finished (the .compact temps
+    ! are authoritative once the marker exists — see complete_compact_swap).
+    pure function compact_marker_path(db, name) result(p)
+        type(db_t),       intent(in)  :: db
+        character(len=*), intent(in)  :: name
+        character(len=:), allocatable :: p
+        p = pathjoin(db%dir, trim(name) // '.compacting')
     end function
 
     ! The blob file name relative to the db directory — the form the journal
@@ -527,14 +539,46 @@ contains
         stat = SQR_OK
     end subroutine
 
+    ! Crash-atomic replace of `final` by the freshly-written `tmp`.  fsync the
+    ! temp so its bytes are on stable storage, rename(2) it over the target
+    ! (the rename is atomic, so a crash leaves either the whole old file or the
+    ! whole new one — never a truncated header), then fsync the directory so the
+    ! rename itself is durable.  Used by the catalog and schema writers: those
+    ! files are the sole record of the database's table list and each table's
+    ! column layout, so an in-place `status='replace'` truncate that a crash
+    ! caught mid-write would lose the table (or the whole db) with the row data
+    ! still intact.
+    subroutine atomic_replace(db, tmp, final, stat)
+        type(db_t),       intent(in)  :: db
+        character(len=*), intent(in)  :: tmp, final
+        integer,          intent(out) :: stat
+        integer :: ios
+        ios = c_fsync_path(tmp)
+        call io_check(ios)
+        if (ios /= 0) then
+            stat = SQR_ERR
+            return
+        end if
+        if (c_rename(tmp, final) /= 0) then
+            stat = SQR_ERR
+            return
+        end if
+        ios = c_fsync_dir(db%dir)
+        call io_check(ios)
+        stat = merge(SQR_ERR, SQR_OK, ios /= 0)
+    end subroutine
+
     subroutine write_catalog(db, stat)
         type(db_t), intent(in)  :: db
         integer,    intent(out) :: stat
         integer :: u, ios, i
         character(len=4) :: magic
         character(len=SQR_NAME_LEN) :: nm
+        character(len=:), allocatable :: final, tmp
         magic = CATALOG_MAGIC
-        open(newunit=u, file=catalog_path(db), access='stream', form='unformatted', &
+        final = catalog_path(db)
+        tmp   = final // '.tmp'
+        open(newunit=u, file=tmp, access='stream', form='unformatted', &
              status='replace', action='write', iostat=ios)
         if (ios /= 0) then
             stat = SQR_ERR
@@ -551,12 +595,16 @@ contains
             call io_check(ios)
         end do write_names
         if (ios /= 0) then
-            close(u, iostat=ios)
+            close(u, status='delete', iostat=ios)
             stat = SQR_ERR
             return
         end if
-        close(u, iostat=ios)
-        stat = merge(SQR_ERR, SQR_OK, ios /= 0)
+        close(u, iostat=ios)   ! flushes buffered writes; catch a late ENOSPC/EIO
+        if (ios /= 0) then
+            stat = SQR_ERR
+            return
+        end if
+        call atomic_replace(db, tmp, final, stat)
     end subroutine
 
     ! ===== Schema I/O =====
@@ -568,8 +616,11 @@ contains
         integer :: u, ios, i, m
         character(len=4) :: magic
         character(len=SQR_NAME_LEN) :: nm
+        character(len=:), allocatable :: final, tmp
         magic = SQR_MAGIC
-        open(newunit=u, file=schema_path(db, tbl%name), access='stream', form='unformatted', &
+        final = schema_path(db, tbl%name)
+        tmp   = final // '.tmp'
+        open(newunit=u, file=tmp, access='stream', form='unformatted', &
              status='replace', action='write', iostat=ios)
         if (ios /= 0) then
             stat = SQR_ERR
@@ -606,12 +657,16 @@ contains
             end associate
         end do idx_out
         if (ios /= 0) then
-            close(u, iostat=ios)
+            close(u, status='delete', iostat=ios)
             stat = SQR_ERR
             return
         end if
-        close(u, iostat=ios)
-        stat = merge(SQR_ERR, SQR_OK, ios /= 0)
+        close(u, iostat=ios)   ! flushes buffered writes; catch a late ENOSPC/EIO
+        if (ios /= 0) then
+            stat = SQR_ERR
+            return
+        end if
+        call atomic_replace(db, tmp, final, stat)
     end subroutine
 
     subroutine read_schema(db, name, tbl, stat, errmsg)

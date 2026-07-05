@@ -7,7 +7,7 @@
 ! lookup helpers.
 
 submodule (sqr:sqr_base) sqr_table
-    use :: clib_wrap, only: c_rename, c_remove, c_lock_try, c_lock_share
+    use :: clib_wrap, only: c_remove, c_lock_try, c_lock_share   ! c_rename/c_fsync_dir host-associated from sqr_base
     implicit none
 contains
 
@@ -126,29 +126,96 @@ contains
                             call raise(rs, stat, errmsg)
                             exit open_seq
                         end if
-                        call open_data(db, t, 'old', rs)
-                        if (rs /= SQR_OK) then
-                            call raise(rs, stat, errmsg, &
-                                       'cannot open data file for ' // trim(names(i)))
-                            exit open_seq
-                        end if
-                        indices_open: do j = 1, t%nindices
-                            if (.not. idx_live(t%indices(j))) cycle indices_open
-                            call open_index(db, t, t%indices(j), j, 'old', rs)
-                            if (rs /= SQR_OK) then
+
+                        ! An interrupted db_compact leaves a marker (see
+                        ! compact_marker_path). A read-only handle cannot write
+                        ! the completion, so it refuses — as with a hot journal.
+                        recovering: block
+                            logical :: interrupted
+                            interrupted = file_exists(compact_marker_path(db, trim(names(i))))
+                            if (interrupted .and. db%readonly) then
+                                rs = SQR_READONLY
                                 call raise(rs, stat, errmsg, &
-                                           'cannot open index file for ' // trim(names(i)))
+                                    'database needs compaction recovery; reopen read-write: "' &
+                                    // trim(db%dir) // '"')
                                 exit open_seq
                             end if
-                        end do indices_open
-                        if (table_has_text(t)) then
-                            call open_blob(db, t, 'old', rs)
+                            if (interrupted) then
+                                call complete_compact_swap(db, t, rs)
+                                if (rs /= SQR_OK) then
+                                    call raise(rs, stat, errmsg, &
+                                        'cannot finish interrupted compact for ' // trim(names(i)))
+                                    exit open_seq
+                                end if
+                            end if
+
+                            call open_data(db, t, 'old', rs)
                             if (rs /= SQR_OK) then
                                 call raise(rs, stat, errmsg, &
-                                           'cannot open blob file for ' // trim(names(i)))
+                                           'cannot open data file for ' // trim(names(i)))
                                 exit open_seq
                             end if
-                        end if
+
+                            ! The renumbered, tombstone-free file is the truth
+                            ! for next_id/live_count — the pre-compact schema is
+                            ! stale (too high) and open_data only repairs upward.
+                            if (interrupted) then
+                                recount: block
+                                    integer(int64) :: fsize
+                                    integer        :: ios
+                                    inquire(unit=t%unit, size=fsize)
+                                    t%next_id = int(fsize / t%record_size, int32) + 1_int32
+                                    call recount_live(t%unit, t, ios)
+                                    if (ios /= 0) then
+                                        rs = SQR_ERR
+                                        call raise(rs, stat, errmsg, &
+                                            'cannot recount rows for ' // trim(names(i)))
+                                        exit open_seq
+                                    end if
+                                end block recount
+                            end if
+
+                            if (table_has_text(t)) then
+                                call open_blob(db, t, 'old', rs)
+                                if (rs /= SQR_OK) then
+                                    call raise(rs, stat, errmsg, &
+                                               'cannot open blob file for ' // trim(names(i)))
+                                    exit open_seq
+                                end if
+                            end if
+
+                            if (interrupted) then
+                                ! Indices map keys to pre-compact row ids — rebuild
+                                ! them (bt_open truncate-creates), persist the fixed
+                                ! counters, then retire the marker.
+                                rebuild_all: do j = 1, t%nindices
+                                    if (.not. idx_live(t%indices(j))) cycle rebuild_all
+                                    call rebuild_index(db, i, j, rs)
+                                    if (rs /= SQR_OK) then
+                                        call raise(rs, stat, errmsg, &
+                                            'cannot rebuild index for ' // trim(names(i)))
+                                        exit open_seq
+                                    end if
+                                end do rebuild_all
+                                call write_schema(db, t, rs)
+                                if (rs == SQR_OK) call clear_compact_marker(db, trim(names(i)), rs)
+                                if (rs /= SQR_OK) then
+                                    call raise(rs, stat, errmsg, &
+                                        'cannot finalise compact recovery for ' // trim(names(i)))
+                                    exit open_seq
+                                end if
+                            else
+                                indices_open: do j = 1, t%nindices
+                                    if (.not. idx_live(t%indices(j))) cycle indices_open
+                                    call open_index(db, t, t%indices(j), j, 'old', rs)
+                                    if (rs /= SQR_OK) then
+                                        call raise(rs, stat, errmsg, &
+                                                   'cannot open index file for ' // trim(names(i)))
+                                        exit open_seq
+                                    end if
+                                end do indices_open
+                            end if
+                        end block recovering
                     end associate
                 end do tables_open
                 db%ntables = n
@@ -540,12 +607,36 @@ contains
                 return
             end if
 
-            ! Phase B — swap in the compacted files, then rebuild derived
-            ! state. rename(2) atomically replaces the destination, so no
-            ! separate delete is needed. A crash between the two renames or
-            ! during the index rebuild is the documented residual window
-            ! (no journaling — transactions are deferred); indices are
-            ! derivable, so re-running compact recovers.
+            ! Make the compacted temps durable BEFORE they become authoritative.
+            ! A rename is only as safe as the bytes behind it: without this,
+            ! power loss just after a "successful" compact could leave the new
+            ! data file empty/partial while the original is already gone.
+            ios = c_fsync_path(dtmp)
+            call io_check(ios)
+            if (ios == 0 .and. has_text) then
+                ios = c_fsync_path(btmp)
+                call io_check(ios)
+            end if
+            if (ios == 0) then
+                ios = c_fsync_dir(db%dir)
+                call io_check(ios)
+            end if
+            if (ios /= 0) then
+                if (present(stat)) stat = SQR_ERR
+                return
+            end if
+
+            ! Phase B — swap in the compacted files, then rebuild derived state.
+            ! The two renames + reindex + schema rewrite are not one atomic step,
+            ! so drop a durable marker first: if a crash interrupts any of them,
+            ! the next open sees the marker and finishes the compact (the temps
+            ! are already durable, so completion always rolls forward). rename(2)
+            ! atomically replaces the destination, so no separate delete needed.
+            call write_compact_marker(db, t%name, rs)
+            if (rs /= SQR_OK) then
+                if (present(stat)) stat = rs
+                return
+            end if
             close(t%unit); t%unit = -1
             if (c_rename(dtmp, dpath) /= 0) then
                 if (present(stat)) stat = SQR_ERR
@@ -557,6 +648,12 @@ contains
                     if (present(stat)) stat = SQR_ERR
                     return
                 end if
+            end if
+            ios = c_fsync_dir(db%dir)   ! the renames themselves must be durable
+            call io_check(ios)
+            if (ios /= 0) then
+                if (present(stat)) stat = SQR_ERR
+                return
             end if
 
             call open_data(db, t, 'old', rs)
@@ -589,8 +686,81 @@ contains
                 if (present(stat)) stat = rs
                 return
             end if
+            ! Fully durable: data+blob renamed, indices rebuilt, schema written
+            ! atomically. Retire the marker so the next open does no recovery.
+            ! (A fault here leaves the marker; recovery is idempotent, so the
+            ! next open simply re-finishes and clears it.)
+            call clear_compact_marker(db, t%name, rs)
+            if (rs /= SQR_OK) then
+                if (present(stat)) stat = rs
+                return
+            end if
         end associate
         if (present(stat)) stat = SQR_OK
+    end subroutine
+
+    ! Drop the "compact in progress" marker (see compact_marker_path). Written
+    ! after the compacted temps are durable and cleared once the swap is fully
+    ! committed, so its presence on open means an interrupted compact to finish.
+    subroutine write_compact_marker(db, name, stat)
+        type(db_t),       intent(in)  :: db
+        character(len=*), intent(in)  :: name
+        integer,          intent(out) :: stat
+        integer :: u, ios
+        open(newunit=u, file=compact_marker_path(db, name), access='stream', &
+             form='unformatted', status='replace', action='write', iostat=ios)
+        if (ios /= 0) then
+            stat = SQR_ERR
+            return
+        end if
+        close(u, iostat=ios)
+        if (ios == 0) ios = c_fsync_path(compact_marker_path(db, name))
+        call io_check(ios)
+        if (ios == 0) ios = c_fsync_dir(db%dir)   ! the new marker must be durable
+        call io_check(ios)
+        stat = merge(SQR_ERR, SQR_OK, ios /= 0)
+    end subroutine
+
+    subroutine clear_compact_marker(db, name, stat)
+        type(db_t),       intent(in)  :: db
+        character(len=*), intent(in)  :: name
+        integer,          intent(out) :: stat
+        integer :: ios
+        ios = 0
+        if (c_path_exists(compact_marker_path(db, name))) &
+            ios = c_remove(compact_marker_path(db, name))
+        if (ios == 0) ios = c_fsync_dir(db%dir)   ! the removal must be durable
+        call io_check(ios)
+        stat = merge(SQR_ERR, SQR_OK, ios /= 0)
+    end subroutine
+
+    ! Finish an interrupted compact detected on open: roll each surviving
+    ! .compact temp forward over its target (the temps were made durable before
+    ! the marker was dropped, so rolling forward is always the complete result),
+    ! then let the caller rederive next_id/live_count and the indices from the
+    ! renumbered data file. Idempotent — safe to re-run if it too is interrupted.
+    subroutine complete_compact_swap(db, tbl, stat)
+        type(db_t),    intent(in)  :: db
+        type(table_t), intent(in)  :: tbl
+        integer,       intent(out) :: stat
+        integer :: ios
+        character(len=:), allocatable :: dpath, dtmp, bpath, btmp
+        ios = 0
+        dpath = data_path(db, tbl%name)
+        dtmp  = dpath // '.compact'
+        if (c_path_exists(dtmp)) ios = c_rename(dtmp, dpath)
+        if (ios == 0 .and. table_has_text(tbl)) then
+            bpath = blob_path(db, tbl%name)
+            btmp  = bpath // '.compact'
+            if (c_path_exists(btmp)) ios = c_rename(btmp, bpath)
+        end if
+        if (ios /= 0) then
+            stat = SQR_ERR
+            return
+        end if
+        ios = c_fsync_dir(db%dir)
+        call io_check(ios)
+        stat = merge(SQR_ERR, SQR_OK, ios /= 0)
     end subroutine
 
     module subroutine db_list_tables(db, names)
