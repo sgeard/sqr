@@ -55,6 +55,7 @@ program utest_sqr
     call test_natural_keys()
     call test_null_columns()
     call test_leading_column()
+    call test_find_by_leading()
     call test_drop_index()
     call test_db_verify()
     call test_verify_dup_split_by_dead()
@@ -3235,6 +3236,79 @@ contains
         call drain_count(db, cur, n)
         call check(n == 4, 'lead: open_cursor on leading char -> all 4')
 
+        call db_close(db)
+        ios = c_rmtree(LDIR)
+    end subroutine
+
+    ! Review §3: db_find_by_* can use a composite index's LEADING member
+    ! (parity with db_find_range/db_open_cursor).  Several rows may share
+    ! the leading value: the one returned is the first in key order.
+    subroutine test_find_by_leading()
+        character(len=*), parameter :: LDIR = 'utest_sqr_findlead_db'
+        type(db_t) :: db
+        type(column_t) :: c(3), c2(2)
+        integer :: rs, ios, ti
+        integer(int32) :: rid, r_lo, r_hi, r_eu1, r_eu3
+        character(len=:), allocatable :: buf
+        character(len=128) :: emsg
+
+        ios = c_rmtree(LDIR)
+        c(1)%name = 'a'; c(1)%dtype = DT_INT  ; c(1)%csize = 4
+        c(2)%name = 'b'; c(2)%dtype = DT_REAL ; c(2)%csize = 8
+        c(3)%name = 'c'; c(3)%dtype = DT_CHAR ; c(3)%csize = 8
+        call db_open(db, LDIR, rs, emsg)
+        call db_create_table(db, 'm', c, rs, emsg)
+        ti = db_table_index(db, 'm')
+        ! Insert the higher trailing member FIRST so first-in-key-order is
+        ! distinguishable from first-inserted.
+        call row_alloc(buf, db_record_size(db, 'm'))
+        call row_set_int (buf, db%tables(ti)%cols(1), 20_int32)
+        call row_set_real(buf, db%tables(ti)%cols(2), 3.0_real64)
+        call row_set_char(buf, db%tables(ti)%cols(3), 't')
+        call db_insert(db, 'm', buf, r_hi, rs)
+        call row_set_real(buf, db%tables(ti)%cols(2), 1.0_real64)
+        call row_set_char(buf, db%tables(ti)%cols(3), 'r')
+        call db_insert(db, 'm', buf, r_lo, rs)
+        call row_set_int (buf, db%tables(ti)%cols(1), 10_int32)
+        call db_insert(db, 'm', buf, rid, rs)
+        call db_create_index(db, 'm', [character(len=8) :: 'a', 'b', 'c'], rs)
+
+        call db_find_by_int(db, 'm', 'a', 20_int32, rid, rs)
+        call check(rs == SQR_OK .and. rid == r_lo, &
+                   'find lead: composite leading int found, first in key order')
+        call db_find_by_int(db, 'm', 'a', 99_int32, rid, rs)
+        call check(rs == SQR_NOT_FOUND .and. rid == 0, 'find lead: absent key -> NOT_FOUND')
+        call db_find_by_real(db, 'm', 'a', 20.0_real64, rid, rs)
+        call check(rs == SQR_NOT_FOUND, 'find lead: wrong-typed overload -> NOT_FOUND')
+        call db_find_by_real(db, 'm', 'b', 1.0_real64, rid, rs)
+        call check(rs == SQR_NOT_FOUND, 'find lead: trailing member is not served')
+        call db_close(db)
+        ios = c_rmtree(LDIR)
+
+        ! Leading char member, and liveness within the run: after deleting
+        ! the first-in-key-order row the next live one is returned.
+        c2(1)%name = 'region'; c2(1)%dtype = DT_CHAR; c2(1)%csize = 4
+        c2(2)%name = 'sku'   ; c2(2)%dtype = DT_INT ; c2(2)%csize = 4
+        call db_open(db, LDIR, rs, emsg)
+        call db_create_table(db, 'r2', c2, rs, emsg)
+        ti = db_table_index(db, 'r2')
+        call row_alloc(buf, db_record_size(db, 'r2'))
+        call row_set_char(buf, db%tables(ti)%cols(1), 'eu')
+        call row_set_int (buf, db%tables(ti)%cols(2), 3_int32)
+        call db_insert(db, 'r2', buf, r_eu3, rs)
+        call row_set_int (buf, db%tables(ti)%cols(2), 1_int32)
+        call db_insert(db, 'r2', buf, r_eu1, rs)
+        call row_set_char(buf, db%tables(ti)%cols(1), 'us')
+        call db_insert(db, 'r2', buf, rid, rs)
+        call db_create_index(db, 'r2', [character(len=8) :: 'region', 'sku'], rs)
+
+        call db_find_by_char(db, 'r2', 'region', 'eu', rid, rs)
+        call check(rs == SQR_OK .and. rid == r_eu1, 'find lead: leading char, lowest sku first')
+        call db_delete(db, 'r2', r_eu1, rs)
+        call db_find_by_char(db, 'r2', 'region', 'eu', rid, rs)
+        call check(rs == SQR_OK .and. rid == r_eu3, 'find lead: dead first hit skipped')
+        call db_find_by_char(db, 'r2', 'region', 'europe', rid, rs)
+        call check(rs == SQR_NOT_FOUND, 'find lead: key wider than leading column -> NOT_FOUND')
         call db_close(db)
         ios = c_rmtree(LDIR)
     end subroutine

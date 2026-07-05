@@ -171,13 +171,19 @@ contains
         end associate
     end subroutine
 
-    ! First live row whose indexed key equals `key` (B+-tree lower-bound
-    ! seek, then forward over the equal-key run skipping dead rows).
-    ! row_id = 0 / SQR_NOT_FOUND if none.
-    subroutine index_find(db, ti, j, key, row_id, stat)
+    ! First live row whose first `nmem` key members equal those of `probe`
+    ! (B+-tree lower-bound seek, then forward over the equal-run skipping
+    ! dead rows).  `probe` is always a full-width key: for a leading-member
+    ! find (nmem < ix%ncols) its trailing members hold their typed minima
+    ! (build_leading_bounds' lo key), so the seek lands at the start of the
+    ! run and the walk yields entries in (trailing members, row id) order;
+    ! for a natural-key find nmem = ix%ncols and this is plain key
+    ! equality.  row_id = 0 / SQR_NOT_FOUND if none.
+    subroutine index_find(db, ti, j, probe, nmem, row_id, stat)
         type(db_t),       intent(inout) :: db
         integer,          intent(in)    :: ti, j
-        character(len=*), intent(in)    :: key
+        character(len=*), intent(in)    :: probe
+        integer,          intent(in)    :: nmem
         integer(int32),   intent(out)   :: row_id
         integer,          intent(out)   :: stat
         integer :: bs, ios
@@ -192,7 +198,7 @@ contains
             allocate(character(len=ix%key_size) :: ckey)
             allocate(character(len=t%record_size) :: rbuf)
             cx = make_kc_ctx(t, ix)
-            call bt_seek(ix%bt, key, bt_key_cmp, cx, cur, bs)
+            call bt_seek(ix%bt, probe, bt_key_cmp, cx, cur, bs)
             if (bs /= BT_OK) then
                 stat = SQR_ERR
                 return
@@ -204,7 +210,7 @@ contains
                     return
                 end if
                 if (.not. ok) exit scan
-                if (key_cmp_ix(t, ix, ckey, key) /= 0) exit scan
+                if (key_cmp_lead(t, ix, ckey, probe, nmem) /= 0) exit scan
                 read(t%unit, rec=rid, iostat=ios) rbuf
                 call io_check(ios)
                 if (ios == 0 .and. row_status(rbuf) == ROW_ALIVE) then
@@ -225,15 +231,11 @@ contains
         integer,          intent(out), optional :: stat
         integer :: ti, j, rs
         character(len=4) :: kbuf
+        character(len=:), allocatable :: probe, hk
         row_id = 0
-        ti = db_table_index(db, table_name)
-        if (ti == 0) then
-            if (present(stat)) stat = SQR_NOT_FOUND
-            return
-        end if
-        j = index_index(db%tables(ti), col_name)
-        if (j == 0) then
-            if (present(stat)) stat = SQR_NOT_FOUND
+        call find_leading_index(db, table_name, col_name, ti, j, rs)
+        if (rs /= SQR_OK) then
+            if (present(stat)) stat = rs
             return
         end if
         if (leading_dtype(db%tables(ti), db%tables(ti)%indices(j)) /= DT_INT) then
@@ -241,7 +243,9 @@ contains
             return
         end if
         kbuf = transfer(key, kbuf)
-        call index_find(db, ti, j, kbuf, row_id, rs)
+        call build_leading_bounds(db%tables(ti), db%tables(ti)%indices(j), &
+                                  kbuf, kbuf, probe, hk)
+        call index_find(db, ti, j, probe, 1, row_id, rs)
         if (present(stat)) stat = rs
     end subroutine
 
@@ -256,15 +260,11 @@ contains
         integer,          intent(out), optional :: stat
         integer :: ti, j, rs
         character(len=8) :: kbuf
+        character(len=:), allocatable :: probe, hk
         row_id = 0
-        ti = db_table_index(db, table_name)
-        if (ti == 0) then
-            if (present(stat)) stat = SQR_NOT_FOUND
-            return
-        end if
-        j = index_index(db%tables(ti), col_name)
-        if (j == 0) then
-            if (present(stat)) stat = SQR_NOT_FOUND
+        call find_leading_index(db, table_name, col_name, ti, j, rs)
+        if (rs /= SQR_OK) then
+            if (present(stat)) stat = rs
             return
         end if
         if (leading_dtype(db%tables(ti), db%tables(ti)%indices(j)) /= DT_REAL) then
@@ -279,7 +279,9 @@ contains
             return
         end if
         kbuf = transfer(key, kbuf)
-        call index_find(db, ti, j, kbuf, row_id, rs)
+        call build_leading_bounds(db%tables(ti), db%tables(ti)%indices(j), &
+                                  kbuf, kbuf, probe, hk)
+        call index_find(db, ti, j, probe, 1, row_id, rs)
         if (present(stat)) stat = rs
     end subroutine
 
@@ -290,37 +292,35 @@ contains
         character(len=*), intent(in)           :: key
         integer(int32),   intent(out)          :: row_id
         integer,          intent(out), optional :: stat
-        integer :: ti, j, rs, ks, nc
-        character(len=:), allocatable :: kbuf
+        integer :: ti, j, rs, lw, nc
+        character(len=:), allocatable :: kbuf, probe, hk
         row_id = 0
-        ti = db_table_index(db, table_name)
-        if (ti == 0) then
-            if (present(stat)) stat = SQR_NOT_FOUND
-            return
-        end if
-        j = index_index(db%tables(ti), col_name)
-        if (j == 0) then
-            if (present(stat)) stat = SQR_NOT_FOUND
+        call find_leading_index(db, table_name, col_name, ti, j, rs)
+        if (rs /= SQR_OK) then
+            if (present(stat)) stat = rs
             return
         end if
         if (leading_dtype(db%tables(ti), db%tables(ti)%indices(j)) /= DT_CHAR) then
             if (present(stat)) stat = SQR_NOT_FOUND   ! wrong overload for this index
             return
         end if
-        ks = db%tables(ti)%indices(j)%key_size
-        ! A key longer than the column can hold could never have been stored
-        ! (row_set_char would truncate it), so it matches nothing — say so
-        ! rather than silently truncating the search key to ks and matching a
-        ! shorter stored value. Trailing blanks are insignificant padding.
-        if (len_trim(key) > ks) then
+        lw = db%tables(ti)%cols(db%tables(ti)%indices(j)%col_idx(1))%csize
+        ! A key longer than the leading column can hold could never have
+        ! been stored (row_set_char would truncate it), so it matches
+        ! nothing — say so rather than silently truncating the search key
+        ! and matching a shorter stored value. Trailing blanks are
+        ! insignificant padding.
+        if (len_trim(key) > lw) then
             if (present(stat)) stat = SQR_NOT_FOUND
             return
         end if
-        nc = min(ks, len_trim(key))     ! trailing blanks insignificant: match the canonical key
-        allocate(character(len=ks) :: kbuf)
-        kbuf              = repeat(char(0), ks)
+        nc = min(lw, len_trim(key))     ! trailing blanks insignificant: match the canonical key
+        allocate(character(len=lw) :: kbuf)
+        kbuf              = repeat(char(0), lw)
         if (nc > 0) kbuf(1:nc) = key(1:nc)
-        call index_find(db, ti, j, kbuf, row_id, rs)
+        call build_leading_bounds(db%tables(ti), db%tables(ti)%indices(j), &
+                                  kbuf, kbuf, probe, hk)
+        call index_find(db, ti, j, probe, 1, row_id, rs)
         if (present(stat)) stat = rs
     end subroutine
 
@@ -686,7 +686,7 @@ contains
             end if
             allocate(character(len=t%indices(j)%key_size) :: key)
             call extract_key(t, t%indices(j), keyrow, key)
-            call index_find(db, ti, j, key, row_id, stat)
+            call index_find(db, ti, j, key, t%indices(j)%ncols, row_id, stat)
         end associate
     end subroutine
 

@@ -1307,9 +1307,20 @@ contains
         type(table_t),    intent(in) :: t
         type(index_t),    intent(in) :: ix
         character(len=*), intent(in) :: a, b
+        integer :: r
+        r = key_cmp_lead(t, ix, a, b, ix%ncols)
+    end function
+
+    ! key_cmp_ix restricted to the first `nmem` members — comparison on a
+    ! leading prefix of a composite key (nmem = ix%ncols is the full key).
+    pure function key_cmp_lead(t, ix, a, b, nmem) result(r)
+        type(table_t),    intent(in) :: t
+        type(index_t),    intent(in) :: ix
+        character(len=*), intent(in) :: a, b
+        integer,          intent(in) :: nmem
         integer :: r, m, lo, hi
         r = 0
-        members: do m = 1, ix%ncols
+        members: do m = 1, nmem
             associate (c => t%cols(ix%col_idx(m)))
                 lo = ix%key_off(m)
                 hi = lo + c%csize - 1

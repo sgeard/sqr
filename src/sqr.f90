@@ -804,7 +804,12 @@ module sqr
         end subroutine
 
         !! Equality lookup of the first live row whose indexed `int32`
-        !! column equals `key`.
+        !! column equals `key`.  As for `db_find_range`, an exact
+        !! single-column index is preferred, else the first index whose
+        !! LEADING member is `col_name` serves; under a composite index
+        !! several rows may share the leading value — the one returned is
+        !! the first in key order (lowest trailing members, then lowest
+        !! row id).
         module subroutine db_find_by_int(db, table_name, col_name, key, row_id, stat)
             class(db_t),       intent(inout)        :: db  !! Database handle
             character(len=*), intent(in)           :: table_name  !! Target table
@@ -824,7 +829,8 @@ module sqr
         !! value that was inserted matches; a value the caller recomputes
         !! differently (`0.1+0.2` vs a stored `0.3`) will not — that is
         !! inherent to floating point.  Tolerance matching is a range
-        !! query, not an equality lookup.
+        !! query, not an equality lookup.  Index selection and composite
+        !! leading-member semantics as for `db_find_by_int`.
         module subroutine db_find_by_real(db, table_name, col_name, key, row_id, stat)
             class(db_t),       intent(inout)        :: db  !! Database handle
             character(len=*), intent(in)           :: table_name  !! Target table
@@ -835,7 +841,10 @@ module sqr
         end subroutine
 
         !! Equality lookup on an indexed `DT_CHAR` column.  The key is
-        !! NUL-padded to the column width before comparison.
+        !! NUL-padded to the column width before comparison (trailing
+        !! blanks insignificant; a key longer than the column matches
+        !! nothing).  Index selection and composite leading-member
+        !! semantics as for `db_find_by_int`.
         module subroutine db_find_by_char(db, table_name, col_name, key, row_id, stat)
             class(db_t),       intent(inout)        :: db  !! Database handle
             character(len=*), intent(in)           :: table_name  !! Target table
