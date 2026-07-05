@@ -171,6 +171,17 @@ contains
         first = SQR_OK
         if (present(stat)) stat = SQR_OK
         if (.not. db%opened) return
+        ! A still-open explicit transaction must be UNDONE at close, not silently
+        ! persisted.  Otherwise write_schema below flushes the in-flight counters,
+        ! the guarded base writes stay on disk, and the hot journal is then deleted
+        ! — so a close would durably COMMIT a transaction the caller never committed
+        ! (e.g. an error path that reached close without db_commit/db_rollback).
+        ! Roll it back first so a close means abort, not commit.  Read-only handles
+        ! never hold an active transaction.
+        if (db%jrnl%active .and. .not. db%readonly) then
+            call txn_rollback(db, rs)
+            if (rs /= SQR_OK .and. first == SQR_OK) first = rs
+        end if
         close_tables: do i = 1, db%ntables
             associate (t => db%tables(i))
                 ! Schema counters (next_id/live_count) are flushed only here,
@@ -203,8 +214,8 @@ contains
         if (.not. db%readonly) then
             call write_catalog(db, rs)
             if (rs /= SQR_OK .and. first == SQR_OK) first = rs
-            ! A clean close guarantees no transaction is live, so any journal on
-            ! disk is a voided leftover: delete it so the next open does zero
+            ! Any in-flight transaction was rolled back above, so a journal on
+            ! disk is now a voided leftover: delete it so the next open does zero
             ! recovery work.  (Read-only opens never write, so they leave it.)
             del_journal: block
                 character(len=:), allocatable :: jpath
@@ -331,6 +342,7 @@ contains
         if (readonly_block(db, stat)) return
         if (txn_block(db, stat)) return
         db%generation = db%generation + 1   ! shifts table slots: invalidate cursors
+        call db_reset_history(db)           ! slot shift ⇒ captured undo/redo steps can't replay
         idx = db_table_index(db, name)
         if (idx == 0) then
             if (present(stat)) stat = SQR_NOT_FOUND
@@ -402,6 +414,7 @@ contains
         if (readonly_block(db, stat)) return
         if (txn_block(db, stat)) return
         db%generation = db%generation + 1   ! renumbers rows: invalidate cursors
+        call db_reset_history(db)           ! row renumber ⇒ captured undo/redo steps can't replay
         idx = db_table_index(db, table_name)
         if (idx == 0) then
             if (present(stat)) stat = SQR_NOT_FOUND
@@ -613,6 +626,7 @@ contains
         if (readonly_block(db, stat)) return
         if (txn_block(db, stat)) return
         db%generation = db%generation + 1   ! structural change: invalidate cursors
+        call db_reset_history(db)           ! record_size change ⇒ captured undo/redo steps can't replay
         ti = db_table_index(db, table_name)
         if (ti == 0) then
             call raise(SQR_NOT_FOUND, stat, errmsg, 'no such table: ' // trim(table_name))
@@ -657,6 +671,7 @@ contains
         if (readonly_block(db, stat)) return
         if (txn_block(db, stat)) return
         db%generation = db%generation + 1   ! structural change: invalidate cursors
+        call db_reset_history(db)           ! record_size change ⇒ captured undo/redo steps can't replay
         ti = db_table_index(db, table_name)
         if (ti == 0) then
             call raise(SQR_NOT_FOUND, stat, errmsg, 'no such table: ' // trim(table_name))

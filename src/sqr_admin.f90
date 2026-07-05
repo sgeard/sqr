@@ -35,6 +35,7 @@ contains
         if (readonly_block(db, stat)) return
         if (txn_block(db, stat)) return
         db%generation = db%generation + 1   ! structural change: invalidate cursors
+        call db_reset_history(db)           ! index-set change ⇒ captured undo/redo steps can't replay
         ti = db_table_index(db, table_name)
         if (ti == 0) then
             if (present(stat)) stat = SQR_NOT_FOUND

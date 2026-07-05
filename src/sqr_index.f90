@@ -55,6 +55,11 @@ contains
         type(index_t) :: ix
         if (readonly_block(db, stat)) return
         if (txn_block(db, stat)) return
+        ! A freshly built index is not covered by any earlier gesture's captured
+        ! deltas, so a later db_undo would restore the rows but leave this tree
+        ! reflecting the post-gesture keys — a silent index/row disagreement.
+        ! Drop the history (create_index does not shift rows, hence no gen bump).
+        call db_reset_history(db)
         uniq = .false.
         if (present(unique)) uniq = unique
         nc = size(col_names)

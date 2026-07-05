@@ -65,6 +65,7 @@ program utest_sqr
     call test_txn_record_rollback()
     call test_txn_insert_many_rollback()
     call test_explicit_txn()
+    call test_close_rolls_back_open_txn()
     call test_txn_structural_block()
     call test_locking()
     call test_set_readonly()
@@ -581,6 +582,55 @@ contains
         call db_verify(db, 't', rs, emsg)
         call check(rs == SQR_OK, 'exptxn: db_verify passes after commit')
 
+        call db_close(db)
+        ios = c_rmtree(XDIR)
+    end subroutine
+
+    ! H5: db_close with an explicit transaction still open must ROLL IT BACK, not
+    ! silently persist it.  A begin+insert that reaches close without commit (e.g.
+    ! an error path) must leave the store as if the transaction never happened —
+    ! not durably commit it via the close-time schema flush.
+    subroutine test_close_rolls_back_open_txn()
+        character(len=*), parameter :: XDIR = TEST_DIR // '_closetxn'
+        type(db_t), target :: db
+        type(column_t)     :: c(1)
+        character(len=:), allocatable :: buf
+        integer        :: rs, ti, i, ios
+        integer(int32) :: rid
+        character(len=128) :: emsg
+        ios = c_rmtree(XDIR)
+        c(1)%name = 'id'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        call db_open(db, XDIR, rs, emsg)
+        call db_create_table(db, 't', c, rs, emsg)
+        call db_create_index(db, 't', 'id', rs)
+        ti = db_table_index(db, 't')
+        do i = 1, 3
+            call row_alloc(buf, db%tables(ti)%record_size)
+            call row_set_int(buf, db%tables(ti)%cols(1), int(i, int32))
+            call db_insert(db, 't', buf, rid, rs)
+        end do
+
+        ! Open a transaction, insert into it, then CLOSE without commit/rollback.
+        call db_begin(db, rs)
+        do i = 10, 12
+            call row_alloc(buf, db%tables(ti)%record_size)
+            call row_set_int(buf, db%tables(ti)%cols(1), int(i, int32))
+            call db_insert(db, 't', buf, rid, rs)
+        end do
+        call check(db%jrnl%active, 'closetxn: transaction open with uncommitted inserts')
+        call db_close(db, rs)
+        call check(rs == SQR_OK, 'closetxn: close (rolling the txn back) reports success')
+
+        ! Reopen: the in-flight inserts must be gone, counters at the pre-txn
+        ! value, and the store consistent — the close ABORTED the transaction.
+        call db_open(db, XDIR, rs, emsg)
+        ti = db_table_index(db, 't')
+        call check(db%tables(ti)%live_count == 3, 'closetxn: live_count is the pre-txn 3 on reopen')
+        call check(db%tables(ti)%next_id == 4,    'closetxn: next_id reverted to 4 on reopen')
+        call db_find_by_int(db, 't', 'id', 11_int32, rid, rs)
+        call check(rs == SQR_NOT_FOUND, 'closetxn: in-flight insert absent from index on reopen')
+        call db_verify(db, 't', rs, emsg)
+        call check(rs == SQR_OK, 'closetxn: db_verify passes on reopen')
         call db_close(db)
         ios = c_rmtree(XDIR)
     end subroutine

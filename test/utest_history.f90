@@ -22,6 +22,7 @@ program utest_history
     call test_depth_cap()
     call test_empty_and_readonly()
     call test_reset_history()
+    call test_structural_ops_reset_history()
 
     print '(a,i0,a,i0,a)', 'sqr history tests: ', pass, ' passed, ', fail, ' failed'
     if (fail > 0) error stop 1
@@ -272,6 +273,73 @@ contains
         call check(.not. db_can_undo(db) .and. .not. db_can_redo(db), 'reset: history cleared')
         call db_close(db)
         ios = c_rmtree('utest_hist_reset')
+    end subroutine
+
+    ! Open 't(a int, b int)' with an index on a and insert one row (a=1); no
+    ! gesture yet, so history starts empty.  The caller commits the gesture.
+    subroutine prime2(db, dir)
+        type(db_t),       intent(out) :: db
+        character(len=*), intent(in)  :: dir
+        type(column_t) :: c(2)
+        integer :: rs, ios, r1
+        ios = c_rmtree(dir)
+        c(1)%name = 'a'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        c(2)%name = 'b'; c(2)%dtype = DT_INT; c(2)%csize = 4
+        call db_open(db, dir, rs)
+        call db_create_table(db, 't', c, rs)
+        call db_create_index(db, 't', 'a', rs)
+        r1 = ins(db, 1)
+    end subroutine
+
+    ! H3: every structural op (compact / drop table / add or drop column / create
+    ! or drop index) shifts offsets, slots, the record layout or the index set, so
+    ! a captured undo/redo step — which writes absolute byte ranges — can no longer
+    ! be replayed.  Each such op must clear the history; otherwise a later db_undo
+    ! splices stale bytes into the new shape with SQR_OK.  Each block primes one
+    ! committed gesture (undo available), runs the op, asserts the history is gone.
+    subroutine test_structural_ops_reset_history()
+        type(db_t), target :: db
+        integer :: r1, rs, ios
+        type(column_t) :: newc
+        newc%name = 'c'; newc%dtype = DT_INT; newc%csize = 4
+
+        call prime2(db, 'utest_hist_struct'); r1 = ins(db, 5)
+        call db_begin(db, rs, label='G'); call setv(db, r1, 6); call db_commit(db, rs)
+        call check(db_can_undo(db), 'struct: history primed before the op')
+        call db_compact(db, 't', rs)
+        call check(rs == SQR_OK .and. .not. db_can_undo(db) .and. .not. db_can_redo(db), &
+                   'struct: db_compact clears history')
+        call db_close(db); ios = c_rmtree('utest_hist_struct')
+
+        call prime2(db, 'utest_hist_struct'); r1 = ins(db, 5)
+        call db_begin(db, rs, label='G'); call setv(db, r1, 6); call db_commit(db, rs)
+        call db_drop_index(db, 't', 'a', rs)
+        call check(rs == SQR_OK .and. .not. db_can_undo(db), 'struct: db_drop_index clears history')
+        call db_close(db); ios = c_rmtree('utest_hist_struct')
+
+        call prime2(db, 'utest_hist_struct'); r1 = ins(db, 5)
+        call db_begin(db, rs, label='G'); call setv(db, r1, 6); call db_commit(db, rs)
+        call db_create_index(db, 't', 'b', rs)          ! b was unindexed
+        call check(rs == SQR_OK .and. .not. db_can_undo(db), 'struct: db_create_index clears history')
+        call db_close(db); ios = c_rmtree('utest_hist_struct')
+
+        call prime2(db, 'utest_hist_struct'); r1 = ins(db, 5)
+        call db_begin(db, rs, label='G'); call setv(db, r1, 6); call db_commit(db, rs)
+        call db_add_column(db, 't', newc, rs)
+        call check(rs == SQR_OK .and. .not. db_can_undo(db), 'struct: db_add_column clears history')
+        call db_close(db); ios = c_rmtree('utest_hist_struct')
+
+        call prime2(db, 'utest_hist_struct'); r1 = ins(db, 5)
+        call db_begin(db, rs, label='G'); call setv(db, r1, 6); call db_commit(db, rs)
+        call db_drop_column(db, 't', 'b', rs)
+        call check(rs == SQR_OK .and. .not. db_can_undo(db), 'struct: db_drop_column clears history')
+        call db_close(db); ios = c_rmtree('utest_hist_struct')
+
+        call prime2(db, 'utest_hist_struct'); r1 = ins(db, 5)
+        call db_begin(db, rs, label='G'); call setv(db, r1, 6); call db_commit(db, rs)
+        call db_drop_table(db, 't', rs)
+        call check(rs == SQR_OK .and. .not. db_can_undo(db), 'struct: db_drop_table clears history')
+        call db_close(db); ios = c_rmtree('utest_hist_struct')
     end subroutine
 
 end program utest_history
