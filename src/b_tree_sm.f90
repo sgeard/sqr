@@ -673,9 +673,14 @@ contains
             call set_leaf_next(pg, right_pid)
             up_key(1:bt%key_len) = leaf_key(bt, rpg, 1)
             up_pay = leaf_pay(bt, rpg, 1)
-            call write_page(bt, pid, pg, stat)
-            if (stat /= BT_OK) return
+            ! Write the new right leaf BEFORE the left: the left's next-pointer
+            ! already refers to right_pid, so a crash between the two writes must
+            ! leave right durable (else the leaf chain would dangle). Reversed,
+            ! a crash leaves right an unreferenced orphan and left unchanged —
+            ! the coherent-tree guarantee (b_tree.f90:12-14).
             call write_page(bt, right_pid, rpg, stat)
+            if (stat /= BT_OK) return
+            call write_page(bt, pid, pg, stat)
             if (stat /= BT_OK) return
             bt%nentries = bt%nentries + 1_int64
             split = .true.
@@ -726,9 +731,14 @@ contains
         end do rchild
         call set_node(rpg, K_INT, int(rn, int32))
         call set_node(pg,  K_INT, int(mid - 1, int32))
-        call write_page(bt, pid, pg, stat)
-        if (stat /= BT_OK) return
+        ! Right before left: truncating the left node first would, on a crash
+        ! before the right write, orphan the upper-half child subtrees (dropped
+        ! by left, not yet held by right). Written this way the moved children
+        ! stay reachable via the still-intact left node until the parent adopts
+        ! right; right is at worst an unreferenced orphan.
         call write_page(bt, right_pid, rpg, stat)
+        if (stat /= BT_OK) return
+        call write_page(bt, pid, pg, stat)
         if (stat /= BT_OK) return
         split = .true.
     end subroutine
@@ -863,26 +873,33 @@ contains
         integer(int32),    intent(out)   :: payload
         logical,           intent(out)   :: ok
         integer,           intent(out)   :: stat
-        character(len=:), allocatable :: pg
         integer :: nk
 
         ok      = .false.
         payload = 0_int32
         stat    = BT_OK
         if (.not. cur%valid .or. cur%leaf == 0) return
-        allocate(character(len=bt%page_size) :: pg)
         advance: do
-            call read_page(bt, cur%leaf, pg, stat)
-            if (stat /= BT_OK) return
-            nk = n_keys(pg)
+            ! Serve the current leaf from the cursor's one-page cache: a range
+            ! scan yields many keys from the same leaf, so this reads that page
+            ! once rather than on every step. Moving to leaf_next (or a fresh
+            ! cursor, which is intent(out) so cpg auto-deallocates) refreshes it.
+            if (cur%cpid /= cur%leaf .or. .not. allocated(cur%cpg)) then
+                if (.not. allocated(cur%cpg)) &
+                    allocate(character(len=bt%page_size) :: cur%cpg)
+                call read_page(bt, cur%leaf, cur%cpg, stat)
+                if (stat /= BT_OK) return
+                cur%cpid = cur%leaf
+            end if
+            nk = n_keys(cur%cpg)
             if (cur%slot < nk) then
-                key(1:bt%key_len) = leaf_key(bt, pg, cur%slot + 1)
-                payload = leaf_pay(bt, pg, cur%slot + 1)
+                key(1:bt%key_len) = leaf_key(bt, cur%cpg, cur%slot + 1)
+                payload = leaf_pay(bt, cur%cpg, cur%slot + 1)
                 cur%slot = cur%slot + 1
                 ok = .true.
                 return
             end if
-            cur%leaf = leaf_next(pg)
+            cur%leaf = leaf_next(cur%cpg)
             cur%slot = 0
             if (cur%leaf == 0) then
                 cur%valid = .false.

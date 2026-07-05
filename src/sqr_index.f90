@@ -135,6 +135,11 @@ contains
 
             call write_schema(db, t, rs)
             if (rs /= SQR_OK) then
+                ! Match every other failure path: the schema on disk does not
+                ! record this index, so leaving it live in memory would make a
+                ! retry hit SQR_DUP for an index the caller was told failed (and
+                ! it vanishes on reopen anyway). Tear it back down.
+                call drop_last_index(db, ti)
                 if (present(stat)) stat = rs
                 return
             end if

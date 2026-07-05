@@ -319,8 +319,15 @@ contains
         end if
         db%readonly = .true.               ! mutators now refuse via readonly_block
         ! Drop the exclusive lock to shared so other read-only connections may
-        ! attach.  A failed downgrade still leaves the handle safely read-only.
-        if (c_lock_share(db%lock_tok) /= 0 .and. present(stat)) stat = SQR_ERR
+        ! attach. The downgrade is not atomic on every platform (Windows drops
+        ! then retakes the byte range), so a failed retake leaves the handle
+        ! holding NO lock — it would then serve stale reads from its open units
+        ! while a writer mutates underneath. Force it shut instead so it cannot,
+        ! and report the failure; the caller must reopen.
+        if (c_lock_share(db%lock_tok) /= 0) then
+            call abandon_open(db)
+            if (present(stat)) stat = SQR_ERR
+        end if
     end subroutine
 
     module subroutine db_create_table(db, name, cols, stat, errmsg)

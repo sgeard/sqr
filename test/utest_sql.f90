@@ -568,6 +568,19 @@ contains
         call run(db, "SELECT * FROM t WHERE id = 'x'", res, rs)
         call check(rs == SQR_INVALID, 'exec err: numeric column vs string literal')
 
+        ! M7: an over-long CHAR literal must be rejected, not silently truncated
+        ! (row_set_char would clip 'toolongname' to 8 chars and report success).
+        ! Trailing blanks are insignificant, so an exact-fit-plus-blanks is OK.
+        call run(db, "INSERT INTO t VALUES (1, 'toolongname')", res, rs)
+        call check(rs == SQR_INVALID, 'exec err: over-long CHAR rejected on insert')
+        call run(db, "INSERT INTO t VALUES (2, 'exactly8')", res, rs)
+        call check(rs == SQR_OK, 'exec err: exact-fit CHAR accepted')
+        call run(db, "UPDATE t SET name = 'muchtoolong' WHERE id = 2", res, rs)
+        call check(rs == SQR_INVALID, 'exec err: over-long CHAR rejected on update')
+        ! The rejected rows/updates left nothing behind.
+        call run(db, "SELECT id FROM t", res, rs)
+        call check(rs == SQR_OK .and. res%nrows == 1, 'exec err: only the valid row persisted')
+
         call db_close(db)
     end subroutine
 

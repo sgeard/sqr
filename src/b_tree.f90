@@ -95,6 +95,10 @@ module b_tree
         integer :: leaf  = 0        !! Current leaf page id (0 = exhausted)
         integer :: slot  = 0        !! 0-based index of the next entry to yield
         logical :: valid = .false.  !! `.true.` while the cursor may yield more
+        integer :: cpid  = 0        !! Page id currently held in `cpg` (0 = none)
+        character(len=:), allocatable :: cpg  !! One-leaf read cache: a range
+                                    !! scan yields many keys from one leaf, so
+                                    !! `bt_next` reads it once instead of per key
     end type
 
     abstract interface

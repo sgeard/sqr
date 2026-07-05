@@ -878,6 +878,16 @@ contains
             if (lit%ltype /= LIT_STR) then
                 rs = SQR_INVALID; errmsg = 'column "' // trim(col%name) // '" needs a string'; return
             end if
+            ! Reject rather than silently truncate: row_set_char would clip an
+            ! over-long value to col%csize, so INSERT of 'abcdef' into CHAR(3)
+            ! would report success and store 'abc'. The engine's key path already
+            ! rejects over-long keys; keep the SQL layer at least as strict.
+            ! Trailing blanks are insignificant, so compare on len_trim.
+            if (len_trim(lit%sval) > col%csize) then
+                rs = SQR_INVALID
+                errmsg = 'value too long for column "' // trim(col%name) // '"'
+                return
+            end if
             call row_set_char(buf, col, lit%sval)
         case (DT_TEXT)
             if (lit%ltype /= LIT_STR) then

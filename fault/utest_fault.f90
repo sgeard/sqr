@@ -47,6 +47,8 @@ program utest_fault
     call sweep('get_text',     prep_textset,     op_gettext, .false., expect=SQR_ERR)
 
     call compact_atomicity()
+    call compact_index_recovery()
+    call create_index_retry()
 
     ! Auto-commit atomicity: every row mutator brackets itself, so a mid-op
     ! fault must leave the indexed table in its exact pre-op state (live_count 3
@@ -212,6 +214,18 @@ contains
         call db_delete(db, 'people', 2_int32, rs)
         call db_close(db)
     end subroutine prep_compactable
+
+    ! As prep_compactable, but with a live index on 'age' — so a compact must
+    ! rebuild the index over the renumbered rows (the M4 path).
+    subroutine prep_indexed_compactable()
+        type(db_t) :: db
+        integer :: rs
+        call prep_rows()
+        call db_open(db, DBDIR, rs)
+        call db_create_index(db, 'people', 'age', rs)
+        call db_delete(db, 'people', 2_int32, rs)
+        call db_close(db)
+    end subroutine prep_indexed_compactable
 
     subroutine prep_textrow()
         type(db_t) :: db
@@ -381,6 +395,94 @@ contains
         call check(bad == 0, &
             'compact: original data intact after every mid-compact failure')
     end subroutine compact_atomicity
+
+    ! M4: a compact that fails mid-reindex must never leave a truncated/empty
+    ! index that later queries trust. Sweep every injection point of an indexed
+    ! compact; after each failure reopen (unarmed) so the ".compacting" marker
+    ! recovery finishes the compact and rebuilds the index, then db_verify —
+    ! which walks the index against a full scan — must pass. An empty index over
+    ! populated rows would fail it.
+    subroutine compact_index_recovery()
+        type(db_t) :: db
+        integer :: rs, n, nops, bad
+        character(len=128) :: emsg
+
+        call fault_disarm()
+        call prep_indexed_compactable()
+        call db_open(gdb, DBDIR, rs)
+        gopen = rs == SQR_OK
+        call fault_arm(BIG)
+        call op_compact(rs)
+        nops = fault_count()
+        call fault_disarm()
+        call close_g()
+
+        bad = 0
+        atom_loop: do n = 1, nops
+            call prep_indexed_compactable()
+            call db_open(gdb, DBDIR, rs)
+            gopen = rs == SQR_OK
+            call fault_arm(n)
+            call op_compact(rs)
+            call fault_disarm()
+            call close_g()
+            ! Reopen unarmed: recovery (if a marker was left) rebuilds the index.
+            call db_open(db, DBDIR, rs)
+            if (rs /= SQR_OK) then
+                bad = bad + 1
+                cycle atom_loop
+            end if
+            call db_verify(db, 'people', rs, emsg)
+            if (rs /= SQR_OK) bad = bad + 1
+            call db_close(db)
+        end do atom_loop
+        call check(bad == 0, &
+            'compact: index consistent (db_verify) after every mid-compact failure')
+    end subroutine compact_index_recovery
+
+    ! M3: a create_index that fails at any point (including the final
+    ! write_schema) must tear the half-built index back down, so a retry on the
+    ! same open handle succeeds — never a spurious SQR_DUP for an index the
+    ! caller was told failed — and the rebuilt index actually resolves lookups.
+    subroutine create_index_retry()
+        integer :: rs, n, nops, bad
+        integer(int32) :: r
+
+        call fault_disarm()
+        call prep_rows()
+        call db_open(gdb, DBDIR, rs)
+        gopen = rs == SQR_OK
+        call fault_arm(BIG)
+        call db_create_index(gdb, 'people', 'age', rs)
+        nops = fault_count()
+        call fault_disarm()
+        call close_g()
+
+        bad = 0
+        retry_loop: do n = 1, nops
+            call prep_rows()
+            call db_open(gdb, DBDIR, rs)
+            gopen = rs == SQR_OK
+            call fault_arm(n)
+            call db_create_index(gdb, 'people', 'age', rs)
+            call fault_disarm()
+            if (rs == SQR_OK) then
+                call close_g()
+                cycle retry_loop           ! created despite the fault: fine
+            end if
+            ! Failed create -> retry unarmed on the same handle must succeed.
+            call db_create_index(gdb, 'people', 'age', rs)
+            if (rs /= SQR_OK) then
+                bad = bad + 1
+            else
+                call db_find_by_int(gdb, 'people', 'age', 33_int32, r, rs)
+                if (rs /= SQR_OK .or. r /= 1_int32) bad = bad + 1
+            end if
+            call close_g()
+        end do retry_loop
+        call check(bad == 0, &
+            'create_index: clean retry after every mid-create failure (no stale SQR_DUP)')
+    end subroutine create_index_retry
 
     ! Auto-commit rollback sweep. Each row mutator wraps its work in an
     ! implicit transaction (ac_begin/ac_end), so any injected I/O failure must
