@@ -271,7 +271,12 @@ contains
                 end if
                 t%blob_unit = -1
                 close_indices: do j = 1, t%nindices
-                    if (idx_live(t%indices(j))) call bt_close(t%indices(j)%bt)
+                    if (idx_live(t%indices(j))) then
+                        ! bt_close rewrites the tree meta on a writable unit —
+                        ! capture its failure like every other flush here.
+                        call bt_close(t%indices(j)%bt, cs)
+                        if (cs /= BT_OK .and. first == SQR_OK) first = SQR_ERR
+                    end if
                     ! Free any journal-hook context left by an unclosed txn so
                     ! the heap target does not leak when the slot is deallocated.
                     if (associated(t%indices(j)%jctx)) deallocate(t%indices(j)%jctx)

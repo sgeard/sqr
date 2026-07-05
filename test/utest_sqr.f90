@@ -65,6 +65,12 @@ program utest_sqr
     call test_strict_write_length()
     call test_row_id_exhaustion()
     call test_readonly_media_lock()
+    call test_engine_errmsg()
+    call test_wide_table()
+    call test_scan_empty()
+    call test_name_boundary()
+    call test_index_reopen_after_removes()
+    call test_idx_live_direct()
     call test_insert_many()
     call test_alter_column()
     call test_oo_bindings()
@@ -3888,6 +3894,203 @@ contains
         end if
         ios = c_chmod(MDIR // '/_lock', int(o'644'))
         ios = c_rmtree(MDIR)
+    end subroutine
+
+    ! Review §5.4: engine-level errmsg CONTENT (substring matches so the
+    ! wording can evolve).
+    subroutine test_engine_errmsg()
+        character(len=*), parameter :: EDIR = 'utest_sqr_errmsg_db'
+        type(db_t) :: db
+        type(column_t) :: c(2), big(16)
+        integer :: rs, ios, i
+        character(len=256) :: emsg
+        ios = c_rmtree(EDIR)
+        c(1)%name = 'id'; c(1)%dtype = DT_INT ; c(1)%csize = 4
+        c(2)%name = 'nm'; c(2)%dtype = DT_CHAR; c(2)%csize = 8
+
+        emsg = ''
+        call db_open(db, 'no_such_db_dir', rs, emsg, readonly=.true.)
+        call check(index(emsg, 'database not found') > 0, 'errmsg: missing db named')
+
+        call db_open(db, EDIR, rs, emsg)
+        emsg = ''
+        call db_create_table(db, 'bad/name', c, rs, emsg)
+        call check(index(emsg, 'invalid table name') > 0, 'errmsg: invalid name quoted')
+        call db_create_table(db, 't', c, rs, emsg)
+        emsg = ''
+        call db_create_table(db, 't', c, rs, emsg)
+        call check(index(emsg, 'already exists') > 0, 'errmsg: duplicate table named')
+
+        ! 16 x CHAR(65536) = exactly SQR_MAX_RECORD before the status byte
+        ! and NULL bitmap push it over — every csize individually valid.
+        do i = 1, size(big)
+            write(big(i)%name, '(a,i0)') 'c', i
+            big(i)%dtype = DT_CHAR; big(i)%csize = 65536
+        end do
+        emsg = ''
+        call db_create_table(db, 'wide', big, rs, emsg)
+        call check(rs == SQR_INVALID .and. index(emsg, 'record size too large') > 0, &
+                   'errmsg: over-cap record size described')
+        emsg = ''
+        call db_verify(db, 'nosuch', rs, emsg)
+        call check(index(emsg, 'no such table') > 0, 'errmsg: verify on missing table')
+        call db_close(db)
+        ios = c_rmtree(EDIR)
+    end subroutine
+
+    ! Review §5.5: a record sized close to SQR_MAX_RECORD must round-trip.
+    subroutine test_wide_table()
+        character(len=*), parameter :: WDIR = 'utest_sqr_wide_db'
+        type(db_t) :: db
+        type(column_t) :: c(16)
+        integer :: rs, ios, ti, i, rsz
+        integer(int32) :: rid
+        character(len=:), allocatable :: buf, back
+        character(len=128) :: emsg
+        ios = c_rmtree(WDIR)
+        ! 15 x CHAR(65536) (the per-column maximum) + an int: ~983 KB of
+        ! the 1 MiB record cap.
+        c(1)%name = 'id'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        wide_cols: do i = 2, 16
+            write(c(i)%name, '(a,i0)') 'blk', i
+            c(i)%dtype = DT_CHAR; c(i)%csize = 65536
+        end do wide_cols
+        call db_open(db, WDIR, rs, emsg)
+        call db_create_table(db, 'w', c, rs, emsg)
+        call check(rs == SQR_OK, 'wide: ~1MB record accepted')
+        ti = db_table_index(db, 'w')
+        rsz = db_record_size(db, 'w')
+        call check(rsz > 900000 .and. rsz <= SQR_MAX_RECORD, 'wide: record size near the cap')
+        call row_alloc(buf, rsz)
+        call row_set_int (buf, db%tables(ti)%cols(1), 7_int32)
+        call row_set_char(buf, db%tables(ti)%cols(2), repeat('x', 65536))
+        call row_set_char(buf, db%tables(ti)%cols(16), repeat('y', 65536))
+        call db_insert(db, 'w', buf, rid, rs)
+        call check(rs == SQR_OK, 'wide: insert ok')
+        call row_alloc(back, rsz)
+        call db_get(db, 'w', rid, back, rs)
+        call check(rs == SQR_OK .and. &
+                   row_get_int(back, db%tables(ti)%cols(1)) == 7_int32 .and. &
+                   row_get_char(back, db%tables(ti)%cols(2)) == repeat('x', 65536) .and. &
+                   row_get_char(back, db%tables(ti)%cols(16)) == repeat('y', 65536), &
+                   'wide: round-trip intact')
+        call db_close(db)
+        ios = c_rmtree(WDIR)
+    end subroutine
+
+    ! Review §5.5: db_scan over a zero-row table — the callback never
+    ! fires and the scan reports SQR_OK.
+    subroutine test_scan_empty()
+        character(len=*), parameter :: SDIR = 'utest_sqr_scan0_db'
+        type(db_t) :: db
+        type(column_t) :: c(2)
+        type(scan_ctx_t) :: ctx
+        integer :: rs, ios, ti
+        character(len=128) :: emsg
+        ios = c_rmtree(SDIR)
+        c(1)%name = 'id' ; c(1)%dtype = DT_INT; c(1)%csize = 4
+        c(2)%name = 'age'; c(2)%dtype = DT_INT; c(2)%csize = 4
+        call db_open(db, SDIR, rs, emsg)
+        call db_create_table(db, 'p', c, rs, emsg)
+        ti = db_table_index(db, 'p')
+        ctx%age_col = db%tables(ti)%cols(2)
+        call db_scan(db, 'p', scan_count_and_sum, ctx, rs)
+        call check(rs == SQR_OK .and. ctx%count == 0, 'scan: zero-row table -> OK, no callbacks')
+        call db_close(db)
+        ios = c_rmtree(SDIR)
+    end subroutine
+
+    ! Review §5.5: SQR_NAME_LEN boundary — a 32-char table name works and
+    ! survives a reopen; 33 chars is rejected.
+    subroutine test_name_boundary()
+        character(len=*), parameter :: NDIR = 'utest_sqr_name_db'
+        character(len=32), parameter :: N32 = repeat('abcd', 8)   ! exactly SQR_NAME_LEN
+        type(db_t) :: db
+        type(column_t) :: c(1)
+        integer :: rs, ios
+        character(len=128) :: emsg
+        ios = c_rmtree(NDIR)
+        c(1)%name = 'id'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        call db_open(db, NDIR, rs, emsg)
+        call db_create_table(db, N32, c, rs, emsg)
+        call check(rs == SQR_OK, 'names: 32-char table name accepted')
+        call db_create_table(db, N32 // 'x', c, rs, emsg)
+        call check(rs == SQR_INVALID, 'names: 33-char table name rejected')
+        call db_close(db)
+        call db_open(db, NDIR, rs, emsg)
+        call check(db_table_index(db, N32) > 0, 'names: 32-char name survives reopen')
+        call db_close(db)
+        ios = c_rmtree(NDIR)
+    end subroutine
+
+    ! Review §5.5: reopen a tree after removes — updates that move keys
+    ! drive bt_remove; the reopened index must serve the new keys and
+    ! miss the old ones, and verify clean.
+    subroutine test_index_reopen_after_removes()
+        character(len=*), parameter :: RDIR = 'utest_sqr_reopen_db'
+        type(db_t) :: db
+        type(column_t) :: c(2)
+        integer :: rs, ios, ti, i
+        integer(int32) :: rid, r
+        character(len=:), allocatable :: buf
+        character(len=128) :: emsg
+        ios = c_rmtree(RDIR)
+        c(1)%name = 'id'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        c(2)%name = 'k' ; c(2)%dtype = DT_INT; c(2)%csize = 4
+        call db_open(db, RDIR, rs, emsg)
+        call db_create_table(db, 'p', c, rs, emsg)
+        call db_create_index(db, 'p', 'k', rs)
+        ti = db_table_index(db, 'p')
+        call row_alloc(buf, db_record_size(db, 'p'))
+        fill: do i = 1, 50
+            call row_set_int(buf, db%tables(ti)%cols(1), int(i, int32))
+            call row_set_int(buf, db%tables(ti)%cols(2), int(i, int32))
+            call db_insert(db, 'p', buf, rid, rs)
+        end do fill
+        ! Move half the keys: each update removes the old entry (bt_remove)
+        ! and inserts the new one.
+        move: do i = 2, 50, 2
+            call row_set_int(buf, db%tables(ti)%cols(1), int(i, int32))
+            call row_set_int(buf, db%tables(ti)%cols(2), int(i + 1000, int32))
+            call db_update(db, 'p', int(i, int32), buf, rs)
+        end do move
+        call db_close(db)
+
+        call db_open(db, RDIR, rs, emsg)
+        call db_verify(db, 'p', rs, emsg)
+        call check(rs == SQR_OK, 'reopen: tree verifies after removes')
+        call db_find_by_int(db, 'p', 'k', 1002_int32, r, rs)
+        call check(rs == SQR_OK .and. r == 2_int32, 'reopen: moved key found')
+        call db_find_by_int(db, 'p', 'k', 2_int32, r, rs)
+        call check(rs == SQR_NOT_FOUND, 'reopen: old key gone')
+        call db_find_by_int(db, 'p', 'k', 3_int32, r, rs)
+        call check(rs == SQR_OK .and. r == 3_int32, 'reopen: unmoved key still found')
+        call db_close(db)
+        ios = c_rmtree(RDIR)
+    end subroutine
+
+    ! Review §5.5: idx_live asserted directly around create/drop.
+    subroutine test_idx_live_direct()
+        character(len=*), parameter :: LDIR = 'utest_sqr_idxlive_db'
+        type(db_t) :: db
+        type(column_t) :: c(2)
+        integer :: rs, ios, ti
+        character(len=128) :: emsg
+        ios = c_rmtree(LDIR)
+        c(1)%name = 'a'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        c(2)%name = 'b'; c(2)%dtype = DT_INT; c(2)%csize = 4
+        call db_open(db, LDIR, rs, emsg)
+        call db_create_table(db, 't', c, rs, emsg)
+        ti = db_table_index(db, 't')
+        call db_create_index(db, 't', 'a', rs)
+        call check(idx_live(db%tables(ti)%indices(1)), 'idx_live: fresh index live')
+        call db_drop_index(db, 't', 'a', rs)
+        call check(.not. idx_live(db%tables(ti)%indices(1)), 'idx_live: dropped slot dead')
+        call db_create_index(db, 't', 'b', rs)
+        call check(idx_live(db%tables(ti)%indices(db%tables(ti)%nindices)), &
+                   'idx_live: later index live in its own slot')
+        call db_close(db)
+        ios = c_rmtree(LDIR)
     end subroutine
 
     ! ===== 5.3 db_insert_many =====

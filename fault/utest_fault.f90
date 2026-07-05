@@ -49,6 +49,7 @@ program utest_fault
     call compact_atomicity()
     call compact_index_recovery()
     call create_index_retry()
+    call close_failure()
 
     ! Auto-commit atomicity: every row mutator brackets itself, so a mid-op
     ! fault must leave the indexed table in its exact pre-op state (live_count 3
@@ -483,6 +484,53 @@ contains
         call check(bad == 0, &
             'create_index: clean retry after every mid-create failure (no stale SQR_DUP)')
     end subroutine create_index_retry
+
+    ! Review §5 gap 4: db_close's flush failures must surface through its
+    ! stat (the generic sweep deliberately runs close disarmed), and the
+    ! store must reopen verified afterwards — a failed close may lose the
+    ! final counter flush but must never corrupt the store.
+    subroutine close_failure()
+        integer :: rs, cs, n, nops, bad, silent
+
+        call fault_disarm()
+        call prep_rows()
+        call db_open(gdb, DBDIR, rs)
+        gopen = rs == SQR_OK
+        call db_create_index(gdb, 'people', 'age', rs)  ! a writable tree to flush
+        call fault_arm(BIG)
+        call db_close(gdb, cs)
+        nops = fault_count()
+        call fault_disarm()
+        gopen = .false.
+        call check(cs == SQR_OK, 'close: clean close reports OK')
+        call check(nops > 0,     'close: close performs I/O (FAULT=on linked)')
+
+        bad = 0; silent = 0
+        close_loop: do n = 1, nops
+            call prep_rows()
+            call db_open(gdb, DBDIR, rs)
+            gopen = rs == SQR_OK
+            call db_create_index(gdb, 'people', 'age', rs)
+            call fault_arm(n)
+            call db_close(gdb, cs)
+            call fault_disarm()
+            gopen = .false.
+            if (cs == SQR_OK) silent = silent + 1
+            ! Whatever the failed close managed to flush, the store must
+            ! reopen and verify (open_data re-derives the counters).
+            call db_open(gdb, DBDIR, rs)
+            gopen = rs == SQR_OK
+            if (rs /= SQR_OK) then
+                bad = bad + 1
+            else
+                call db_verify(gdb, 'people', rs)
+                if (rs /= SQR_OK) bad = bad + 1
+            end if
+            call close_g()
+        end do close_loop
+        call check(silent == 0, 'close: every injected flush failure surfaced in stat')
+        call check(bad == 0,    'close: store reopens verified after every failed close')
+    end subroutine close_failure
 
     ! Auto-commit rollback sweep. Each row mutator wraps its work in an
     ! implicit transaction (ac_begin/ac_end), so any injected I/O failure must

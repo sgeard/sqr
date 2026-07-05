@@ -39,6 +39,8 @@ program utest_sql
     call test_insert_dup_column()
     call test_int_min_literal()
     call test_bare_semicolon()
+    call test_errmsg_content()
+    call test_render()
     call test_functional_example()
 
     call cleanup_dir()
@@ -77,15 +79,18 @@ contains
         end if
     end subroutine
 
-    ! Run one SQL line, returning the result and status.
-    subroutine run(db, text, res, rs)
+    ! Run one SQL line, returning the result and status; the error message
+    ! is surfaced on request so its CONTENT can be asserted (review §5.4).
+    subroutine run(db, text, res, rs, em_out)
         type(db_t),         intent(inout), target :: db
         character(len=*),   intent(in)  :: text
         type(sql_result_t), intent(out) :: res
         integer,            intent(out) :: rs
+        character(len=*),   intent(out), optional :: em_out
         character(len=200) :: em
         em = ''
         call sql_run(db, text, res, rs, em)
+        if (present(em_out)) em_out = em
     end subroutine
 
     ! Cell text of a SELECT result at (row, col), trimmed.
@@ -763,6 +768,76 @@ contains
         call check(rs == SQR_INVALID, 'literal: 2147483648 still out of range')
         call run(db, 'INSERT INTO t VALUES (-2147483649)', res, rs)
         call check(rs == SQR_INVALID, 'literal: -2147483649 out of range')
+        call db_close(db)
+    end subroutine
+
+    ! Review §5.4: assert what the error MESSAGES say, not just the codes —
+    ! substring matches so wording can evolve without breaking the suite.
+    subroutine test_errmsg_content()
+        type(db_t) :: db
+        type(sql_result_t) :: res
+        integer :: rs
+        character(len=200) :: em
+        call fresh_db(db)
+        call run(db, "CREATE TABLE t (id INTEGER, name CHAR(4))", res, rs)
+
+        call run(db, "SELECT * FROM nosuch", res, rs, em)
+        call check(index(em, 'no such table') > 0, 'errmsg: unknown table named')
+        call run(db, "SELECT zz FROM t", res, rs, em)
+        call check(index(em, 'no such column') > 0, 'errmsg: unknown column named')
+        call run(db, "INSERT INTO t (id, id) VALUES (1, 2)", res, rs, em)
+        call check(index(em, 'duplicate column') > 0, 'errmsg: duplicate INSERT column named')
+        call run(db, "INSERT INTO t VALUES (1, 'toolong')", res, rs, em)
+        call check(index(em, 'too long') > 0, 'errmsg: CHAR overflow described')
+        call run(db, "CREATE TABLE t (id INTEGER)", res, rs, em)
+        call check(index(em, 'already exists') > 0, 'errmsg: duplicate table named')
+        call run(db, "SELEKT 1", res, rs, em)
+        call check(index(em, 'unknown statement') > 0, 'errmsg: parse error carries detail')
+        call run(db, "INSERT INTO t VALUES (99999999999, 'a')", res, rs, em)
+        call check(index(em, 'out of range') > 0, 'errmsg: integer literal out of range')
+        call db_close(db)
+    end subroutine
+
+    ! Review §5.5: sql_render had no direct coverage at all — render each
+    ! result kind to a scratch unit and assert the lines.
+    subroutine test_render()
+        type(db_t) :: db
+        type(sql_result_t) :: res, empty
+        integer :: rs, u, ios, nl
+        character(len=256) :: lines(12)
+        call fresh_db(db)
+        call run(db, "CREATE TABLE t (id INTEGER, v REAL, name CHAR(8))", res, rs)
+        call run(db, "INSERT INTO t VALUES (1, 1.5, 'a'), (2, NULL, 'bb')", res, rs)
+
+        open(newunit=u, status='scratch', action='readwrite', form='formatted')
+        call run(db, "SELECT id, v, name FROM t ORDER BY id", res, rs)
+        call sql_render(res, u)                          ! rows grid (5 lines)
+        call run(db, "UPDATE t SET id = 5 WHERE id = 2", res, rs)
+        call sql_render(res, u)                          ! DML count (1 line)
+        call run(db, "DROP TABLE t", res, rs)
+        call sql_render(res, u)                          ! DDL message (1 line)
+        empty%kind = SQLRES_ROWS                         ! degenerate grid
+        call sql_render(empty, u)                        ! (no columns) (1 line)
+
+        rewind(u)
+        nl = 0
+        collect: do
+            read(u, '(a)', iostat=ios) lines(min(nl + 1, size(lines)))
+            if (ios /= 0) exit collect
+            nl = nl + 1
+        end do collect
+        close(u)
+
+        call check(nl == 8, 'render: expected line count')
+        call check(index(lines(1), 'id') > 0 .and. index(lines(1), 'name') > 0, &
+                   'render: header names the columns')
+        call check(index(lines(2), '--') > 0, 'render: rule under the header')
+        call check(index(lines(3), '1.50000000E+00') > 0, 'render: real in es15.8')
+        call check(index(lines(4), 'NULL') > 0, 'render: NULL cell rendered as NULL')
+        call check(index(lines(5), '(2 row(s))') > 0, 'render: row-count trailer')
+        call check(index(lines(6), '1 row(s) affected') > 0, 'render: DML count line')
+        call check(len_trim(lines(7)) > 0, 'render: DDL message line non-empty')
+        call check(index(lines(8), '(no columns)') > 0, 'render: zero-column grid')
         call db_close(db)
     end subroutine
 

@@ -20,7 +20,10 @@
 !! Row ids are `int32` record slots, so a table holds at most ~2.1e9
 !! rows; once the id space is exhausted inserts fail with `SQR_FULL`.
 !! Deleting rows does not free ids (tombstones keep their slots) —
-!! `db_compact` rewrites the table and reclaims the space.
+!! `db_compact` rewrites the table and reclaims the space.  Deletes also
+!! never touch the indices (lazy delete): each dead entry in an
+!! equal-key run costs one record read on lookup/uniqueness paths until
+!! a `db_compact` rebuilds the trees — a deliberate trade, by design.
 !!
 !! A fixed magic + version is written into every `.schema` file; a
 !! mismatch on open returns `SQR_VERSION`.  Errors are reported via
