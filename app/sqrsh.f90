@@ -119,6 +119,36 @@ module sqrsh_actions
 
 contains
 
+    ! Resolve the context table, reporting `no such table` (and flagging the
+    ! action as errored) when it is gone, rather than the silent no-op the
+    ! bare `if (ti == 0) return` used to give.
+    function require_ctx_table(ctx, ti, rv) result(ok)
+        character(len=*),      intent(in)    :: ctx
+        integer,               intent(out)   :: ti
+        type(action_result_t), intent(inout) :: rv
+        logical :: ok
+        ti = db_table_index(db, ctx)
+        ok = ti /= 0
+        if (.not. ok) then
+            write(*,'(a)') 'no such table: ' // trim(ctx)
+            rv%errored = .true.
+        end if
+    end function
+
+    ! Column ordinal of `name` in table `ti`, or 0 if absent.
+    function shell_col_index(ti, name) result(ci)
+        integer,          intent(in) :: ti
+        character(len=*), intent(in) :: name
+        integer :: ci, j
+        ci = 0
+        do j = 1, db%tables(ti)%ncols
+            if (db%tables(ti)%cols(j)%name == trim(name)) then
+                ci = j
+                return
+            end if
+        end do
+    end function
+
     ! ---- top-level ----
 
     function act_open(args, ctx) result(rv)
@@ -459,8 +489,7 @@ contains
         real(real64)   :: rval
         character(len=:), allocatable :: buf, sval
         logical :: ok
-        ti = db_table_index(db, ctx)
-        if (ti == 0) return
+        if (.not. require_ctx_table(ctx, ti, rv)) return
         if (args%size() /= db%tables(ti)%ncols) then
             write(*,'(a,i0,a)') 'expected ', db%tables(ti)%ncols, ' values'
             rv%errored = .true.
@@ -532,8 +561,7 @@ contains
         real(real64)   :: rval
         character(len=:), allocatable :: buf, sval
         logical :: ok
-        ti = db_table_index(db, ctx)
-        if (ti == 0) return
+        if (.not. require_ctx_table(ctx, ti, rv)) return
         if (args%size() /= db%tables(ti)%ncols + 1) then
             write(*,'(a,i0,a)') 'usage: update <row_id> followed by ', &
                 db%tables(ti)%ncols, ' values'
@@ -622,8 +650,7 @@ contains
         character(len=*), intent(in) :: ctx
         type(action_result_t) :: rv
         integer :: ti, rs
-        ti = db_table_index(db, ctx)
-        if (ti == 0) return
+        if (.not. require_ctx_table(ctx, ti, rv)) return
         call print_header(ti)
         call db_scan(db, ctx, select_emit_cb, ti, rs)
     end function
@@ -637,8 +664,7 @@ contains
         integer(int32) :: rid
         character(len=:), allocatable :: buf
         logical :: ok
-        ti = db_table_index(db, ctx)
-        if (ti == 0) return
+        if (.not. require_ctx_table(ctx, ti, rv)) return
         if (args%size() /= 1) then
             write(*,'(a)') 'usage: get <row_id>'
             return
@@ -668,8 +694,7 @@ contains
         integer :: ti, rs
         integer(int32) :: rid
         logical :: ok
-        ti = db_table_index(db, ctx)
-        if (ti == 0) return
+        if (.not. require_ctx_table(ctx, ti, rv)) return
         if (args%size() /= 1) then
             write(*,'(a)') 'usage: delete <row_id>'
             return
@@ -694,8 +719,7 @@ contains
         character(len=*), intent(in) :: ctx
         type(action_result_t) :: rv
         integer :: ti, rs
-        ti = db_table_index(db, ctx)
-        if (ti == 0) return
+        if (.not. require_ctx_table(ctx, ti, rv)) return
         if (args%size() /= 0) then
             write(*,'(a)') 'usage: compact'
             return
@@ -715,8 +739,7 @@ contains
         type(action_result_t) :: rv
         integer :: ti, rs
         character(len=128) :: emsg
-        ti = db_table_index(db, ctx)
-        if (ti == 0) return
+        if (.not. require_ctx_table(ctx, ti, rv)) return
         if (args%size() /= 0) then
             write(*,'(a)') 'usage: verify'
             return
@@ -738,8 +761,7 @@ contains
         class(dlist_node_data_t), allocatable :: n
         character(len=SQR_NAME_LEN), allocatable :: cols(:)
         integer :: ti, rs, nargs, k
-        ti = db_table_index(db, ctx)
-        if (ti == 0) return
+        if (.not. require_ctx_table(ctx, ti, rv)) return
         nargs = args%size()
         if (nargs < 1) then
             write(*,'(a)') 'usage: dropindex <col> [<col> ...]'
@@ -769,8 +791,7 @@ contains
         integer :: ti, rs
         character(len=128) :: emsg
         logical :: ok
-        ti = db_table_index(db, ctx)
-        if (ti == 0) return
+        if (.not. require_ctx_table(ctx, ti, rv)) return
         call parse_col_spec(args, 1, 'addcolumn', col, ok)
         if (.not. ok) then
             rv%errored = .true.
@@ -797,8 +818,7 @@ contains
         character(len=:), allocatable :: cname
         integer :: ti, rs
         character(len=128) :: emsg
-        ti = db_table_index(db, ctx)
-        if (ti == 0) return
+        if (.not. require_ctx_table(ctx, ti, rv)) return
         if (args%size() /= 1) then
             write(*,'(a)') 'usage: dropcolumn <name>'
             return
@@ -857,7 +877,7 @@ contains
         character(len=SQR_NAME_LEN), allocatable, intent(out) :: cols(:)
         logical,                                  intent(out) :: ok
         class(dlist_node_data_t), allocatable :: nc, nv
-        integer :: np, p, ci, j
+        integer :: np, p, ci
         integer(int32) :: ival
         real(real64)   :: rval
         logical :: cvt
@@ -874,13 +894,7 @@ contains
                 nc = args%get(2*p - 1)
                 nv = args%get(2*p)
                 cols(p) = node_as_char(nc)
-                ci = 0
-                find_col: do j = 1, t%ncols
-                    if (t%cols(j)%name == trim(cols(p))) then
-                        ci = j
-                        exit find_col
-                    end if
-                end do find_col
+                ci = shell_col_index(ti, cols(p))
                 if (ci == 0) then
                     write(*,'(2a)') 'no such column: ', trim(cols(p))
                     return
@@ -922,8 +936,7 @@ contains
         integer :: ti, rs
         integer(int32) :: rid
         logical :: ok
-        ti = db_table_index(db, ctx)
-        if (ti == 0) return
+        if (.not. require_ctx_table(ctx, ti, rv)) return
         call parse_key_pairs(ti, args, keyrow, cols, ok)
         if (.not. ok) then
             rv%errored = .true.
@@ -948,8 +961,7 @@ contains
         character(len=:), allocatable :: keyrow
         integer :: ti, rs
         logical :: ok
-        ti = db_table_index(db, ctx)
-        if (ti == 0) return
+        if (.not. require_ctx_table(ctx, ti, rv)) return
         call parse_key_pairs(ti, args, keyrow, cols, ok)
         if (.not. ok) then
             rv%errored = .true.
@@ -970,23 +982,17 @@ contains
         type(action_result_t) :: rv
         class(dlist_node_data_t), allocatable :: nc, nv
         character(len=:), allocatable :: col, buf
-        integer :: ti, ci, rs, j
+        integer :: ti, ci, rs
         integer(int32) :: rid, ival
         real(real64)   :: rval
         logical :: ok
-        ti = db_table_index(db, ctx); if (ti == 0) return
+        if (.not. require_ctx_table(ctx, ti, rv)) return
         if (args%size() /= 2) then
             write(*,'(a)') 'usage: find <col> <value>'
             return
         end if
         nc = args%get(1); col = node_as_char(nc)
-        ci = 0
-        find_col: do j = 1, db%tables(ti)%ncols
-            if (db%tables(ti)%cols(j)%name == trim(col)) then
-                ci = j
-                exit find_col
-            end if
-        end do find_col
+        ci = shell_col_index(ti, col)
         if (ci == 0) then
             write(*,'(2a)') 'no such column: ', trim(col)
             rv%errored = .true.
@@ -1038,24 +1044,18 @@ contains
         type(action_result_t) :: rv
         class(dlist_node_data_t), allocatable :: nc, nlo, nhi
         character(len=:), allocatable :: col, buf
-        integer :: ti, ci, rs, j, nrows
+        integer :: ti, ci, rs, nrows
         integer(int32) :: rid, ilo, ihi
         real(real64)   :: rlo, rhi
         logical :: ok, oklo, okhi
         type(db_cursor_t) :: cur
-        ti = db_table_index(db, ctx); if (ti == 0) return
+        if (.not. require_ctx_table(ctx, ti, rv)) return
         if (args%size() /= 3) then
             write(*,'(a)') 'usage: range <col> <lo> <hi>'
             return
         end if
         nc = args%get(1); col = node_as_char(nc)
-        ci = 0
-        find_col: do j = 1, db%tables(ti)%ncols
-            if (db%tables(ti)%cols(j)%name == trim(col)) then
-                ci = j
-                exit find_col
-            end if
-        end do find_col
+        ci = shell_col_index(ti, col)
         if (ci == 0) then
             write(*,'(2a)') 'no such column: ', trim(col)
             rv%errored = .true.

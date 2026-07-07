@@ -224,19 +224,41 @@ contains
         ios = c_rmtree('utest_hist_noop')
     end subroutine
 
-    ! The depth cap drops the oldest steps.
+    ! The depth cap is a ring: once full it overwrites the OLDEST step, keeping
+    ! the `cap` newest with their content and labels intact.  Undoing the
+    ! survivors newest-first must restore each step's before-image (and stop at
+    ! the oldest survivor, NOT the pre-first-gesture state), and redo re-applies
+    ! them in order — the whole point of E6's ring buffer.
     subroutine test_depth_cap()
         type(db_t), target :: db
         integer :: r1, rs, ios, k
+        character(len=:), allocatable :: lbl
+        character(len=2) :: lb
         call make_db(db, 'utest_hist_cap')
         r1 = ins(db, 0)
         db%hist%cap = 2                     ! keep only the two newest gestures
         do k = 1, 3
-            call db_begin(db, rs, label='G'); call setv(db, r1, k); call db_commit(db, rs)
+            write(lb, '(a1,i1)') 'G', k     ! G1, G2, G3 rewrite v to 1, 2, 3
+            call db_begin(db, rs, label=lb); call setv(db, r1, k); call db_commit(db, rs)
         end do
-        call db_undo(db, rs); call check(rs == SQR_OK,       'cap: undo 1 of 2 retained')
-        call db_undo(db, rs); call check(rs == SQR_OK,       'cap: undo 2 of 2 retained')
-        call db_undo(db, rs); call check(rs == SQR_NO_UNDO,  'cap: third undo past the cap is empty')
+        call check(getv(db, r1) == 3,       'cap: latest gesture applied')
+
+        call db_undo(db, rs, lbl)
+        call check(rs == SQR_OK .and. lbl == 'G3', 'cap: undo 1 returns the newest label (G3)')
+        call check(getv(db, r1) == 2,       'cap: undo 1 restores G3 before-image (2)')
+        call db_undo(db, rs, lbl)
+        call check(rs == SQR_OK .and. lbl == 'G2', 'cap: undo 2 returns G2')
+        call check(getv(db, r1) == 1,       'cap: undo 2 restores G2 before-image (1)')
+        call db_undo(db, rs)
+        call check(rs == SQR_NO_UNDO,       'cap: third undo past the cap is empty (G1 dropped)')
+        call check(getv(db, r1) == 1,       'cap: stops at the oldest survivor, not the pre-G1 value 0')
+
+        call db_redo(db, rs, lbl)
+        call check(rs == SQR_OK .and. lbl == 'G2', 'cap: redo 1 re-applies G2')
+        call check(getv(db, r1) == 2,       'cap: redo 1 value (2)')
+        call db_redo(db, rs, lbl)
+        call check(rs == SQR_OK .and. lbl == 'G3', 'cap: redo 2 re-applies G3')
+        call check(getv(db, r1) == 3,       'cap: redo 2 value (3)')
         call db_close(db)
         ios = c_rmtree('utest_hist_cap')
     end subroutine

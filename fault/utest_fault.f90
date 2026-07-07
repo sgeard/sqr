@@ -67,6 +67,9 @@ program utest_fault
     ! modified base file and only then voids the journal (the commit point).
     call commit_durability()
 
+    ! Q1: a fault swept across a LABELLED commit must never corrupt the history.
+    call capture_fault()
+
     ! H1: a faulted undo replay must leave the journal hot, never voided.
     call recover_fault()
 
@@ -654,6 +657,64 @@ contains
         call check(bad == 0, &
             'commit_durability: every commit-barrier fault aborts and rolls back')
     end subroutine commit_durability
+
+    ! Q1 history-capture failure policy.  capture_step runs inside db_commit
+    ! BEFORE txn_commit; if its post-image reads (finish_delta) fail it must drop
+    ! the session-only history (coherent-or-empty) while the commit's own
+    ! durability stands.  Sweep a fault across a LABELLED commit: whatever the
+    ! fault point, the db must stay coherent in the same session and any undo step
+    ! that survives must replay cleanly (undo restores + verifies, redo re-applies
+    ! + verifies) — a half-built step from a failed capture would break this.
+    subroutine capture_fault()
+        integer :: rs, n_before, n_after, k, bad
+        integer(int32) :: rid
+        character(len=128) :: emsg
+
+        call prep_indexed()
+        call db_open(gdb, DBDIR, rs)
+        gopen = .true.
+        call fault_arm(BIG)                      ! never fires; just counts
+        call db_begin(gdb, rs, label='G')
+        call insert_zoe(gdb, rid, rs)
+        n_before = fault_count()
+        call db_commit(gdb, rs)
+        n_after = fault_count()
+        call fault_disarm()
+        call check(rs == SQR_OK,         'capture_fault: clean labelled commit succeeds')
+        call check(db_can_undo(gdb),     'capture_fault: clean labelled commit leaves one undo step')
+        call close_g()
+
+        bad = 0
+        sweep: do k = n_before + 1, n_after
+            call prep_indexed()
+            call db_open(gdb, DBDIR, rs)
+            gopen = .true.
+            call fault_arm(k)
+            call db_begin(gdb, rs, label='G')
+            call insert_zoe(gdb, rid, rs)
+            if (rs /= SQR_OK) bad = bad + 1              ! pre-commit work must still succeed
+            call db_commit(gdb, rs)                      ! capture fault -> OK; barrier fault -> rollback
+            call fault_disarm()
+            ! Same session: the store must be coherent whatever the fault did.
+            call db_verify(gdb, 'people', rs, emsg)
+            if (rs /= SQR_OK) bad = bad + 1
+            ! A surviving undo step must be replayable (undo then redo), never a
+            ! half-captured step spliced onto the store.
+            if (db_can_undo(gdb)) then
+                call db_undo(gdb, rs)
+                if (rs /= SQR_OK) bad = bad + 1
+                call db_verify(gdb, 'people', rs, emsg)
+                if (rs /= SQR_OK) bad = bad + 1
+                call db_redo(gdb, rs)
+                if (rs /= SQR_OK) bad = bad + 1
+                call db_verify(gdb, 'people', rs, emsg)
+                if (rs /= SQR_OK) bad = bad + 1
+            end if
+            call close_g()
+        end do sweep
+        call check(bad == 0, &
+            'capture_fault: every labelled-commit fault leaves a coherent db + replayable history')
+    end subroutine capture_fault
 
     ! H1 recovery-failure path.  A transient I/O error while replaying the undo
     ! set must NOT void the journal: it stays hot so the next open retries the

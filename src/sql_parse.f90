@@ -529,31 +529,31 @@ contains
             type(sql_cond_group_t), allocatable :: groups(:)
             type(sql_cond_group_t) :: g
             integer :: ng
-            allocate(groups(0))
             ng = 0
             do
                 call parse_and_group(g)
                 if (had_err) return
-                groups = [groups, g]
-                ng = ng + 1
+                call grow_groups(groups, ng, g)
                 if (.not. is_kw(tk(), 'or')) exit
                 call adv()
             end do
             stmt%has_where    = .true.
-            stmt%where_groups = groups
+            stmt%where_groups = groups(1:ng)
         end subroutine
 
         subroutine parse_and_group(g)
             type(sql_cond_group_t), intent(out) :: g
             type(sql_cond_t) :: c
-            allocate(g%conds(0))
+            integer :: nconds
+            nconds = 0
             do
                 call parse_cond(c)
                 if (had_err) return
-                g%conds = [g%conds, c]
+                call grow_conds(g%conds, nconds, c)
                 if (.not. is_kw(tk(), 'and')) exit
                 call adv()
             end do
+            g%conds = g%conds(1:nconds)   ! trim to the exact count
         end subroutine
 
         subroutine parse_cond(c)
@@ -672,7 +672,7 @@ contains
             integer :: nc, ncols, nrows
             type(sql_lit_t), allocatable :: flat(:)
             type(sql_lit_t) :: lit
-            integer :: row_w, cap
+            integer :: row_w, cap, nflat
             call adv()   ! INSERT
             call eat_kw('into')
             if (had_err) return
@@ -691,7 +691,7 @@ contains
             call eat_kw('values')
             if (had_err) return
             ! one or more parenthesised literal tuples
-            allocate(flat(0))
+            nflat = 0
             ncols = -1
             nrows = 0
             do
@@ -701,7 +701,7 @@ contains
                 do
                     call parse_literal(lit)
                     if (had_err) return
-                    flat = [flat, lit]
+                    call grow_lits(flat, nflat, lit)
                     row_w = row_w + 1
                     if (.not. is_punct(tk(), ',')) exit
                     call adv()
@@ -744,13 +744,15 @@ contains
             type(sql_lit_t),             allocatable :: svals(:)
             character(len=SQR_NAME_LEN) :: cname
             type(sql_lit_t) :: lit
+            integer :: nsc, nsv
             call adv()   ! UPDATE
             stmt%kind = ST_UPDATE
             call take_name(stmt%table, 'table name')
             if (had_err) return
             call eat_kw('set')
             if (had_err) return
-            allocate(scols(0), svals(0))
+            nsc = 0
+            nsv = 0
             do
                 call take_name(cname, 'column name')
                 if (had_err) return
@@ -758,13 +760,13 @@ contains
                 if (had_err) return
                 call parse_literal(lit)
                 if (had_err) return
-                scols = [scols, cname]
-                svals = [svals, lit]
+                call grow_names(scols, nsc, cname)
+                call grow_lits(svals, nsv, lit)
                 if (.not. is_punct(tk(), ',')) exit
                 call adv()
             end do
-            stmt%set_cols = scols
-            stmt%set_vals = svals
+            stmt%set_cols = scols(1:nsc)
+            stmt%set_vals = svals(1:nsv)
             call parse_tail(want_order=.false.)
         end subroutine
 
@@ -904,6 +906,72 @@ contains
             else
                 call errf(cur_col(), 'expected ADD or DROP after ALTER TABLE')
             end if
+        end subroutine
+
+        ! ---- amortised-O(1) array growth (capacity doubling) ----
+        ! Each appends one element, doubling the backing store when full, so a
+        ! parse of n items costs O(n) copies rather than the O(n^2) of the
+        ! `arr = [arr, elem]` idiom.  `n` is the live count; callers slice
+        ! `arr(1:n)` when storing the finished list.
+
+        subroutine grow_groups(arr, n, elem)
+            type(sql_cond_group_t), allocatable, intent(inout) :: arr(:)
+            integer,                             intent(inout) :: n
+            type(sql_cond_group_t),              intent(in)    :: elem
+            type(sql_cond_group_t), allocatable :: tmp(:)
+            if (.not. allocated(arr)) allocate(arr(4))
+            if (n == size(arr)) then
+                allocate(tmp(2 * size(arr)))
+                tmp(1:n) = arr(1:n)
+                call move_alloc(tmp, arr)
+            end if
+            n = n + 1
+            arr(n) = elem
+        end subroutine
+
+        subroutine grow_conds(arr, n, elem)
+            type(sql_cond_t), allocatable, intent(inout) :: arr(:)
+            integer,                       intent(inout) :: n
+            type(sql_cond_t),              intent(in)    :: elem
+            type(sql_cond_t), allocatable :: tmp(:)
+            if (.not. allocated(arr)) allocate(arr(4))
+            if (n == size(arr)) then
+                allocate(tmp(2 * size(arr)))
+                tmp(1:n) = arr(1:n)
+                call move_alloc(tmp, arr)
+            end if
+            n = n + 1
+            arr(n) = elem
+        end subroutine
+
+        subroutine grow_lits(arr, n, elem)
+            type(sql_lit_t), allocatable, intent(inout) :: arr(:)
+            integer,                      intent(inout) :: n
+            type(sql_lit_t),              intent(in)    :: elem
+            type(sql_lit_t), allocatable :: tmp(:)
+            if (.not. allocated(arr)) allocate(arr(4))
+            if (n == size(arr)) then
+                allocate(tmp(2 * size(arr)))
+                tmp(1:n) = arr(1:n)
+                call move_alloc(tmp, arr)
+            end if
+            n = n + 1
+            arr(n) = elem
+        end subroutine
+
+        subroutine grow_names(arr, n, elem)
+            character(len=SQR_NAME_LEN), allocatable, intent(inout) :: arr(:)
+            integer,                                  intent(inout) :: n
+            character(len=*),                         intent(in)    :: elem
+            character(len=SQR_NAME_LEN), allocatable :: tmp(:)
+            if (.not. allocated(arr)) allocate(arr(4))
+            if (n == size(arr)) then
+                allocate(tmp(2 * size(arr)))
+                tmp(1:n) = arr(1:n)
+                call move_alloc(tmp, arr)
+            end if
+            n = n + 1
+            arr(n) = elem
         end subroutine
 
     end subroutine sql_parse

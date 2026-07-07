@@ -386,12 +386,13 @@ contains
             call db_begin(db, rs)
             if (rs /= SQR_OK) then; call set_err(stat, errmsg, rs, 'cannot begin transaction'); return; end if
         end if
+        ! One record buffer for the whole loop: gather already holds each
+        ! row's image in g%bufs, so reuse it (same length every iteration —
+        ! the allocatable assignment keeps the allocation) instead of a
+        ! per-row row_alloc + db_get round-trip.
+        call row_alloc(buf, db%tables(ti)%record_size)
         rows: do k = 1, g%n
-            call row_alloc(buf, db%tables(ti)%record_size)
-            call db_get(db, trim(stmt%table), g%rids(k), buf, rs)
-            if (rs /= SQR_OK) then
-                call fail_txn(db, own); call set_err(stat, errmsg, rs, 'update: row vanished'); return
-            end if
+            buf = g%bufs(k)
             do s = 1, size(setcol)
                 em = ''
                 call put_lit(buf, db%tables(ti)%cols(setcol(s)), stmt%set_vals(s), rs, em)
@@ -401,7 +402,15 @@ contains
             end do
             call db_update(db, trim(stmt%table), g%rids(k), buf, rs)
             if (rs /= SQR_OK) then
-                call fail_txn(db, own); call set_err(stat, errmsg, rs, 'update failed'); return
+                ! db_update re-validates liveness, so a row that vanished
+                ! between gather and here surfaces as SQR_NOT_FOUND.
+                call fail_txn(db, own)
+                if (rs == SQR_NOT_FOUND) then
+                    call set_err(stat, errmsg, rs, 'update: row vanished')
+                else
+                    call set_err(stat, errmsg, rs, 'update failed')
+                end if
+                return
             end if
             ! TEXT columns in the SET list.
             do s = 1, size(setcol)
@@ -724,6 +733,26 @@ contains
         end do
     end function
 
+    ! Effective length of a CHAR cell in `buf`: the stored member is NUL-padded
+    ! (row_set_char), its value runs to the first NUL, and trailing blanks are
+    ! insignificant (the store canonicalises them out — see extract_key).  So the
+    ! comparable value is buf(col%offset : col%offset + char_cell(...) - 1), with
+    ! no allocated temporary.  Fortran's own trailing-blank-insensitive character
+    ! comparison then reconciles it against the (untrimmed) literal directly.
+    pure function char_cell(buf, col) result(clen)
+        character(len=*), intent(in) :: buf
+        type(column_t),   intent(in) :: col
+        integer :: clen, k
+        associate (n => col%csize, off => col%offset)
+            k = scan(buf(off : off + n - 1), char(0))
+            if (k == 0) then
+                clen = len_trim(buf(off : off + n - 1))
+            else
+                clen = len_trim(buf(off : off + k - 2))
+            end if
+        end associate
+    end function
+
     ! Evaluate one validated condition against a row.  A NULL column value
     ! makes any comparison / BETWEEN false (SQL three-valued logic collapsed to
     ! "not matched"); IS NULL / IS NOT NULL test the null bit directly.
@@ -732,10 +761,9 @@ contains
         type(sql_cond_t), intent(in) :: c
         character(len=*), intent(in) :: buf
         logical :: yes
-        integer :: ci
+        integer :: ci, clen
         logical :: isnull
         real(real64) :: v
-        character(len=:), allocatable :: s
         yes = .false.
         ci = c%col_ord                       ! resolved once in gather
         if (ci == 0) ci = col_index(t, trim(c%col))   ! unresolved caller: look up
@@ -764,16 +792,18 @@ contains
                 case (OP_BETWEEN); yes = v >= lit_num(c%lit) .and. v <= lit_num(c%lit2)
                 end select
             case (DT_CHAR)
-                s = trim(row_get_char(buf, col))
-                select case (c%op)
-                case (OP_EQ);      yes = s == trim(c%lit%sval)
-                case (OP_NE);      yes = s /= trim(c%lit%sval)
-                case (OP_LT);      yes = s <  trim(c%lit%sval)
-                case (OP_LE);      yes = s <= trim(c%lit%sval)
-                case (OP_GT);      yes = s >  trim(c%lit%sval)
-                case (OP_GE);      yes = s >= trim(c%lit%sval)
-                case (OP_BETWEEN); yes = s >= trim(c%lit%sval) .and. s <= trim(c%lit2%sval)
-                end select
+                clen = char_cell(buf, col)
+                associate (s => buf(col%offset : col%offset + clen - 1))
+                    select case (c%op)
+                    case (OP_EQ);      yes = s == c%lit%sval
+                    case (OP_NE);      yes = s /= c%lit%sval
+                    case (OP_LT);      yes = s <  c%lit%sval
+                    case (OP_LE);      yes = s <= c%lit%sval
+                    case (OP_GT);      yes = s >  c%lit%sval
+                    case (OP_GE);      yes = s >= c%lit%sval
+                    case (OP_BETWEEN); yes = s >= c%lit%sval .and. s <= c%lit2%sval
+                    end select
+                end associate
             end select
         end associate
     end function
@@ -1012,8 +1042,6 @@ contains
         end associate
     end subroutine
 
-    ! Stable insertion sort of `perm` ordering rows by column `oc`.  Ascending
-    ! puts NULLs last; descending inverts the comparison (NULLs first).
     ! Stable bottom-up merge sort of the row permutation: O(n log n) where
     ! the previous insertion sort was O(n^2).  Stability (ties keep gather
     ! order) comes from the merge taking the LEFT run's element unless the
@@ -1081,10 +1109,9 @@ contains
     function cmp_rows(g, oc, a, b) result(cmp)
         type(row_match_ctx_t), intent(in) :: g
         integer,               intent(in) :: oc, a, b
-        integer :: cmp
+        integer :: cmp, ca, cb
         logical :: na, nb
         real(real64) :: va, vb
-        character(len=:), allocatable :: sa, sb
         associate (col => g%t%cols(oc))
             na = row_is_null(g%bufs(a), col)
             nb = row_is_null(g%bufs(b), col)
@@ -1107,9 +1134,12 @@ contains
                 end if
                 if (va < vb) then; cmp = -1; else if (va > vb) then; cmp = 1; else; cmp = 0; end if
             case (DT_CHAR)
-                sa = trim(row_get_char(g%bufs(a), col))
-                sb = trim(row_get_char(g%bufs(b), col))
-                if (sa < sb) then; cmp = -1; else if (sa > sb) then; cmp = 1; else; cmp = 0; end if
+                ca = char_cell(g%bufs(a), col)
+                cb = char_cell(g%bufs(b), col)
+                associate (sa => g%bufs(a)(col%offset : col%offset + ca - 1), &
+                           sb => g%bufs(b)(col%offset : col%offset + cb - 1))
+                    if (sa < sb) then; cmp = -1; else if (sa > sb) then; cmp = 1; else; cmp = 0; end if
+                end associate
             case default
                 cmp = 0
             end select

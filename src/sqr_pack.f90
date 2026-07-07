@@ -35,11 +35,12 @@ contains
         character(len=*), intent(in)            :: dir, file
         integer,          intent(out), optional :: stat
         type(db_t)     :: sdb                 ! only %dir / %lock_tok are used
-        type(table_t)  :: tbl
+        type(table_t), allocatable :: tbls(:)
         type(pfile_t), allocatable :: pf(:)
         character(len=SQR_NAME_LEN), allocatable :: names(:)
         character(len=:), allocatable :: payload
         integer(int64), allocatable   :: offs(:)
+        integer(int64) :: total
         integer :: n, nf, i, j, k, rs, lerr, cks
 
         rs = SQR_OK
@@ -67,45 +68,53 @@ contains
             call read_catalog(sdb, names, n, rs)
             if (rs /= SQR_OK) exit pack_body
 
-            ! File list: the catalog, then each table's schema/data, its blob
-            ! (only if it has a TEXT column) and every live index.
+            ! Read every table's schema ONCE into tbls(:), counting files as we
+            ! go: the catalog, then each table's schema/data, its blob (only if
+            ! it has a TEXT column) and every live index.
+            allocate(tbls(n))
             nf = 1
             count_tables: do i = 1, n
-                call read_schema(sdb, trim(names(i)), tbl, rs)
+                call read_schema(sdb, trim(names(i)), tbls(i), rs)
                 if (rs /= SQR_OK) exit pack_body
                 nf = nf + 2                                   ! schema + data
-                if (table_has_text(tbl)) nf = nf + 1
-                do j = 1, tbl%nindices
-                    if (idx_live(tbl%indices(j))) nf = nf + 1
+                if (table_has_text(tbls(i))) nf = nf + 1
+                do j = 1, tbls(i)%nindices
+                    if (idx_live(tbls(i)%indices(j))) nf = nf + 1
                 end do
             end do count_tables
 
+            ! Build the file-name list from the schemas already in memory.
             allocate(pf(nf))
             k = 0
             k = k + 1; pf(k)%name = CATALOG_FILE
             list_tables: do i = 1, n
-                call read_schema(sdb, trim(names(i)), tbl, rs)
-                if (rs /= SQR_OK) exit pack_body
                 k = k + 1; pf(k)%name = trim(names(i)) // '.schema'
                 k = k + 1; pf(k)%name = data_relpath(trim(names(i)))
-                if (table_has_text(tbl)) then
+                if (table_has_text(tbls(i))) then
                     k = k + 1; pf(k)%name = blob_relpath(trim(names(i)))
                 end if
-                do j = 1, tbl%nindices
-                    if (.not. idx_live(tbl%indices(j))) cycle
+                do j = 1, tbls(i)%nindices
+                    if (.not. idx_live(tbls(i)%indices(j))) cycle
                     k = k + 1; pf(k)%name = index_relpath(trim(names(i)), j)
                 end do
             end do list_tables
 
-            ! Read every file's bytes and assemble the payload + TOC offsets.
+            ! Read every file's bytes, sizing the payload from the running
+            ! total, then assemble it in one allocation (no O(n^2) concat)
+            ! alongside the TOC offsets.
             allocate(offs(nf))
-            payload = ''
+            total = 0_int64
             read_bytes: do k = 1, nf
                 call read_file_bytes(pathjoin(sdb%dir, pf(k)%name), pf(k)%bytes, rs)
                 if (rs /= SQR_OK) exit pack_body
-                offs(k) = int(len(payload), int64)
-                payload = payload // pf(k)%bytes
+                offs(k) = total
+                total = total + int(len(pf(k)%bytes), int64)
             end do read_bytes
+            allocate(character(len=int(total)) :: payload)
+            assemble: do k = 1, nf
+                if (len(pf(k)%bytes) > 0) &
+                    payload(int(offs(k)) + 1 : int(offs(k)) + len(pf(k)%bytes)) = pf(k)%bytes
+            end do assemble
             cks = checksum(payload)
 
             call write_container(file, pf, offs, cks, rs)

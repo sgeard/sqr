@@ -47,9 +47,10 @@ contains
         character(len=*), intent(in)           :: table_name
         character(len=*), intent(in)           :: buf
         integer(int32),   intent(out)          :: row_id
-        integer,          intent(out), optional :: stat
+        integer,          intent(out)          :: stat
         integer :: idx, rs, ci, ios
-        character(len=:), allocatable :: wbuf
+        logical :: viol
+        stat = SQR_OK
         if (readonly_block(db, stat)) then
             row_id = 0
             return
@@ -57,28 +58,29 @@ contains
         db%generation = db%generation + 1   ! write: invalidate cursors
         idx = db_table_index(db, table_name)
         if (idx == 0) then
-            if (present(stat)) stat = SQR_NOT_FOUND
+            stat = SQR_NOT_FOUND
             row_id = 0
             return
         end if
-        associate (t => db%tables(idx))
+        ! wbuf is the table's reusable record scratch (no per-insert alloc).
+        call ensure_len(db%tables(idx)%rbuf_scratch, db%tables(idx)%record_size)
+        associate (t => db%tables(idx), wbuf => db%tables(idx)%rbuf_scratch)
             ! Strict on write: a wrong-length buffer is a caller bug —
             ! padding or truncating silently would store a malformed row.
             ! Reads stay tolerant; size buffers with db_record_size().
             if (len(buf) /= t%record_size) then
-                if (present(stat)) stat = SQR_INVALID
+                stat = SQR_INVALID
                 row_id = 0
                 return
             end if
             ! Row ids are int32 record slots: refuse rather than wrap once
             ! the id space is exhausted (db_compact reclaims it).
             if (t%next_id == huge(0_int32)) then
-                if (present(stat)) stat = SQR_FULL
+                stat = SQR_FULL
                 row_id = 0
                 return
             end if
             row_id = t%next_id
-            allocate(character(len=t%record_size) :: wbuf)
             wbuf = buf
             call row_set_status(wbuf, ROW_ALIVE)
             ! Fresh rows start with empty text; db_set_text fills them later.
@@ -97,29 +99,28 @@ contains
                     ! A row with any NULL index member is not in that index, so
                     ! it cannot violate uniqueness and carries no NaN key there.
                     if (key_has_null(t, ix, wbuf)) cycle precheck
-                    check_one: block
-                        character(len=:), allocatable :: key
-                        logical :: viol
-                        allocate(character(len=ix%key_size) :: key)
+                    call ensure_len(ix%key_scratch, ix%key_size)
+                    associate (key => ix%key_scratch)
                         call extract_key(t, ix, wbuf, key)
                         if (key_has_nan(t, ix, key)) then
-                            if (present(stat)) stat = SQR_INVALID
+                            stat = SQR_INVALID
                             row_id = 0
                             return
                         end if
-                        if (.not. ix%unique) exit check_one
-                        call unique_violation(db, idx, ci, key, 0_int32, viol, rs)
-                        if (rs /= SQR_OK) then
-                            if (present(stat)) stat = rs
-                            row_id = 0
-                            return
+                        if (ix%unique) then
+                            call unique_violation(db, idx, ci, key, 0_int32, viol, rs)
+                            if (rs /= SQR_OK) then
+                                stat = rs
+                                row_id = 0
+                                return
+                            end if
+                            if (viol) then
+                                stat = SQR_DUP
+                                row_id = 0
+                                return
+                            end if
                         end if
-                        if (viol) then
-                            if (present(stat)) stat = SQR_DUP
-                            row_id = 0
-                            return
-                        end if
-                    end block check_one
+                    end associate
                 end associate
             end do precheck
 
@@ -129,7 +130,7 @@ contains
             if (db%jrnl%active) then
                 call jrnl_log_extend(db, data_relpath(t%name), rs)
                 if (rs /= SQR_OK) then
-                    if (present(stat)) stat = rs
+                    stat = rs
                     row_id = 0
                     return
                 end if
@@ -137,7 +138,7 @@ contains
             write(t%unit, rec=row_id, iostat=ios) wbuf
             call io_check(ios)
             if (ios /= 0) then
-                if (present(stat)) stat = SQR_ERR
+                stat = SQR_ERR
                 row_id = 0          ! contract: 0 on failure (no row written)
                 return
             end if
@@ -145,14 +146,13 @@ contains
             t%live_count = t%live_count + 1
             call update_indices_on_insert(db, idx, row_id, wbuf, rs)
             if (rs /= SQR_OK) then
-                if (present(stat)) stat = rs
+                stat = rs
                 ! Index update failed: the bracket rolls the whole op back
                 ! (row write + any index changes), so the table is left
                 ! exactly as it was — db_insert zeroes row_id on failure.
                 return
             end if
         end associate
-        if (present(stat)) stat = SQR_OK
     end subroutine
 
     module subroutine db_get(db, table_name, row_id, buf, stat)
@@ -231,39 +231,40 @@ contains
         character(len=*), intent(in)           :: table_name
         integer(int32),   intent(in)           :: row_id
         character(len=*), intent(in)           :: buf
-        integer,          intent(out), optional :: stat
+        integer,          intent(out)          :: stat
         integer :: idx, ios, ci, j, rs
         integer(int64) :: toff
         integer(int32) :: tlen
         character(len=:), allocatable :: rbuf, wbuf
         type(keypair_t), allocatable :: kp(:)   ! per-index old/new key bytes
+        stat = SQR_OK
         if (readonly_block(db, stat)) return
         db%generation = db%generation + 1   ! write: invalidate cursors
         idx = db_table_index(db, table_name)
         if (idx == 0) then
-            if (present(stat)) stat = SQR_NOT_FOUND
+            stat = SQR_NOT_FOUND
             return
         end if
         associate (t => db%tables(idx))
             ! Strict on write — see ins_core: a wrong-length buffer is a
             ! caller bug, not something to pad or truncate silently.
             if (len(buf) /= t%record_size) then
-                if (present(stat)) stat = SQR_INVALID
+                stat = SQR_INVALID
                 return
             end if
             if (row_id < 1 .or. row_id >= t%next_id) then
-                if (present(stat)) stat = SQR_NOT_FOUND
+                stat = SQR_NOT_FOUND
                 return
             end if
             allocate(character(len=t%record_size) :: rbuf)
             read(t%unit, rec=row_id, iostat=ios) rbuf
             call io_check(ios)
             if (ios /= 0) then          ! I/O failure is not "row absent"
-                if (present(stat)) stat = SQR_ERR
+                stat = SQR_ERR
                 return
             end if
             if (row_status(rbuf) /= ROW_ALIVE) then
-                if (present(stat)) stat = SQR_NOT_FOUND
+                stat = SQR_NOT_FOUND
                 return
             end if
 
@@ -324,7 +325,7 @@ contains
                     uniq_one: block
                         logical :: viol
                         if (key_has_nan(t, ix, kp(j)%nkey)) then
-                            if (present(stat)) stat = SQR_INVALID
+                            stat = SQR_INVALID
                             return
                         end if
                         ! Check uniqueness only if the row is entering the index
@@ -332,11 +333,11 @@ contains
                         if (ix%unique .and. (.not. kp(j)%oldin .or. kp(j)%okey /= kp(j)%nkey)) then
                             call unique_violation(db, idx, j, kp(j)%nkey, row_id, viol, rs)
                             if (rs /= SQR_OK) then
-                                if (present(stat)) stat = rs
+                                stat = rs
                                 return
                             end if
                             if (viol) then
-                                if (present(stat)) stat = SQR_DUP
+                                stat = SQR_DUP
                                 return
                             end if
                         end if
@@ -353,13 +354,13 @@ contains
             ! pre-image before overwriting in place so a rollback restores it.
             call journal_record(db, t, row_id, rbuf, rs)
             if (rs /= SQR_OK) then
-                if (present(stat)) stat = rs
+                stat = rs
                 return
             end if
             write(t%unit, rec=row_id, iostat=ios) wbuf
             call io_check(ios)
             if (ios /= 0) then
-                if (present(stat)) stat = SQR_ERR
+                stat = SQR_ERR
                 return
             end if
 
@@ -377,14 +378,14 @@ contains
                         if (kp(j)%oldin .and. (.not. kp(j)%newin .or. changed)) then
                             call index_remove(db, idx, j, row_id, kp(j)%okey, rs)
                             if (rs /= SQR_OK) then
-                                if (present(stat)) stat = rs
+                                stat = rs
                                 return
                             end if
                         end if
                         if (kp(j)%newin .and. (.not. kp(j)%oldin .or. changed)) then
                             call index_insert(db, idx, j, row_id, wbuf, rs)
                             if (rs /= SQR_OK) then
-                                if (present(stat)) stat = rs
+                                stat = rs
                                 return
                             end if
                         end if
@@ -393,7 +394,6 @@ contains
             end do idx_loop
 
         end associate
-        if (present(stat)) stat = SQR_OK
     end subroutine
 
     module subroutine db_delete(db, table_name, row_id, stat)
@@ -413,49 +413,49 @@ contains
         class(db_t),       intent(inout)        :: db
         character(len=*), intent(in)           :: table_name
         integer(int32),   intent(in)           :: row_id
-        integer,          intent(out), optional :: stat
+        integer,          intent(out)          :: stat
         integer :: idx, ios, rs
         character(len=:), allocatable :: rbuf
+        stat = SQR_OK
         if (readonly_block(db, stat)) return
         db%generation = db%generation + 1   ! write: invalidate cursors
         idx = db_table_index(db, table_name)
         if (idx == 0) then
-            if (present(stat)) stat = SQR_NOT_FOUND
+            stat = SQR_NOT_FOUND
             return
         end if
         associate (t => db%tables(idx))
             if (row_id < 1 .or. row_id >= t%next_id) then
-                if (present(stat)) stat = SQR_NOT_FOUND
+                stat = SQR_NOT_FOUND
                 return
             end if
             allocate(character(len=t%record_size) :: rbuf)
             read(t%unit, rec=row_id, iostat=ios) rbuf
             call io_check(ios)
             if (ios /= 0) then          ! I/O failure is not "row absent"
-                if (present(stat)) stat = SQR_ERR
+                stat = SQR_ERR
                 return
             end if
             if (row_status(rbuf) /= ROW_ALIVE) then
-                if (present(stat)) stat = SQR_NOT_FOUND
+                stat = SQR_NOT_FOUND
                 return
             end if
             ! Capture the live image before tombstoning it in place (rbuf is
             ! about to be mutated), so a rollback brings the row back alive.
             call journal_record(db, t, row_id, rbuf, rs)
             if (rs /= SQR_OK) then
-                if (present(stat)) stat = rs
+                stat = rs
                 return
             end if
             call row_set_status(rbuf, ROW_TOMBSTONE)
             write(t%unit, rec=row_id, iostat=ios) rbuf
             call io_check(ios)
             if (ios /= 0) then
-                if (present(stat)) stat = SQR_ERR
+                stat = SQR_ERR
                 return
             end if
             t%live_count = t%live_count - 1
         end associate
-        if (present(stat)) stat = SQR_OK
     end subroutine
 
     module subroutine db_scan(db, table_name, cb, ctx, stat)
@@ -513,39 +513,40 @@ contains
         integer(int32),   intent(in)           :: row_id
         character(len=*), intent(in)           :: col_name
         character(len=*), intent(in)           :: text
-        integer,          intent(out), optional :: stat
+        integer,          intent(out)          :: stat
         integer :: idx, ci, ios, rs
         integer(int64) :: off
         character(len=:), allocatable :: rbuf
+        stat = SQR_OK
         if (readonly_block(db, stat)) return
         idx = db_table_index(db, table_name)
         if (idx == 0) then
-            if (present(stat)) stat = SQR_NOT_FOUND
+            stat = SQR_NOT_FOUND
             return
         end if
         associate (t => db%tables(idx))
             if (row_id < 1 .or. row_id >= t%next_id) then
-                if (present(stat)) stat = SQR_NOT_FOUND
+                stat = SQR_NOT_FOUND
                 return
             end if
             ci = col_index(t, col_name)
             if (ci == 0) then
-                if (present(stat)) stat = SQR_NOT_FOUND
+                stat = SQR_NOT_FOUND
                 return
             end if
             if (t%cols(ci)%dtype /= DT_TEXT) then
-                if (present(stat)) stat = SQR_INVALID
+                stat = SQR_INVALID
                 return
             end if
             allocate(character(len=t%record_size) :: rbuf)
             read(t%unit, rec=row_id, iostat=ios) rbuf
             call io_check(ios)
             if (ios /= 0) then          ! I/O failure is not "row absent"
-                if (present(stat)) stat = SQR_ERR
+                stat = SQR_ERR
                 return
             end if
             if (row_status(rbuf) /= ROW_ALIVE) then
-                if (present(stat)) stat = SQR_NOT_FOUND
+                stat = SQR_NOT_FOUND
                 return
             end if
             off = t%blob_next
@@ -556,14 +557,14 @@ contains
                 if (db%jrnl%active) then
                     call jrnl_log_extend(db, blob_relpath(t%name), rs)
                     if (rs /= SQR_OK) then
-                        if (present(stat)) stat = rs
+                        stat = rs
                         return
                     end if
                 end if
                 write(t%blob_unit, pos=off, iostat=ios) text
                 call io_check(ios)
                 if (ios /= 0) then
-                    if (present(stat)) stat = SQR_ERR
+                    stat = SQR_ERR
                     return
                 end if
                 t%blob_next = off + len(text)
@@ -572,7 +573,7 @@ contains
             ! (rbuf is the on-disk image until the next two calls mutate it).
             call journal_record(db, t, row_id, rbuf, rs)
             if (rs /= SQR_OK) then
-                if (present(stat)) stat = rs
+                stat = rs
                 return
             end if
             call row_set_text_desc(rbuf, t%cols(ci), off, int(len(text), int32))
@@ -582,11 +583,10 @@ contains
             write(t%unit, rec=row_id, iostat=ios) rbuf
             call io_check(ios)
             if (ios /= 0) then
-                if (present(stat)) stat = SQR_ERR
+                stat = SQR_ERR
                 return
             end if
         end associate
-        if (present(stat)) stat = SQR_OK
     end subroutine
 
     module subroutine db_get_text(db, table_name, row_id, col_name, text, stat)
@@ -698,17 +698,18 @@ contains
         integer(int32),   intent(in)    :: row_id
         character(len=*), intent(in)    :: buf
         integer,          intent(out)   :: stat
-        character(len=:), allocatable :: key
         integer :: bs
         associate (t => db%tables(ti), ix => db%tables(ti)%indices(j))
             stat = SQR_OK
             if (key_has_null(t, ix, buf)) return   ! NULL member ⇒ not indexed
-            allocate(character(len=ix%key_size) :: key)
-            call extract_key(t, ix, buf, key)
-            call ensure_kc_ctx(t, ix)
-            call bt_insert(ix%bt, key, row_id, bt_key_cmp, ix%kc, bs)
-            stat = sqr_of_bt(bs)
-            if (stat == SQR_OK) ix%nentries = int(ix%bt%nentries)
+            call ensure_len(ix%key_scratch, ix%key_size)
+            associate (key => ix%key_scratch)
+                call extract_key(t, ix, buf, key)
+                call ensure_kc_ctx(t, ix)
+                call bt_insert(ix%bt, key, row_id, bt_key_cmp, ix%kc, bs)
+                stat = sqr_of_bt(bs)
+                if (stat == SQR_OK) ix%nentries = int(ix%bt%nentries)
+            end associate
         end associate
     end subroutine
 

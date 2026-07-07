@@ -31,7 +31,7 @@ contains
         character(len=*), intent(in)            :: table_name
         character(len=*), intent(in)            :: col_names(:)
         integer,          intent(out), optional :: stat
-        integer :: ti, j, u, ios, rs
+        integer :: ti, j, rs
         if (readonly_block(db, stat)) return
         if (txn_block(db, stat)) return
         db%generation = db%generation + 1   ! structural change: invalidate cursors
@@ -72,8 +72,7 @@ contains
                 if (present(stat)) stat = rs
                 return
             end if
-            open(newunit=u, file=index_path(db, t%name, j), status='old', iostat=ios)
-            if (ios == 0) close(u, status='delete')
+            call remove_file(index_path(db, t%name, j))
         end associate
         if (present(stat)) stat = SQR_OK
     end subroutine
@@ -104,37 +103,35 @@ contains
         character(len=*), intent(in)            :: table_name
         character(len=*), intent(in)            :: bufs(:)
         integer(int32),   intent(out)           :: row_ids(:)
-        integer,          intent(out), optional :: stat
+        integer,          intent(out)          :: stat
         integer :: ti, n, k, j, ci, ios, rs
         integer(int32) :: rid
         character(len=:), allocatable :: wrows(:)
+        stat = SQR_OK
         n = size(bufs)
         row_ids = 0
         if (readonly_block(db, stat)) return
         db%generation = db%generation + 1   ! write: invalidate cursors
         ti = db_table_index(db, table_name)
         if (ti == 0) then
-            if (present(stat)) stat = SQR_NOT_FOUND
+            stat = SQR_NOT_FOUND
             return
         end if
         if (size(row_ids) < n) then
-            if (present(stat)) stat = SQR_INVALID
+            stat = SQR_INVALID
             return
         end if
-        if (n == 0) then
-            if (present(stat)) stat = SQR_OK
-            return
-        end if
+        if (n == 0) return
         associate (t => db%tables(ti))
             ! Strict on write — see ins_core (bufs is an array of one
             ! length, so a single check covers every row).
             if (len(bufs) /= t%record_size) then
-                if (present(stat)) stat = SQR_INVALID
+                stat = SQR_INVALID
                 return
             end if
             ! Refuse the whole batch if it would exhaust the int32 id space.
             if (t%next_id > huge(0_int32) - n) then
-                if (present(stat)) stat = SQR_FULL
+                stat = SQR_FULL
                 return
             end if
             ! Build the row images once (status alive, text descriptors
@@ -169,7 +166,7 @@ contains
                             if (bnull(k)) cycle keys_pass
                             call extract_key(t, ix, wrows(k), bkeys(k))
                             if (key_has_nan(t, ix, bkeys(k))) then
-                                if (present(stat)) stat = SQR_INVALID
+                                stat = SQR_INVALID
                                 return
                             end if
                         end do keys_pass
@@ -178,18 +175,18 @@ contains
                                 if (bnull(k)) cycle uniq_pass
                                 call unique_violation(db, ti, j, bkeys(k), 0_int32, viol, rs)
                                 if (rs /= SQR_OK) then
-                                    if (present(stat)) stat = rs
+                                    stat = rs
                                     return
                                 end if
                                 if (viol) then
-                                    if (present(stat)) stat = SQR_DUP
+                                    stat = SQR_DUP
                                     return
                                 end if
                                 ! Intra-batch: an earlier non-NULL row, same key.
                                 batch_dup: do p = 1, k - 1
                                     if (bnull(p)) cycle batch_dup
                                     if (key_cmp_ix(t, ix, bkeys(p), bkeys(k)) == 0) then
-                                        if (present(stat)) stat = SQR_DUP
+                                        stat = SQR_DUP
                                         return
                                     end if
                                 end do batch_dup
@@ -206,7 +203,7 @@ contains
             if (db%jrnl%active) then
                 call jrnl_log_extend(db, data_relpath(t%name), rs)
                 if (rs /= SQR_OK) then
-                    if (present(stat)) stat = rs
+                    stat = rs
                     return
                 end if
             end if
@@ -220,7 +217,7 @@ contains
                 write(t%unit, rec=rid, iostat=ios) wrows(k)
                 call io_check(ios)
                 if (ios /= 0) then
-                    if (present(stat)) stat = SQR_ERR
+                    stat = SQR_ERR
                     return
                 end if
                 row_ids(k)   = rid
@@ -234,12 +231,11 @@ contains
                 if (.not. idx_live(t%indices(j))) cycle reindex
                 call rebuild_index(db, ti, j, rs)
                 if (rs /= SQR_OK) then
-                    if (present(stat)) stat = rs
+                    stat = rs
                     return
                 end if
             end do reindex
         end associate
-        if (present(stat)) stat = SQR_OK
     end subroutine
 
     module subroutine db_verify(db, table_name, stat, errmsg)
@@ -248,6 +244,7 @@ contains
         integer,          intent(out),  optional  :: stat
         character(len=*), intent(inout), optional :: errmsg
         integer :: ti, j, ios, recount, vrs
+        integer, allocatable :: expected(:)
         integer(int32) :: rid
         integer(int64) :: fsize
         character(len=:), allocatable :: rbuf
@@ -263,8 +260,12 @@ contains
         verify: block
             associate (t => db%tables(ti))
                 allocate(character(len=t%record_size) :: rbuf)
-                ! (1) Live-row recount and data-file extent.
+                ! (1) Live-row recount, data-file extent, and each live index's
+                ! expected entry count — all folded into this single data scan
+                ! so verify_one_index need not re-read the whole file per index.
                 recount = 0
+                allocate(expected(t%nindices))
+                expected = 0
                 scan_rows: do rid = 1, t%next_id - 1
                     read(t%unit, rec=rid, iostat=ios) rbuf
                     call io_check(ios)
@@ -272,7 +273,13 @@ contains
                         vrs = SQR_ERR; detail = 'cannot read data record'
                         exit verify
                     end if
-                    if (row_status(rbuf) == ROW_ALIVE) recount = recount + 1
+                    if (row_status(rbuf) /= ROW_ALIVE) cycle scan_rows
+                    recount = recount + 1
+                    tally_idx: do j = 1, t%nindices
+                        if (.not. idx_live(t%indices(j))) cycle tally_idx
+                        if (.not. key_has_null(t, t%indices(j), rbuf)) &
+                            expected(j) = expected(j) + 1
+                    end do tally_idx
                 end do scan_rows
                 if (recount /= t%live_count) then
                     vrs = SQR_INVALID; detail = 'live_count disagrees with row recount'
@@ -288,7 +295,7 @@ contains
                 ! the count of such entries equals the live rows to be indexed.
                 verify_idx: do j = 1, t%nindices
                     if (.not. idx_live(t%indices(j))) cycle verify_idx
-                    call verify_one_index(db, ti, j, rbuf, vrs, detail)
+                    call verify_one_index(db, ti, j, rbuf, expected(j), vrs, detail)
                     if (vrs /= SQR_OK) exit verify
                 end do verify_idx
             end associate
@@ -303,31 +310,20 @@ contains
     ! and confirm the number of such matched entries equals the live rows that
     ! ought to be indexed (catches a missing entry). Unique indices additionally
     ! must have no duplicate live keys. rs is SQR_OK / SQR_INVALID / SQR_ERR.
-    subroutine verify_one_index(db, ti, j, rbuf, rs, detail)
+    subroutine verify_one_index(db, ti, j, rbuf, expected_in, rs, detail)
         type(db_t),       intent(inout) :: db
         integer,          intent(in)    :: ti, j
         character(len=*), intent(inout) :: rbuf
+        integer,          intent(in)    :: expected_in   ! live rows to be indexed, from db_verify's scan
         integer,          intent(out)   :: rs
         character(len=*), intent(inout) :: detail
-        integer :: bs, ios, expected, matched
+        integer :: bs, ios, matched
         integer(int32) :: rid
         logical :: ok, dup
         character(len=:), allocatable :: ckey, rkey
         type(bt_cursor_t) :: cur
         rs = SQR_OK
         associate (t => db%tables(ti), ix => db%tables(ti)%indices(j))
-            ! Live rows that should be indexed (no NULL member of this index).
-            expected = 0
-            count_live: do rid = 1, t%next_id - 1
-                read(t%unit, rec=rid, iostat=ios) rbuf
-                call io_check(ios)
-                if (ios /= 0) then
-                    rs = SQR_ERR; detail = 'cannot read data record'
-                    return
-                end if
-                if (row_status(rbuf) /= ROW_ALIVE) cycle count_live
-                if (.not. key_has_null(t, ix, rbuf)) expected = expected + 1
-            end do count_live
             ! Walk the index; check live-row entries against the stored row.
             allocate(character(len=ix%key_size) :: ckey, rkey)
             call bt_first(ix%bt, cur, bs)
@@ -357,7 +353,7 @@ contains
                 end if
                 matched = matched + 1
             end do walk
-            if (matched /= expected) then
+            if (matched /= expected_in) then
                 rs = SQR_INVALID; detail = 'index entry count disagrees with live rows'
                 return
             end if

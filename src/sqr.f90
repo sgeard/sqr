@@ -135,6 +135,8 @@ module sqr
         class(*), pointer :: jctx => null()  !! Heap-owned `bt_jhook_ctx_t` while a txn's journal hook is installed on `bt`; freed at txn end
         type(kc_ctx_t) :: kc  !! Cached comparator geometry — transient (never on disk), rebuilt on demand
         logical :: kc_valid = .false.  !! `kc` matches the current geometry (cleared by rebuild_index)
+        character(len=:), allocatable :: key_scratch   !! Reusable key buffer (extract_key in ins/index_insert); transient, re-sized lazily by ensure_len
+        character(len=:), allocatable :: key_scratch2  !! Second key buffer for unique_violation's probe, live while key_scratch is
     end type
 
     !! One open table: schema, derived layout, open units and index set.
@@ -151,6 +153,8 @@ module sqr
         type(index_t), allocatable  :: indices(:)  !! Secondary indices
         integer                     :: blob_unit      = -1       !! Open unit for `<table>.blob`, -1 if none
         integer(int64)              :: blob_next      = 1_int64  !! Next blob append position (1-based)
+        character(len=:), allocatable :: rbuf_scratch   !! Reusable record buffer (ins_core's wbuf); transient, re-sized lazily by ensure_len
+        character(len=:), allocatable :: rbuf_scratch2  !! Second record buffer for unique_violation's row read, live while rbuf_scratch is
     end type
 
     !! One undo record captured before a transaction overwrites part of a
@@ -194,6 +198,11 @@ module sqr
         integer        :: nrec     = 0        !! Live undo-record count for the current txn
         type(undo_rec_t), allocatable :: recs(:)  !! In-memory undo set for the current txn
         type(tbl_snap_t), allocatable :: snaps(:)  !! Per-table counter snapshot, by table position, for the current txn
+        integer, allocatable :: hslot(:)      !! Open-addressed dedup index into recs (record index, 0 = empty); power-of-two size
+        integer        :: hcount   = 0        !! Live entries in hslot (load-factor tracking)
+        integer(int64) :: plen_durable = 0    !! Payload bytes already serialised+written+fsynced (incremental arm)
+        integer        :: nrec_durable = 0    !! Records fully covered by plen_durable
+        integer        :: cksum_acc    = 0    !! Rolling checksum over the first plen_durable payload bytes
     end type
 
     !! One changed byte-range of a base file within a committed gesture, holding
@@ -229,6 +238,16 @@ module sqr
         character(len=:), allocatable   :: label      !! Caller's gesture name (menu text)
     end type
 
+    !! A bounded LIFO of committed gestures backed by a ring buffer: push
+    !! overwrites the oldest slot once `cap` steps are held, so neither push nor
+    !! pop ever copies the whole stack (each step carries full byte images).
+    !! `head` is the slot of the newest element (0 = empty).  Module-private.
+    type :: hist_stack_t
+        type(hist_step_t), allocatable :: steps(:)  !! Ring storage, allocated lazily to cap
+        integer :: head  = 0   !! Slot of the newest element (0 = empty)
+        integer :: count = 0   !! Live element count (<= size(steps))
+    end type
+
     !! Per-database in-memory Undo/Redo history.  Opaque to callers, carried as
     !! a component of `db_t`.  Distinct from `journal_t`: that is the one-deep,
     !! crash-durable rollback of the in-flight transaction; this is the
@@ -236,8 +255,8 @@ module sqr
     !! recorded only when `db_begin` was given a `label`; `capturing` latches
     !! that intent until the matching `db_commit` snapshots the step.
     type, public :: history_t
-        type(hist_step_t), allocatable :: undo(:)  !! Committed steps, newest last
-        type(hist_step_t), allocatable :: redo(:)  !! Undone steps, newest last
+        type(hist_stack_t) :: undo  !! Committed steps (newest on top)
+        type(hist_stack_t) :: redo  !! Undone steps (newest on top)
         integer        :: cap        = 100        !! Max retained undo steps (oldest dropped)
         logical        :: capturing  = .false.    !! The in-flight explicit txn is a labelled gesture
         character(len=:), allocatable :: pending_label  !! Label stashed by db_begin until commit

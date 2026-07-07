@@ -24,6 +24,7 @@ program bench_sqr
 
     ! Tunable problem sizes.
     integer, parameter :: SCALE_N(4) = [2000, 4000, 8000, 16000]
+    integer, parameter :: TXN_SCALE(4) = [500, 1000, 2000, 4000]   ! explicit-txn arm scaling
     integer, parameter :: LOOKUP_ROWS  = 20000
     integer, parameter :: LOOKUP_HITS  = 20000   ! indexed lookups timed
     integer, parameter :: SCAN_HITS    = 200     ! full-scan lookups timed
@@ -43,6 +44,7 @@ program bench_sqr
 
     call bench_bulk_insert()
     call bench_index_scaling()
+    call bench_txn_insert()
     call bench_lookup()
     call bench_delete_compact()
     call bench_text()
@@ -216,6 +218,65 @@ contains
         end if
         print '(i8,f11.3,f12.2,f8.2,f13.2,f15.2)', &
             n, secs(t0, t1), us, ratio, asc_us, noidx_us
+        prev_us = us
+    end subroutine
+
+    ! --- 2b. Explicit-transaction insert: journal arm scaling ---------
+    ! Every mutation inside an explicit txn arms the journal.  Before E1 the arm
+    ! re-serialised and rewrote the ENTIRE undo set on each call (plus a have_rec
+    ! linear scan and an O(nrec^2) commit fsync dedup), so a txn of N inserts was
+    ! O(N^2).  After E1/E2/E3 the arm appends only the new record, dedup is a hash
+    ! probe, and the commit fsyncs each distinct path once, so per-insert cost is
+    ! ~flat (ratio ~1.0) instead of doubling with N.
+    subroutine bench_txn_insert()
+        integer :: s
+        real(real64) :: prev_us
+        print '(a)', '-- 2b. explicit-txn insert, journal arm scaling --'
+        print '(a)', '       N   total(s)   us/insert   ratio'
+        prev_us = 0.0_real64
+        do s = 1, size(TXN_SCALE)
+            call one_txn_scale(TXN_SCALE(s), prev_us)
+        end do
+        print '(a)', ''
+        print '(a)', '   ratio = us/insert vs the previous (half-size) row;'
+        print '(a)', '   ~1.0 means the per-insert arm cost is ~constant in N.'
+        print '(a)', ''
+    end subroutine
+
+    subroutine one_txn_scale(n, prev_us)
+        integer,      intent(in)    :: n
+        real(real64), intent(inout) :: prev_us
+        type(db_t) :: db
+        character(len=:), allocatable :: buf
+        integer :: rs, i, ti
+        integer(int32) :: rid
+        integer(int64) :: t0, t1
+        real(real64) :: us, ratio
+        call cleanup()
+        call db_open(db, DBDIR, rs);                         call die('open', rs)
+        call db_create_table(db, 't', bench_cols(), rs);     call die('create', rs)
+        call db_create_index(db, 't', 'k', rs);              call die('index', rs)
+        ti = db_table_index(db, 't')
+        call row_alloc(buf, db%tables(ti)%record_size)
+        call db_begin(db, rs);                               call die('begin', rs)
+        call system_clock(t0)
+        do i = 1, n
+            call row_set_status(buf, ROW_ALIVE)
+            call row_set_int(buf, db%tables(ti)%cols(1), int(i, int32))
+            call row_set_int(buf, db%tables(ti)%cols(2), int(i, int32))
+            call db_insert(db, 't', buf, rid, rs)
+            if (rs /= SQR_OK) call die('txn insert', rs)
+        end do
+        call system_clock(t1)
+        call db_commit(db, rs);                              call die('commit', rs)
+        call db_close(db)
+        us = 1.0e6_real64 * secs(t0, t1) / real(n, real64)
+        if (prev_us > 0.0_real64) then
+            ratio = us / prev_us
+        else
+            ratio = 0.0_real64
+        end if
+        print '(i8,f11.3,f12.2,f8.2)', n, secs(t0, t1), us, ratio
         prev_us = us
     end subroutine
 

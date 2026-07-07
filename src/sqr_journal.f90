@@ -77,6 +77,7 @@ contains
     module subroutine db_commit(db, stat)
         class(db_t), intent(inout) :: db
         integer,    intent(out), optional :: stat
+        integer :: cst
         if (present(stat)) stat = SQR_OK
         if (.not. (db%jrnl%active .and. db%jrnl%explicit)) then
             if (present(stat)) stat = SQR_INVALID
@@ -85,7 +86,10 @@ contains
         ! Snapshot this gesture as one Undo step BEFORE txn_commit discards the
         ! in-memory undo set (jrnl%recs) and counters.  A no-op gesture (no
         ! recs) records nothing, so an empty bracket stays invisible to Undo.
-        if (db%hist%capturing) call capture_step(db)
+        ! A capture failure only costs the (session-only) history — capture_step
+        ! discards it and resets to empty; the commit's own durability stands, so
+        ! db_commit still returns txn_commit's status.
+        if (db%hist%capturing) call capture_step(db, cst)
         db%hist%capturing = .false.
         call txn_commit(db, stat)         ! also clears the explicit latch
     end subroutine
@@ -117,6 +121,7 @@ contains
         if (allocated(db%jrnl%recs)) deallocate(db%jrnl%recs)
         allocate(db%jrnl%recs(0))
         db%jrnl%nrec   = 0
+        call reset_jrnl_arm_state(db%jrnl)   ! dedup hash + incremental-arm trio
         db%jrnl%active = .true.
         db%jrnl%armed  = .false.
         ! Push every buffered base-file write to disk first: the journal captures
@@ -201,8 +206,9 @@ contains
     module subroutine txn_arm(db, stat)
         class(db_t), intent(inout)        :: db
         integer,    intent(out), optional :: stat
-        character(len=:), allocatable :: payload
-        integer                       :: u, ios, i, st
+        character(len=:), allocatable :: newbytes
+        integer                       :: u, ios, i, st, ck
+        integer(int64)                :: newplen
         logical                       :: fresh
         st = SQR_OK
         if (.not. db%jrnl%active) then
@@ -219,12 +225,12 @@ contains
             end if
             fresh = .true.
         end if
-        ! Serialise the undo set into one buffer (so the checksum and the
-        ! single positioned write stay consistent).
-        payload = ''
-        do i = 1, db%jrnl%nrec
-            call append_serialised(payload, db%jrnl%recs(i))
-        end do
+        ! Incremental arm: serialise ONLY the records not yet durable.  The file
+        ! already holds the first plen_durable bytes (an immutable prefix — records
+        ! never change once appended), so we append the new suffix beyond them.
+        call serialise_range(db%jrnl, db%jrnl%nrec_durable + 1, db%jrnl%nrec, newbytes)
+        newplen = db%jrnl%plen_durable + int(len(newbytes), int64)
+        ck      = checksum_fold(db%jrnl%cksum_acc, newbytes)   ! extends the prefix's checksum
         open(newunit=u, file=db%jrnl%path, access='stream', form='unformatted', &
              status='old', action='readwrite', iostat=ios)
         call io_check(ios)
@@ -232,15 +238,14 @@ contains
             if (present(stat)) stat = SQR_ERR
             return
         end if
-        ! Phase 1 — make the payload durable BEFORE the header names it.  On a
-        ! re-arm the payload is an append-only identical prefix of the previous
-        ! one, so a crash after this fsync but before the header lands leaves the
-        ! OLD header (old nrec/plen/cksum) over a still-valid prefix: recovery
-        ! reads only that prefix, its checksum matches, and every earlier undo
-        ! record survives.  This keeps "torn payload => arming never completed"
-        ! true for every arm, not just the first (see jrnl_recover).
-        if (len(payload) > 0) then
-            write(u, pos=JHEADER + 1, iostat=ios) payload
+        ! Phase 1 — make the appended payload durable BEFORE the header names it.
+        ! Appends land STRICTLY BEYOND plen_durable and the prefix is never
+        ! rewritten, so a crash after this fsync but before the header lands leaves
+        ! the OLD header (old nrec/plen/cksum) over an untouched valid prefix:
+        ! recovery reads only that prefix, its checksum matches, every earlier undo
+        ! record survives.  ("torn payload => arming never completed", every arm.)
+        if (len(newbytes) > 0) then
+            write(u, pos=JHEADER + 1 + db%jrnl%plen_durable, iostat=ios) newbytes
             call io_check(ios)
         end if
         if (ios == 0) flush(u, iostat=ios)
@@ -256,7 +261,7 @@ contains
         end if
         ! Phase 2 — the header may now safely point at the durable payload.
         write(u, pos=1, iostat=ios) JMAGIC, JFMT, JSTATE_HOT, db%jrnl%nrec, &
-                                    checksum(payload), int(len(payload), int64)
+                                    ck, newplen
         call io_check(ios)
         if (ios == 0) flush(u, iostat=ios)
         call io_check(ios)
@@ -268,6 +273,16 @@ contains
         ios = c_fsync_path(db%jrnl%path)         ! header durable
         call io_check(ios)
         if (ios /= 0) st = SQR_ERR
+        ! The payload+header bytes are now durable, so the trio may advance to name
+        ! them (the dir fsync below only affects the fresh file's directory entry,
+        ! not these bytes).  Reached only on a clean header fsync; any earlier
+        ! failure took an early return with the trio untouched, so the next arm
+        ! re-serialises from nrec_durable+1 and rewrites the same immutable bytes.
+        if (ios == 0) then
+            db%jrnl%plen_durable = newplen
+            db%jrnl%nrec_durable = db%jrnl%nrec
+            db%jrnl%cksum_acc    = ck
+        end if
         if (fresh) then
             ios = c_fsync_dir(db%dir)        ! make the new file durable
             call io_check(ios)
@@ -388,6 +403,19 @@ contains
         db%jrnl%nrec     = 0
         if (allocated(db%jrnl%recs))  deallocate(db%jrnl%recs)
         if (allocated(db%jrnl%snaps)) deallocate(db%jrnl%snaps)
+        call reset_jrnl_arm_state(db%jrnl)
+    end subroutine
+
+    ! Reset the per-txn dedup hash (E2) and the incremental-arm trio (E1) — the
+    ! trio must describe fsynced bytes only, so it starts at zero for every txn
+    ! (and after presize recreates the file).
+    subroutine reset_jrnl_arm_state(jrnl)
+        type(journal_t), intent(inout) :: jrnl
+        if (allocated(jrnl%hslot)) deallocate(jrnl%hslot)
+        jrnl%hcount       = 0
+        jrnl%plen_durable = 0
+        jrnl%nrec_durable = 0
+        jrnl%cksum_acc    = 0
     end subroutine
 
     module subroutine jrnl_recover(db, stat)
@@ -535,7 +563,7 @@ contains
     subroutine fsync_base_files(db, st)
         class(db_t), intent(inout) :: db
         integer,     intent(inout) :: st
-        integer :: i, k, ios, ti, j, bs
+        integer :: i, ios, ti, j, bs
         logical :: dup
         call flush_base_files(db, st)
         do ti = 1, db%ntables
@@ -545,19 +573,36 @@ contains
                 end do
             end associate
         end do
-        do i = 1, db%jrnl%nrec
-            dup = .false.
-            dedup: do k = 1, i - 1
-                if (db%jrnl%recs(k)%path == db%jrnl%recs(i)%path) then
-                    dup = .true.
-                    exit dedup
+        ! Fsync each distinct base file this txn touched, once.  Compare each
+        ! record's path only against the DISTINCT paths already seen (first(:),
+        ! bounded by tables*2 + indices) — O(nrec * ndistinct), not the old
+        ! all-pairs O(nrec^2).  First-occurrence order and error handling unchanged.
+        dedup_block: block
+            integer, allocatable :: first(:), tmp(:)
+            integer :: nseen, m
+            nseen = 0
+            allocate(first(8))
+            do i = 1, db%jrnl%nrec
+                dup = .false.
+                seen: do m = 1, nseen
+                    if (db%jrnl%recs(first(m))%path == db%jrnl%recs(i)%path) then
+                        dup = .true.
+                        exit seen
+                    end if
+                end do seen
+                if (dup) cycle
+                if (nseen == size(first)) then
+                    allocate(tmp(2 * size(first)))
+                    tmp(1:nseen) = first(1:nseen)
+                    call move_alloc(tmp, first)
                 end if
-            end do dedup
-            if (dup) cycle
-            ios = c_fsync_path(pathjoin(db%dir, db%jrnl%recs(i)%path))
-            call io_check(ios)
-            if (ios /= 0) st = SQR_ERR
-        end do
+                nseen = nseen + 1
+                first(nseen) = i
+                ios = c_fsync_path(pathjoin(db%dir, db%jrnl%recs(i)%path))
+                call io_check(ios)
+                if (ios /= 0) st = SQR_ERR
+            end do
+        end block dedup_block
     end subroutine
 
     ! Reopen each table's data and blob units after a rollback so no unit buffer
@@ -770,6 +815,12 @@ contains
             st = SQR_ERR
             return
         end if
+        ! The file was just recreated (zeroed), so no payload bytes are durable:
+        ! the incremental-arm trio starts from zero.  (The dedup hash is NOT
+        ! touched — records already captured before this first arm stay indexed.)
+        db%jrnl%plen_durable = 0
+        db%jrnl%nrec_durable = 0
+        db%jrnl%cksum_acc    = 0
         db%jrnl%capacity = JPRESIZE
         db%jrnl%sized    = .true.
     end subroutine
@@ -801,23 +852,90 @@ contains
     end subroutine
 
     ! True if an equal undo record was already captured this transaction.
+    ! Hash of a record's idempotency tuple, masked into [0, mask] (mask is a
+    ! power-of-two size minus one).  Bounded polynomial fold (mod 2^31-1) so the
+    ! int64 accumulator never overflows — no reliance on wraparound.
+    pure integer function rec_hash(kind, path, offset, length, mask) result(h)
+        integer,          intent(in) :: kind
+        character(len=*), intent(in) :: path
+        integer(int64),   intent(in) :: offset, length
+        integer,          intent(in) :: mask
+        integer(int64), parameter :: M = 2147483647_int64   ! 2^31-1 (Mersenne prime)
+        integer(int64) :: acc
+        integer :: i
+        acc = 2166136261_int64
+        do i = 1, len(path)
+            acc = modulo(acc * 16777619_int64 + int(iachar(path(i:i)), int64), M)
+        end do
+        acc = modulo(acc * 16777619_int64 + int(kind, int64),   M)
+        acc = modulo(acc * 16777619_int64 + modulo(offset, M),  M)
+        acc = modulo(acc * 16777619_int64 + modulo(length, M),  M)
+        h = int(iand(acc, int(mask, int64)))
+    end function
+
+    ! Open-addressed dedup probe (E2): O(1) replacement for the O(nrec) linear
+    ! scan.  Same idempotency tuple (kind, path, offset, length), same "first
+    ! capture wins" semantics.  Stays pure — reads intent(in) state only.
     pure logical function have_rec(j, kind, path, offset, length) result(yes)
         type(journal_t), intent(in) :: j
         integer,         intent(in) :: kind
         character(len=*),intent(in) :: path
         integer(int64),  intent(in) :: offset, length
-        integer :: i
+        integer :: h, i, slot, cap
         yes = .false.
-        do i = 1, j%nrec
-            if (j%recs(i)%kind == kind .and. j%recs(i)%path == path .and. &
-                j%recs(i)%offset == offset .and. j%recs(i)%length == length) then
-                yes = .true.
+        if (.not. allocated(j%hslot)) return          ! no records captured yet
+        cap = size(j%hslot)
+        h = rec_hash(kind, path, offset, length, cap - 1)
+        probe: do i = 0, cap - 1
+            slot = iand(h + i, cap - 1) + 1            ! linear probe, 1-based
+            if (j%hslot(slot) == 0) return            ! empty run ⇒ not present
+            associate (r => j%recs(j%hslot(slot)))
+                if (r%kind == kind .and. r%path == path .and. &
+                    r%offset == offset .and. r%length == length) then
+                    yes = .true.
+                    return
+                end if
+            end associate
+        end do probe
+    end function
+
+    ! Insert record index `idx` into the dedup hash (caller has ensured the tuple
+    ! is not already present — dedup runs before append).
+    subroutine hslot_insert(j, idx)
+        type(journal_t), intent(inout) :: j
+        integer,         intent(in)    :: idx
+        integer :: h, i, slot, cap
+        cap = size(j%hslot)
+        associate (r => j%recs(idx))
+            h = rec_hash(r%kind, r%path, r%offset, r%length, cap - 1)
+        end associate
+        do i = 0, cap - 1
+            slot = iand(h + i, cap - 1) + 1
+            if (j%hslot(slot) == 0) then
+                j%hslot(slot) = idx
+                j%hcount = j%hcount + 1
                 return
             end if
         end do
-    end function
+    end subroutine
 
-    ! Append one undo record, growing the backing array as needed.
+    ! (Re)build the dedup hash at `newcap` slots (power of two) from the existing
+    ! records recs(1:nrec-1) — the just-appended recs(nrec) is inserted by the
+    ! caller afterwards.  Doubles as the lazy first allocation (nrec == 1).
+    subroutine rehash(j, newcap)
+        type(journal_t), intent(inout) :: j
+        integer,         intent(in)    :: newcap
+        integer :: idx
+        if (allocated(j%hslot)) deallocate(j%hslot)
+        allocate(j%hslot(newcap))
+        j%hslot  = 0
+        j%hcount = 0
+        do idx = 1, j%nrec - 1
+            call hslot_insert(j, idx)
+        end do
+    end subroutine
+
+    ! Append one undo record, growing the backing array and dedup hash as needed.
     subroutine append_rec(j, r)
         type(journal_t), intent(inout) :: j
         type(undo_rec_t),intent(in)    :: r
@@ -829,18 +947,63 @@ contains
         end if
         j%nrec = j%nrec + 1
         j%recs(j%nrec) = r
+        ! Keep the dedup hash at load < 1/2 (first size 64), then index the row.
+        if (.not. allocated(j%hslot)) then
+            call rehash(j, 64)
+        else if (j%hcount + 1 > size(j%hslot) / 2) then
+            call rehash(j, size(j%hslot) * 2)
+        end if
+        call hslot_insert(j, j%nrec)
     end subroutine
 
-    ! Serialise one record onto the payload buffer.
-    subroutine append_serialised(buf, r)
-        character(len=:), allocatable, intent(inout) :: buf
-        type(undo_rec_t),              intent(in)    :: r
+    ! Serialised byte length of one record: the fixed 40-byte header
+    ! (kind + pathlen + orig_len + offset + length + byteslen) plus path + bytes.
+    pure integer(int64) function rec_serial_len(r) result(n)
+        type(undo_rec_t), intent(in) :: r
         integer(int64) :: blen
         blen = 0_int64
         if (r%kind == UNDO_REGION) blen = int(len(r%bytes), int64)
-        buf = buf // i32b(r%kind) // i32b(len(r%path)) // r%path // &
-              i64b(r%orig_len) // i64b(r%offset) // i64b(r%length) // i64b(blen)
-        if (blen > 0) buf = buf // r%bytes
+        n = 40_int64 + int(len(r%path), int64) + blen
+    end function
+
+    ! Write one serialised record into buf starting at 1-based position p,
+    ! advancing p past it.  Field order mirrors deserialise exactly.
+    subroutine put_rec(buf, p, r)
+        character(len=*), intent(inout) :: buf
+        integer,          intent(inout) :: p
+        type(undo_rec_t), intent(in)    :: r
+        integer(int64) :: blen
+        integer :: plen
+        blen = 0_int64
+        if (r%kind == UNDO_REGION) blen = int(len(r%bytes), int64)
+        plen = len(r%path)
+        buf(p:p+3) = i32b(r%kind);                     p = p + 4
+        buf(p:p+3) = i32b(plen);                       p = p + 4
+        if (plen > 0) then; buf(p:p+plen-1) = r%path;  p = p + plen; end if
+        buf(p:p+7) = i64b(r%orig_len);                 p = p + 8
+        buf(p:p+7) = i64b(r%offset);                   p = p + 8
+        buf(p:p+7) = i64b(r%length);                   p = p + 8
+        buf(p:p+7) = i64b(blen);                       p = p + 8
+        if (blen > 0) then; buf(p:p+int(blen)-1) = r%bytes; p = p + int(blen); end if
+    end subroutine
+
+    ! Serialise records recs(lo:hi) into a single freshly-allocated buffer (one
+    ! allocation, positioned copies — no per-record concat).  Empty when lo > hi.
+    subroutine serialise_range(j, lo, hi, buf)
+        type(journal_t),               intent(in)  :: j
+        integer,                       intent(in)  :: lo, hi
+        character(len=:), allocatable, intent(out) :: buf
+        integer(int64) :: total
+        integer :: i, p
+        total = 0_int64
+        do i = lo, hi
+            total = total + rec_serial_len(j%recs(i))
+        end do
+        allocate(character(len=int(total)) :: buf)
+        p = 1
+        do i = lo, hi
+            call put_rec(buf, p, j%recs(i))
+        end do
     end subroutine
 
     ! Parse nrec records back out of a payload buffer.
@@ -967,8 +1130,8 @@ contains
         end if
         call pop_step(db%hist%undo, step)
         call apply_step(db, step, redo=.false., st=st)
-        call push_step(db%hist%redo, step, db%hist%cap)
         if (present(label) .and. allocated(step%label)) label = step%label
+        call push_step(db%hist%redo, step, db%hist%cap)   ! empties step
         if (present(stat)) stat = st
     end subroutine
 
@@ -990,29 +1153,27 @@ contains
         end if
         call pop_step(db%hist%redo, step)
         call apply_step(db, step, redo=.true., st=st)
-        call push_step(db%hist%undo, step, db%hist%cap)
         if (present(label) .and. allocated(step%label)) label = step%label
+        call push_step(db%hist%undo, step, db%hist%cap)   ! empties step
         if (present(stat)) stat = st
     end subroutine
 
     pure module function db_can_undo(db) result(yes)
         class(db_t), intent(in) :: db
         logical :: yes
-        yes = allocated(db%hist%undo)
-        if (yes) yes = size(db%hist%undo) > 0
+        yes = db%hist%undo%count > 0
     end function
 
     pure module function db_can_redo(db) result(yes)
         class(db_t), intent(in) :: db
         logical :: yes
-        yes = allocated(db%hist%redo)
-        if (yes) yes = size(db%hist%redo) > 0
+        yes = db%hist%redo%count > 0
     end function
 
     module subroutine db_reset_history(db)
         class(db_t), intent(inout) :: db
-        if (allocated(db%hist%undo)) deallocate(db%hist%undo)
-        if (allocated(db%hist%redo)) deallocate(db%hist%redo)
+        call reset_stack(db%hist%undo)
+        call reset_stack(db%hist%redo)
         if (allocated(db%hist%pending_label)) deallocate(db%hist%pending_label)
         db%hist%capturing = .false.
     end subroutine
@@ -1023,10 +1184,12 @@ contains
     ! post-gesture ("redo") bytes from disk, so flush every base unit AND sync
     ! the index trees first (fsync_base_files does the tree sync at commit, but
     ! that is after this point).
-    subroutine capture_step(db)
+    subroutine capture_step(db, stat)
         class(db_t), intent(inout) :: db
+        integer,     intent(out)   :: stat
         type(hist_step_t) :: step
         integer :: ti, j, bs
+        stat = SQR_OK
         if (db%jrnl%nrec == 0) return          ! a gesture that changed nothing
         call flush_base_files(db)
         do ti = 1, db%ntables
@@ -1036,7 +1199,15 @@ contains
                 end do
             end associate
         end do
-        call build_deltas(db, step%deltas)
+        call build_deltas(db, step%deltas, stat)
+        if (stat /= SQR_OK) then
+            ! The gesture is durable, but its post-images could not be read back,
+            ! so this step would be incomplete AND the steps already stacked can
+            ! no longer be trusted against the new on-disk state.  A wrong Undo is
+            ! worse than none: drop history entirely (coherent-or-empty invariant).
+            call db_reset_history(db)
+            return
+        end if
         if (allocated(db%jrnl%snaps)) step%before = db%jrnl%snaps
         step%after = snapshot_now(db)
         if (allocated(db%hist%pending_label)) then
@@ -1044,7 +1215,7 @@ contains
         else
             step%label = ''
         end if
-        if (allocated(db%hist%redo)) deallocate(db%hist%redo)
+        call reset_stack(db%hist%redo)         ! a new gesture forks the timeline
         call push_step(db%hist%undo, step, db%hist%cap)
     end subroutine
 
@@ -1053,10 +1224,12 @@ contains
     ! path's pre-gesture length (the single growth point); REGION records give
     ! the pre-image of each in-place overwrite.  finish_delta fills the post
     ! images and the grown tail from the (now flushed) files.
-    subroutine build_deltas(db, deltas)
+    subroutine build_deltas(db, deltas, stat)
         class(db_t),                     intent(in)  :: db
         type(path_delta_t), allocatable, intent(out) :: deltas(:)
+        integer,                         intent(out) :: stat
         integer :: i, di
+        stat = SQR_OK
         allocate(deltas(0))
         do i = 1, db%jrnl%nrec
             associate (r => db%jrnl%recs(i))
@@ -1071,18 +1244,21 @@ contains
             end associate
         end do
         do di = 1, size(deltas)
-            call finish_delta(db, deltas(di))
+            call finish_delta(db, deltas(di), stat)
+            if (stat /= SQR_OK) return
         end do
     end subroutine
 
     ! Complete one delta: read the current length and the post-gesture image of
     ! every in-place range, then capture the grown tail (bytes that did not exist
     ! before the gesture; undo truncates them away, redo re-appends them).
-    subroutine finish_delta(db, d)
+    subroutine finish_delta(db, d, stat)
         class(db_t),        intent(in)    :: db
         type(path_delta_t), intent(inout) :: d
+        integer,            intent(out)   :: stat
         character(len=:), allocatable :: full
         integer :: k, ios
+        stat = SQR_OK
         full = pathjoin(db%dir, d%path)
         d%redo_len = file_len(full)
         if (d%undo_len < 0) d%undo_len = d%redo_len      ! no growth this gesture
@@ -1090,6 +1266,10 @@ contains
             call read_region(full, d%ranges(k)%offset, &
                  int(len(d%ranges(k)%undo_bytes), int64), d%ranges(k)%redo_bytes, ios)
             call io_check(ios)
+            if (ios /= 0) then
+                stat = SQR_ERR
+                return
+            end if
         end do
         if (d%redo_len > d%undo_len) then
             call add_region(d, d%undo_len + 1, '')       ! pure tail: empty pre-image
@@ -1097,6 +1277,10 @@ contains
             call read_region(full, d%undo_len + 1, d%redo_len - d%undo_len, &
                  d%ranges(k)%redo_bytes, ios)
             call io_check(ios)
+            if (ios /= 0) then
+                stat = SQR_ERR
+                return
+            end if
         end if
     end subroutine
 
@@ -1206,38 +1390,48 @@ contains
 
     ! ---- history stack + delta helpers ----
 
-    ! Push a step, retaining at most `cap` newest (oldest dropped at the front).
-    subroutine push_step(stack, step, cap)
-        type(hist_step_t), allocatable, intent(inout) :: stack(:)
-        type(hist_step_t),              intent(in)    :: step
-        integer,                        intent(in)    :: cap
-        type(hist_step_t), allocatable :: tmp(:)
-        integer :: n, keep, lo
-        n = 0
-        if (allocated(stack)) n = size(stack)
-        keep = min(n + 1, max(cap, 1))
-        allocate(tmp(keep))
-        lo = n - keep + 2                       ! first carried-over old element
-        if (keep > 1) tmp(1:keep-1) = stack(lo:n)
-        tmp(keep) = step
-        call move_alloc(tmp, stack)
+    ! Move one step's allocatable images from src to dst in O(1) (no byte copy),
+    ! leaving src empty.  The nested allocatables inside deltas move with the
+    ! array component.
+    subroutine hist_move(src, dst)
+        type(hist_step_t), intent(inout) :: src, dst
+        call move_alloc(src%deltas, dst%deltas)
+        call move_alloc(src%before, dst%before)
+        call move_alloc(src%after,  dst%after)
+        call move_alloc(src%label,  dst%label)
     end subroutine
 
-    ! Pop the newest (top) step off a non-empty stack.
+    ! Empty a stack: drop the ring and mark it unused.
+    subroutine reset_stack(stack)
+        type(hist_stack_t), intent(inout) :: stack
+        if (allocated(stack%steps)) deallocate(stack%steps)
+        stack%head  = 0
+        stack%count = 0
+    end subroutine
+
+    ! Push a step onto the ring, retaining at most `cap` newest: once full the
+    ! advancing head overwrites the oldest slot.  Never copies the whole stack —
+    ! the step is MOVED into its slot, so `step` is emptied on return.
+    subroutine push_step(stack, step, cap)
+        type(hist_stack_t), intent(inout) :: stack
+        type(hist_step_t),  intent(inout) :: step
+        integer,            intent(in)    :: cap
+        if (.not. allocated(stack%steps)) allocate(stack%steps(max(cap, 1)))
+        stack%head = mod(stack%head, size(stack%steps)) + 1
+        call hist_move(step, stack%steps(stack%head))   ! overwrites the oldest slot when full
+        if (stack%count < size(stack%steps)) stack%count = stack%count + 1
+    end subroutine
+
+    ! Pop the newest (top) step off a non-empty ring, moving it out into `step`.
     subroutine pop_step(stack, step)
-        type(hist_step_t), allocatable, intent(inout) :: stack(:)
-        type(hist_step_t),              intent(out)   :: step
-        type(hist_step_t), allocatable :: tmp(:)
-        integer :: n
-        n = size(stack)
-        step = stack(n)
-        if (n > 1) then
-            allocate(tmp(n-1))
-            tmp(1:n-1) = stack(1:n-1)
-            call move_alloc(tmp, stack)
-        else
-            deallocate(stack)
-        end if
+        type(hist_stack_t), intent(inout) :: stack
+        type(hist_step_t),  intent(out)   :: step
+        if (stack%count == 0) return                    ! empty (callers guard)
+        call hist_move(stack%steps(stack%head), step)
+        stack%head  = stack%head - 1
+        if (stack%head == 0) stack%head = size(stack%steps)   ! wrap to newest-below
+        stack%count = stack%count - 1
+        if (stack%count == 0) stack%head = 0            ! empty sentinel
     end subroutine
 
     ! Index of the delta for `path`, or 0 if none yet.

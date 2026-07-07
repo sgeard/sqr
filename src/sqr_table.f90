@@ -426,7 +426,7 @@ contains
     subroutine discard_new_table(db, tbl)
         type(db_t),    intent(in)    :: db
         type(table_t), intent(inout) :: tbl
-        integer :: u, ios
+        integer :: ios
         if (tbl%unit /= -1) then
             close(tbl%unit, status='delete', iostat=ios)
             tbl%unit = -1
@@ -435,8 +435,7 @@ contains
             close(tbl%blob_unit, status='delete', iostat=ios)
             tbl%blob_unit = -1
         end if
-        open(newunit=u, file=schema_path(db, trim(tbl%name)), status='old', iostat=ios)
-        if (ios == 0) close(u, status='delete')
+        call remove_file(schema_path(db, trim(tbl%name)))
     end subroutine
 
     module subroutine db_drop_table(db, name, stat)
@@ -444,7 +443,7 @@ contains
         character(len=*), intent(in)           :: name
         integer,          intent(out), optional :: stat
         type(table_t), allocatable :: nt(:)
-        integer :: j, rs, idx, u, ios, ni
+        integer :: j, rs, idx, ni
         if (readonly_block(db, stat)) return
         if (txn_block(db, stat)) return
         db%generation = db%generation + 1   ! shifts table slots: invalidate cursors
@@ -492,17 +491,12 @@ contains
 
         ! Catalog no longer references the table — now reclaim its files.
         ! Any failure here leaves harmless orphans, not a broken database.
-        open(newunit=u, file=data_path(db, name), status='old', iostat=ios)
-        if (ios == 0) close(u, status='delete')
-        open(newunit=u, file=blob_path(db, name), status='old', iostat=ios)
-        if (ios == 0) close(u, status='delete')
+        call remove_file(data_path(db, name))
+        call remove_file(blob_path(db, name))
         del_indices: do j = 1, ni
-            open(newunit=u, file=index_path(db, name, j), &
-                 status='old', iostat=ios)
-            if (ios == 0) close(u, status='delete')
+            call remove_file(index_path(db, name, j))
         end do del_indices
-        open(newunit=u, file=schema_path(db, name), status='old', iostat=ios)
-        if (ios == 0) close(u, status='delete')
+        call remove_file(schema_path(db, name))
 
         if (present(stat)) stat = SQR_OK
     end subroutine
@@ -511,7 +505,7 @@ contains
         class(db_t),       intent(inout)         :: db
         character(len=*), intent(in)            :: table_name
         integer,          intent(out), optional :: stat
-        integer :: idx, ud, ub, ios, rs, j, ci, u
+        integer :: idx, ud, ub, ios, rs, j, ci
         integer(int32) :: rid, new_rid, length
         integer(int64) :: off, newpos
         logical :: has_text
@@ -542,12 +536,8 @@ contains
             build: block
                 ! A crash on a previous attempt can leave a stale temp file;
                 ! drop it before recreating.
-                open(newunit=u, file=dtmp, status='old', iostat=ios)
-                if (ios == 0) close(u, status='delete')
-                if (has_text) then
-                    open(newunit=u, file=btmp, status='old', iostat=ios)
-                    if (ios == 0) close(u, status='delete')
-                end if
+                call remove_file(dtmp)
+                if (has_text) call remove_file(btmp)
 
                 open(newunit=ud, file=dtmp, access='direct', &
                      form='unformatted', recl=t%record_size, &
@@ -1013,7 +1003,7 @@ contains
         integer,        intent(in)    :: src(:)
         integer,        intent(in)    :: cascade(:)
         integer,        intent(out)   :: stat
-        integer :: ud, ios, rs, u, j, m, k, old_rs, nnew
+        integer :: ud, ios, rs, j, m, k, old_rs, nnew
         integer(int32) :: rid
         logical :: had_text, has_text_new
         character(len=:), allocatable :: rbuf, nbuf, dpath, dtmp
@@ -1033,8 +1023,7 @@ contains
             ! The original data unit stays open and untouched, so any failure
             ! here just drops the temp file and returns with nothing committed.
             build: block
-                open(newunit=u, file=dtmp, status='old', iostat=ios)
-                if (ios == 0) close(u, status='delete')   ! stale temp from a crash
+                call remove_file(dtmp)   ! stale temp from a crash
                 open(newunit=ud, file=dtmp, access='direct', form='unformatted', &
                      recl=new_rs, status='replace', action='readwrite', iostat=ios)
                 if (ios /= 0) then
@@ -1142,15 +1131,12 @@ contains
                     close(t%blob_unit)
                     t%blob_unit = -1
                 end if
-                open(newunit=u, file=blob_path(db, t%name), status='old', iostat=ios)
-                if (ios == 0) close(u, status='delete')
+                call remove_file(blob_path(db, t%name))
                 t%blob_next = 1_int64
             end if
 
             del_cascade: do k = 1, size(cascade)
-                open(newunit=u, file=index_path(db, t%name, cascade(k)), &
-                     status='old', iostat=ios)
-                if (ios == 0) close(u, status='delete')
+                call remove_file(index_path(db, t%name, cascade(k)))
             end do del_cascade
         end associate
         stat = SQR_OK

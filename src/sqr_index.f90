@@ -154,7 +154,7 @@ contains
         type(db_t), intent(inout) :: db
         integer,    intent(in)    :: ti
         type(index_t), allocatable :: keep(:)
-        integer :: s, u, ios
+        integer :: s
         associate (t => db%tables(ti))
             s = t%nindices
             ! File is deleted next — close without flushing meta.
@@ -162,8 +162,7 @@ contains
                 close(t%indices(s)%bt%unit)
                 t%indices(s)%bt%unit = -1
             end if
-            open(newunit=u, file=index_path(db, t%name, s), status='old', iostat=ios)
-            if (ios == 0) close(u, status='delete')
+            call remove_file(index_path(db, t%name, s))
             allocate(keep(s - 1))
             keep(1:s-1) = t%indices(1:s-1)
             call move_alloc(keep, t%indices)
@@ -230,21 +229,14 @@ contains
         integer,          intent(out), optional :: stat
         integer :: ti, j, rs
         character(len=4) :: kbuf
-        character(len=:), allocatable :: probe, hk
         row_id = 0
-        call find_leading_index(db, table_name, col_name, ti, j, rs)
+        call resolve_leading(db, table_name, col_name, DT_INT, ti, j, rs)
         if (rs /= SQR_OK) then
             if (present(stat)) stat = rs
             return
         end if
-        if (leading_dtype(db%tables(ti), db%tables(ti)%indices(j)) /= DT_INT) then
-            if (present(stat)) stat = SQR_NOT_FOUND   ! wrong overload for this index
-            return
-        end if
         kbuf = transfer(key, kbuf)
-        call build_leading_bounds(db%tables(ti), db%tables(ti)%indices(j), &
-                                  kbuf, kbuf, probe, hk)
-        call index_find(db, ti, j, probe, 1, row_id, rs)
+        call find_leading(db, ti, j, kbuf, row_id, rs)
         if (present(stat)) stat = rs
     end subroutine
 
@@ -259,15 +251,10 @@ contains
         integer,          intent(out), optional :: stat
         integer :: ti, j, rs
         character(len=8) :: kbuf
-        character(len=:), allocatable :: probe, hk
         row_id = 0
-        call find_leading_index(db, table_name, col_name, ti, j, rs)
+        call resolve_leading(db, table_name, col_name, DT_REAL, ti, j, rs)
         if (rs /= SQR_OK) then
             if (present(stat)) stat = rs
-            return
-        end if
-        if (leading_dtype(db%tables(ti), db%tables(ti)%indices(j)) /= DT_REAL) then
-            if (present(stat)) stat = SQR_NOT_FOUND   ! wrong overload for this index
             return
         end if
         ! A NaN key is never stored (rejected on write) and key_cmp's </>
@@ -278,9 +265,7 @@ contains
             return
         end if
         kbuf = transfer(key, kbuf)
-        call build_leading_bounds(db%tables(ti), db%tables(ti)%indices(j), &
-                                  kbuf, kbuf, probe, hk)
-        call index_find(db, ti, j, probe, 1, row_id, rs)
+        call find_leading(db, ti, j, kbuf, row_id, rs)
         if (present(stat)) stat = rs
     end subroutine
 
@@ -292,15 +277,11 @@ contains
         integer(int32),   intent(out)          :: row_id
         integer,          intent(out), optional :: stat
         integer :: ti, j, rs, lw, nc
-        character(len=:), allocatable :: kbuf, probe, hk
+        character(len=:), allocatable :: kbuf
         row_id = 0
-        call find_leading_index(db, table_name, col_name, ti, j, rs)
+        call resolve_leading(db, table_name, col_name, DT_CHAR, ti, j, rs)
         if (rs /= SQR_OK) then
             if (present(stat)) stat = rs
-            return
-        end if
-        if (leading_dtype(db%tables(ti), db%tables(ti)%indices(j)) /= DT_CHAR) then
-            if (present(stat)) stat = SQR_NOT_FOUND   ! wrong overload for this index
             return
         end if
         lw = db%tables(ti)%cols(db%tables(ti)%indices(j)%col_idx(1))%csize
@@ -317,9 +298,7 @@ contains
         allocate(character(len=lw) :: kbuf)
         kbuf              = repeat(char(0), lw)
         if (nc > 0) kbuf(1:nc) = key(1:nc)
-        call build_leading_bounds(db%tables(ti), db%tables(ti)%indices(j), &
-                                  kbuf, kbuf, probe, hk)
-        call index_find(db, ti, j, probe, 1, row_id, rs)
+        call find_leading(db, ti, j, kbuf, row_id, rs)
         if (present(stat)) stat = rs
     end subroutine
 
@@ -431,6 +410,50 @@ contains
         end do fill
     end subroutine
 
+    ! Prologue shared by every typed db_find_by_* / db_find_range_* wrapper:
+    ! resolve (table, column) to a leading-member index and confirm its leading
+    ! member has the expected dtype — a mismatch means the caller reached for the
+    ! wrong typed overload, so the key can match nothing (SQR_NOT_FOUND).
+    subroutine resolve_leading(db, table_name, col_name, want_dtype, ti, j, stat)
+        type(db_t),       intent(in)  :: db
+        character(len=*), intent(in)  :: table_name, col_name
+        integer,          intent(in)  :: want_dtype
+        integer,          intent(out) :: ti, j
+        integer,          intent(out) :: stat
+        call find_leading_index(db, table_name, col_name, ti, j, stat)
+        if (stat /= SQR_OK) return
+        if (leading_dtype(db%tables(ti), db%tables(ti)%indices(j)) /= want_dtype) &
+            stat = SQR_NOT_FOUND
+    end subroutine
+
+    ! Exact-match tail: first live row whose leading member equals the encoded
+    ! `keybytes`.  Trailing members span any value (band lo == hi on the lead).
+    subroutine find_leading(db, ti, j, keybytes, row_id, stat)
+        type(db_t),       intent(inout) :: db
+        integer,          intent(in)    :: ti, j
+        character(len=*), intent(in)    :: keybytes
+        integer(int32),   intent(out)   :: row_id
+        integer,          intent(out)   :: stat
+        character(len=:), allocatable :: probe, hk
+        call build_leading_bounds(db%tables(ti), db%tables(ti)%indices(j), &
+                                  keybytes, keybytes, probe, hk)
+        call index_find(db, ti, j, probe, 1, row_id, stat)
+    end subroutine
+
+    ! Range tail: open a bounded cursor over the inclusive band [lobytes,hibytes]
+    ! on the leading member.
+    subroutine find_leading_range(db, ti, j, lobytes, hibytes, cur, stat)
+        type(db_t),        intent(inout) :: db
+        integer,           intent(in)    :: ti, j
+        character(len=*),  intent(in)    :: lobytes, hibytes
+        type(db_cursor_t), intent(out)   :: cur
+        integer,           intent(out)   :: stat
+        character(len=:), allocatable :: lk, hk
+        call build_leading_bounds(db%tables(ti), db%tables(ti)%indices(j), &
+                                  lobytes, hibytes, lk, hk)
+        call open_range(db, ti, j, lk, hk, cur, stat)
+    end subroutine
+
     module subroutine db_open_cursor(db, table_name, col_name, cur, stat)
         class(db_t),        intent(inout)         :: db
         character(len=*),  intent(in)            :: table_name, col_name
@@ -483,22 +506,14 @@ contains
         integer,           intent(out), optional :: stat
         integer :: ti, j, rs
         character(len=4) :: lb, hb
-        character(len=:), allocatable :: lk, hk
-        call find_leading_index(db, table_name, col_name, ti, j, rs)
+        call resolve_leading(db, table_name, col_name, DT_INT, ti, j, rs)
         if (rs /= SQR_OK) then
             if (present(stat)) stat = rs
             return
         end if
-        associate (t => db%tables(ti), ix => db%tables(ti)%indices(j))
-            if (leading_dtype(t, ix) /= DT_INT) then   ! wrong overload for this index
-                if (present(stat)) stat = SQR_NOT_FOUND
-                return
-            end if
-            lb = transfer(lo, lb)
-            hb = transfer(hi, hb)
-            call build_leading_bounds(t, ix, lb, hb, lk, hk)
-        end associate
-        call open_range(db, ti, j, lk, hk, cur, rs)
+        lb = transfer(lo, lb)
+        hb = transfer(hi, hb)
+        call find_leading_range(db, ti, j, lb, hb, cur, rs)
         if (present(stat)) stat = rs
     end subroutine
 
@@ -510,29 +525,21 @@ contains
         integer,           intent(out), optional :: stat
         integer :: ti, j, rs
         character(len=8) :: lb, hb
-        character(len=:), allocatable :: lk, hk
-        call find_leading_index(db, table_name, col_name, ti, j, rs)
+        call resolve_leading(db, table_name, col_name, DT_REAL, ti, j, rs)
         if (rs /= SQR_OK) then
             if (present(stat)) stat = rs
             return
         end if
-        associate (t => db%tables(ti), ix => db%tables(ti)%indices(j))
-            if (leading_dtype(t, ix) /= DT_REAL) then
-                if (present(stat)) stat = SQR_NOT_FOUND
-                return
-            end if
-            ! A NaN bound is unordered against every stored real (key_cmp's </>
-            ! both read false), so it cannot define a band. Reject it rather than
-            ! seek on a nonsensical range.
-            if (ieee_is_nan(lo) .or. ieee_is_nan(hi)) then
-                if (present(stat)) stat = SQR_INVALID
-                return
-            end if
-            lb = transfer(lo, lb)
-            hb = transfer(hi, hb)
-            call build_leading_bounds(t, ix, lb, hb, lk, hk)
-        end associate
-        call open_range(db, ti, j, lk, hk, cur, rs)
+        ! A NaN bound is unordered against every stored real (key_cmp's </>
+        ! both read false), so it cannot define a band. Reject it rather than
+        ! seek on a nonsensical range.
+        if (ieee_is_nan(lo) .or. ieee_is_nan(hi)) then
+            if (present(stat)) stat = SQR_INVALID
+            return
+        end if
+        lb = transfer(lo, lb)
+        hb = transfer(hi, hb)
+        call find_leading_range(db, ti, j, lb, hb, cur, rs)
         if (present(stat)) stat = rs
     end subroutine
 
@@ -543,38 +550,31 @@ contains
         type(db_cursor_t), intent(out)           :: cur
         integer,           intent(out), optional :: stat
         integer :: ti, j, rs, lw
-        character(len=:), allocatable :: lb, hb, lk, hk
-        call find_leading_index(db, table_name, col_name, ti, j, rs)
+        character(len=:), allocatable :: lb, hb
+        call resolve_leading(db, table_name, col_name, DT_CHAR, ti, j, rs)
         if (rs /= SQR_OK) then
             if (present(stat)) stat = rs
             return
         end if
-        associate (t => db%tables(ti), ix => db%tables(ti)%indices(j))
-            if (leading_dtype(t, ix) /= DT_CHAR) then
-                if (present(stat)) stat = SQR_NOT_FOUND
-                return
-            end if
-            lw = t%cols(ix%col_idx(1))%csize       ! leading char member width
-            ! A bound longer than the column would be silently truncated,
-            ! narrowing or widening the band to something the caller did not ask
-            ! for; reject it instead. Trailing blanks are insignificant padding.
-            if (len_trim(lo) > lw .or. len_trim(hi) > lw) then
-                if (present(stat)) stat = SQR_INVALID
-                return
-            end if
-            allocate(character(len=lw) :: lb, hb)
-            lb = repeat(char(0), lw)
-            hb = repeat(char(0), lw)
-            ! Trim trailing blanks from the bounds: they are insignificant padding
-            ! (see the len_trim reject above) and the stored keys are canonicalised
-            ! blank-free by extract_key, so a blank-padded bound would miss them.
-            associate (nlo => min(lw, len_trim(lo)), nhi => min(lw, len_trim(hi)))
-                if (nlo > 0) lb(1:nlo) = lo(1:nlo)
-                if (nhi > 0) hb(1:nhi) = hi(1:nhi)
-            end associate
-            call build_leading_bounds(t, ix, lb, hb, lk, hk)
+        lw = db%tables(ti)%cols(db%tables(ti)%indices(j)%col_idx(1))%csize   ! leading char member width
+        ! A bound longer than the column would be silently truncated,
+        ! narrowing or widening the band to something the caller did not ask
+        ! for; reject it instead. Trailing blanks are insignificant padding.
+        if (len_trim(lo) > lw .or. len_trim(hi) > lw) then
+            if (present(stat)) stat = SQR_INVALID
+            return
+        end if
+        allocate(character(len=lw) :: lb, hb)
+        lb = repeat(char(0), lw)
+        hb = repeat(char(0), lw)
+        ! Trim trailing blanks from the bounds: they are insignificant padding
+        ! (see the len_trim reject above) and the stored keys are canonicalised
+        ! blank-free by extract_key, so a blank-padded bound would miss them.
+        associate (nlo => min(lw, len_trim(lo)), nhi => min(lw, len_trim(hi)))
+            if (nlo > 0) lb(1:nlo) = lo(1:nlo)
+            if (nhi > 0) hb(1:nhi) = hi(1:nhi)
         end associate
-        call open_range(db, ti, j, lk, hk, cur, rs)
+        call find_leading_range(db, ti, j, lb, hb, cur, rs)
         if (present(stat)) stat = rs
     end subroutine
 

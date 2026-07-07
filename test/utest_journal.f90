@@ -33,6 +33,12 @@ program utest_journal
     call one_case('intact hot journal recovers (rolls back)', perturb_none, &
                   expect_rollback=.true.)
 
+    ! E1 partial-append: a valid prefix (named by payload_len) followed by torn
+    ! bytes beyond it — a crash mid-append of a NEW record.  Recovery reads only
+    ! the durable prefix, its checksum matches, so it rolls the base write back.
+    call one_case('trailing garbage past plen recovers', perturb_trailing_garbage, &
+                  expect_rollback=.true.)
+
     ! Torn corpus: recovery must be safe and leave the journal not hot.
     call one_case('foreign magic  -> no-op, safe',       perturb_magic,     .false.)
     call one_case('bad checksum   -> voided, safe',      perturb_checksum,  .false.)
@@ -112,6 +118,14 @@ contains
     subroutine perturb_magic()
         call jwrite_region(JPATH, 1_int64, 'XXXX')      ! foreign magic
     end subroutine perturb_magic
+
+    subroutine perturb_trailing_garbage()
+        ! arm_hot's one record occupies ~53 payload bytes from pos 65; the header
+        ! payload_len names only those.  Write torn bytes well beyond them (still
+        ! inside the 128 KiB pre-sized region) — recovery must never read past
+        ! payload_len, so the valid prefix still recovers.
+        call jwrite_region(JPATH, 400_int64, 'TORNTORNTORNTORN')
+    end subroutine perturb_trailing_garbage
 
     subroutine perturb_checksum()
         call patch_i32(JPATH, 17_int64, 123456789)      ! wrong stored checksum

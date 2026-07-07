@@ -44,7 +44,7 @@ submodule (sqr) sqr_base
     use, intrinsic :: iso_fortran_env, only: error_unit  ! int8/int32/int64/real64 via host association from sqr
     use, intrinsic :: ieee_arithmetic, only: ieee_is_nan
     use :: clib_wrap, only: c_mkdir, c_path_exists, c_lock_release, &
-                            c_rename, c_fsync_path, c_fsync_dir
+                            c_rename, c_fsync_path, c_fsync_dir, c_remove
     use :: sqr_fault, only: io_check
     use :: b_tree, only: btree_t, bt_open, bt_close, bt_reload, bt_sync, bt_insert, &
                          bt_remove, bt_bulk_load, bt_seek, bt_first, bt_next, &
@@ -202,14 +202,49 @@ contains
     ! both submodules share it by host association.
     pure integer function checksum(buf) result(c)
         character(len=*), intent(in) :: buf
+        c = checksum_fold(0, buf)
+    end function
+
+    ! Fold `buf` into a running checksum seeded by a prior checksum value.  The
+    ! fold's whole state is the current non-negative int32, so
+    ! checksum(a//b) == checksum_fold(checksum(a), b): the incremental journal arm
+    ! extends the checksum over just the appended bytes, never re-reading the
+    ! durable prefix.  checksum(buf) is checksum_fold(0, buf).
+    pure integer function checksum_fold(seed, buf) result(c)
+        integer,          intent(in) :: seed
+        character(len=*), intent(in) :: buf
         integer(int64) :: acc
         integer        :: i
-        acc = 0_int64
+        acc = int(seed, int64)
         do i = 1, len(buf)
             acc = mod(acc * 31_int64 + iachar(buf(i:i)), 2147483647_int64)
         end do
         c = int(acc)
     end function
+
+    ! Best-effort removal of a file that may not exist: unlink it directly via
+    ! the C wrapper rather than open/close(status='delete') a throwaway unit.
+    ! Failure is ignored — every caller already treats a missing/undeletable
+    ! file as nothing to do.
+    subroutine remove_file(path)
+        character(len=*), intent(in) :: path
+        integer :: ios
+        if (c_path_exists(path)) ios = c_remove(path)
+    end subroutine
+
+    ! Ensure the allocatable scratch buffer `buf` has exactly length `n`,
+    ! (re)allocating only when it is unallocated or the wrong length.  Lets the
+    ! hot mutator paths reuse a handle-owned buffer instead of allocating and
+    ! freeing a fresh one on every call.
+    subroutine ensure_len(buf, n)
+        character(len=:), allocatable, intent(inout) :: buf
+        integer,                       intent(in)    :: n
+        if (allocated(buf)) then
+            if (len(buf) == n) return
+            deallocate(buf)
+        end if
+        allocate(character(len=n) :: buf)
+    end subroutine
 
     ! The blob file name relative to the db directory — the form the journal
     ! records (it joins db%dir itself).  blob_path() prepends db%dir for opens.
@@ -1225,7 +1260,7 @@ contains
         type(index_t),    intent(in)  :: ix
         character(len=*), intent(in)  :: rowbuf
         character(len=*), intent(out) :: key
-        integer :: m, k, vlen
+        integer :: m, k, vlen, lo
         members: do m = 1, ix%ncols
             associate (c => t%cols(ix%col_idx(m)))
                 if (c%dtype == DT_CHAR) then
@@ -1243,9 +1278,13 @@ contains
                             vlen = len_trim(mb(1:k-1))
                         end if
                     end associate
-                    key(ix%key_off(m) : ix%key_off(m) + c%csize - 1) = repeat(char(0), c%csize)
-                    if (vlen > 0) key(ix%key_off(m) : ix%key_off(m) + vlen - 1) = &
-                        rowbuf(c%offset : c%offset + vlen - 1)
+                    ! Copy the trimmed value, then NUL-fill the remainder of the
+                    ! member slot in place — no repeat(char(0)) temporary.
+                    lo = ix%key_off(m)
+                    if (vlen > 0) key(lo : lo + vlen - 1) = rowbuf(c%offset : c%offset + vlen - 1)
+                    do k = lo + vlen, lo + c%csize - 1
+                        key(k:k) = char(0)
+                    end do
                 else
                     key(ix%key_off(m) : ix%key_off(m) + c%csize - 1) = &
                         rowbuf(c%offset : c%offset + c%csize - 1)
@@ -1349,6 +1388,11 @@ contains
         integer(int32),   allocatable :: pays(:)
         associate (t => db%tables(ti), ix => db%tables(ti)%indices(j))
             ix%kc_valid = .false.   ! geometry may have changed (add/drop column)
+            ! Same geometry change can alter key_size: drop the key scratches so
+            ! they re-size to the new geometry (ensure_len would anyway; this is
+            ! belt-and-braces alongside the kc invalidation).
+            if (allocated(ix%key_scratch))  deallocate(ix%key_scratch)
+            if (allocated(ix%key_scratch2)) deallocate(ix%key_scratch2)
             if (ix%bt%unit /= -1) then
                 close(ix%bt%unit)
                 ix%bt%unit = -1
@@ -1381,18 +1425,13 @@ contains
             stat = sqr_of_bt(bs)
             if (stat /= SQR_OK) return
             allocate(character(len=t%record_size) :: rbuf)
-            nlive = 0
-            count_rows: do rid = 1, t%next_id - 1
-                read(t%unit, rec=rid, iostat=ios) rbuf
-                call io_check(ios)
-                if (ios /= 0) then
-                    stat = SQR_ERR
-                    return
-                end if
-                if (row_status(rbuf) == ROW_ALIVE) nlive = nlive + 1
-            end do count_rows
-            allocate(character(len=ix%key_size) :: keys(max(1, nlive)))
-            allocate(pays(max(1, nlive)))
+            ! Size the gather buffers straight from the table's live-row
+            ! counter, no separate counting pass.  A partial index fills fewer
+            ! slots (rows with a NULL member are skipped below); an over-run
+            ! would mean live_count is stale — a bug to surface (SQR_INVALID),
+            ! not to silently grow past.
+            allocate(character(len=ix%key_size) :: keys(max(1, t%live_count)))
+            allocate(pays(max(1, t%live_count)))
             nlive = 0
             gather: do rid = 1, t%next_id - 1
                 read(t%unit, rec=rid, iostat=ios) rbuf
@@ -1407,6 +1446,10 @@ contains
                 ! these out simply uses fewer slots than allocated.
                 if (key_has_null(t, ix, rbuf)) cycle gather
                 nlive = nlive + 1
+                if (nlive > size(keys)) then   ! live_count was stale
+                    stat = SQR_INVALID
+                    return
+                end if
                 call extract_key(t, ix, rbuf, keys(nlive))
                 ! A NaN has no place in the index's total order. On a first
                 ! build (db_create_index over existing data) this rejects the
@@ -1463,40 +1506,44 @@ contains
         integer :: bs, ios
         integer(int32) :: rid
         logical :: ok
-        character(len=:), allocatable :: ckey, rbuf
         type(bt_cursor_t) :: cur
         viol = .false.
         stat = SQR_OK
         associate (t => db%tables(ti), ix => db%tables(ti)%indices(j))
-            allocate(character(len=ix%key_size) :: ckey)
-            allocate(character(len=t%record_size) :: rbuf)
-            call ensure_kc_ctx(t, ix)
-            call bt_seek(ix%bt, key, bt_key_cmp, ix%kc, cur, bs)
-            if (bs /= BT_OK) then
-                stat = SQR_ERR
-                return
-            end if
-            scan: do
-                call bt_next(ix%bt, cur, ckey, rid, ok, bs)
+            ! Second-tier scratch: the caller's probe key may itself be
+            ! ix%key_scratch, so the cursor key uses key_scratch2, and the row
+            ! read uses rbuf_scratch2 (ins_core holds rbuf_scratch as wbuf).
+            call ensure_len(ix%key_scratch2, ix%key_size)
+            call ensure_len(t%rbuf_scratch2, t%record_size)
+            associate (ckey => ix%key_scratch2, rbuf => t%rbuf_scratch2)
+                call ensure_kc_ctx(t, ix)
+                call bt_seek(ix%bt, key, bt_key_cmp, ix%kc, cur, bs)
                 if (bs /= BT_OK) then
                     stat = SQR_ERR
                     return
                 end if
-                if (.not. ok) exit scan
-                if (key_cmp_ix(t, ix, ckey, key) /= 0) exit scan
-                if (rid /= exclude_row) then
-                    read(t%unit, rec=rid, iostat=ios) rbuf
-                    call io_check(ios)
-                    if (ios /= 0) then
+                scan: do
+                    call bt_next(ix%bt, cur, ckey, rid, ok, bs)
+                    if (bs /= BT_OK) then
                         stat = SQR_ERR
-                        exit scan
+                        return
                     end if
-                    if (row_status(rbuf) == ROW_ALIVE) then
-                        viol = .true.
-                        exit scan
+                    if (.not. ok) exit scan
+                    if (key_cmp_ix(t, ix, ckey, key) /= 0) exit scan
+                    if (rid /= exclude_row) then
+                        read(t%unit, rec=rid, iostat=ios) rbuf
+                        call io_check(ios)
+                        if (ios /= 0) then
+                            stat = SQR_ERR
+                            exit scan
+                        end if
+                        if (row_status(rbuf) == ROW_ALIVE) then
+                            viol = .true.
+                            exit scan
+                        end if
                     end if
-                end if
-            end do scan
+                end do scan
+            end associate
         end associate
     end subroutine
 
