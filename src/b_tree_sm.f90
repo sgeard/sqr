@@ -20,6 +20,23 @@
 !                       fixed-width so byte offsets do not depend on the
 !                       live count.
 !
+! On-disk invariants. Every scalar above is untrusted data read back from a
+! file that a crash, a bad disk or a hostile edit may have changed, so each is
+! checked before it can steer an access:
+!   file length    == page_size * npages                     (bt_open)
+!   root, first_leaf in 2..npages, maxk >= 32, key_len match (bt_open)
+!   node kind      == K_LEAF or K_INT                        (check_node)
+!   nkeys          in 0..MAXK                                (check_node)
+!   leaf next id   == 0 or in 2..npages                      (check_node)
+!   child id       in 2..npages                              (child_pid)
+!   descent depth  <= npages, cursor leaf hops <= npages     (loop ceilings)
+! MAXK is the stable per-node bound: a node is split whenever it would exceed
+! it (ins) and bt_bulk_load never packs more, so a page this library wrote is
+! always within it -- the transient MAXK+1 exists only in memory during a
+! split. Anything outside these ranges is BT_CORRUPT; before they were
+! enforced, one wrong nkeys int32 turned an ordinary insert into a heap write
+! past the page buffer.
+!
 ! Order is the total order on (key, payload): the caller's pure
 ! comparator on keys, ties broken by ascending int32 payload. Every
 ! duplicate key is therefore uniquely addressable. Delete is lazy: an
@@ -124,6 +141,54 @@ contains
         integer :: ios
         read(bt%unit, rec=pid, iostat=ios) pg
         stat = merge(BT_ERR, BT_OK, ios /= 0)
+    end subroutine
+
+    ! Read a leaf/internal page and validate its header before anyone indexes
+    ! by it. Every body-page read goes through here; read_page stays raw for
+    ! the meta page (bt_reload) and for write_page's own pre-image read, which
+    ! copies bytes without interpreting them.
+    subroutine read_node(bt, pid, pg, stat)
+        type(btree_t),    intent(in)  :: bt
+        integer,          intent(in)  :: pid
+        character(len=*), intent(out) :: pg
+        integer,          intent(out) :: stat
+        call read_page(bt, pid, pg, stat)
+        if (stat /= BT_OK) return
+        call check_node(bt, pg, stat)
+    end subroutine
+
+    ! The on-disk page invariants (see the header comment). O(1): only the
+    ! fields that steer an access are checked, and the child ids are bounded
+    ! individually by child_pid at the point each one is followed, so a page
+    ! read never costs a sweep over its slots.
+    subroutine check_node(bt, pg, stat)
+        type(btree_t),    intent(in)  :: bt
+        character(len=*), intent(in)  :: pg
+        integer,          intent(out) :: stat
+        integer :: nk, nx
+        stat = BT_CORRUPT
+        associate (nkind => node_kind(pg))
+            if (nkind /= K_LEAF .and. nkind /= K_INT) return
+            nk = n_keys(pg)
+            if (nk < 0 .or. nk > maxk(bt)) return
+            if (nkind == K_LEAF) then
+                nx = leaf_next(pg)                 ! 0 terminates the chain
+                if (nx /= 0 .and. (nx < 2 .or. nx > bt%npages)) return
+            end if
+        end associate
+        stat = BT_OK
+    end subroutine
+
+    ! Child id in slot j of an internal page, bounded before it is followed:
+    ! page 1 is the meta page, so a body page id is 2..npages.
+    subroutine child_pid(bt, pg, j, pid, stat)
+        type(btree_t),    intent(in)  :: bt
+        character(len=*), intent(in)  :: pg
+        integer,          intent(in)  :: j
+        integer,          intent(out) :: pid
+        integer,          intent(out) :: stat
+        pid  = int_child(pg, j)
+        stat = merge(BT_OK, BT_CORRUPT, pid >= 2 .and. pid <= bt%npages)
     end subroutine
 
     subroutine write_page(bt, pid, pg, stat)
@@ -430,6 +495,7 @@ contains
         logical,          intent(in)  :: create
         integer,          intent(out) :: stat
         integer :: u, ios, ps, entry, need
+        integer(int64) :: fsize
         character(len=9) :: act
         character(len=:), allocatable :: pg
 
@@ -490,6 +556,7 @@ contains
             character(len=44) :: hdr
             integer(int32)    :: bom
             read(u, iostat=ios) hdr
+            inquire(unit=u, size=fsize)
             close(u)
             if (ios /= 0) then
                 stat = BT_ERR
@@ -529,6 +596,16 @@ contains
             bt%root < 2 .or. bt%npages < bt%root .or.               &
             bt%first_leaf < 2 .or. bt%first_leaf > bt%npages .or.   &
             maxk(bt) < 32 .or. bt%nentries < 0) then
+            stat = BT_CORRUPT
+            return
+        end if
+        ! The stored page_size becomes the direct-access recl below, so it must
+        ! agree with the file itself: off by even one byte, every page read
+        ! lands mid-record and nkeys/pointers come back from the middle of key
+        ! data. alloc_page/write_page always leave the file at exactly
+        ! npages*page_size, and jrnl_recover has already repaired any torn
+        ! file by the time db_open reaches an index, so demand equality.
+        if (fsize /= int(bt%page_size, int64) * int(bt%npages, int64)) then
             stat = BT_CORRUPT
             return
         end if
@@ -613,10 +690,11 @@ contains
     ! Recursive descent. On return split=.true. means this node was split:
     ! its right half is page `right_pid` and (up_key,up_pay) is the
     ! separator the parent must adopt (the right half's first entry).
-    recursive subroutine ins(bt, pid, key, pay, cmp, ctx, &
+    recursive subroutine ins(bt, pid, depth, key, pay, cmp, ctx, &
                              split, up_key, up_pay, right_pid, stat)
         type(btree_t),         intent(inout) :: bt
         integer,               intent(in)    :: pid
+        integer,               intent(in)    :: depth
         character(len=*),      intent(in)    :: key
         integer(int32),        intent(in)    :: pay
         procedure(bt_compare)                :: cmp
@@ -627,7 +705,7 @@ contains
         integer,               intent(out)   :: right_pid
         integer,               intent(out)   :: stat
         character(len=:), allocatable :: pg, rpg
-        integer :: nk, j, k, mk, ln, rn, ci, mid
+        integer :: nk, j, k, mk, ln, rn, ci, mid, cpid
         logical :: csplit
         character(len=:), allocatable :: ckey
         integer(int32) :: cpay
@@ -635,8 +713,14 @@ contains
         split = .false.
         right_pid = 0
         up_pay = 0_int32
+        ! A child id cycling back up the tree would otherwise recurse until the
+        ! stack ran out; no path from the root can be longer than the page count.
+        if (depth > bt%npages) then
+            stat = BT_CORRUPT
+            return
+        end if
         allocate(character(len=bt%page_size) :: pg)
-        call read_page(bt, pid, pg, stat)
+        call read_node(bt, pid, pg, stat)
         if (stat /= BT_OK) return
         mk = maxk(bt)
 
@@ -690,8 +774,10 @@ contains
 
         ! Internal node: descend, then absorb a child split if it happened.
         ci = route(bt, pg, key, pay, cmp, ctx)
+        call child_pid(bt, pg, ci, cpid, stat)
+        if (stat /= BT_OK) return
         allocate(character(len=bt%key_len) :: ckey)
-        call ins(bt, int_child(pg, ci), key, pay, cmp, ctx, &
+        call ins(bt, cpid, depth + 1, key, pay, cmp, ctx, &
                  csplit, ckey, cpay, right_pid, stat)
         if (stat /= BT_OK) return
         if (.not. csplit) return
@@ -756,7 +842,7 @@ contains
         integer(int32) :: up_pay
         character(len=:), allocatable :: up_key, pg
         allocate(character(len=bt%key_len) :: up_key)
-        call ins(bt, bt%root, key, payload, cmp, ctx, &
+        call ins(bt, bt%root, 1, key, payload, cmp, ctx, &
                  split, up_key, up_pay, right_pid, stat)
         if (stat /= BT_OK) return
         if (split) then
@@ -786,16 +872,25 @@ contains
         logical,          intent(out)   :: found
         integer,          intent(out)   :: stat
         character(len=:), allocatable :: pg
-        integer :: pid, nk, j, k
+        integer :: pid, nk, j, k, hops
 
         found = .false.
         allocate(character(len=bt%page_size) :: pg)
-        pid = bt%root
+        pid  = bt%root
+        hops = 0
         descend: do
-            call read_page(bt, pid, pg, stat)
+            call read_node(bt, pid, pg, stat)
             if (stat /= BT_OK) return
             if (node_kind(pg) == K_LEAF) exit descend
-            pid = int_child(pg, route(bt, pg, key, payload, cmp, ctx))
+            ! No root-to-leaf path can visit more pages than the file holds:
+            ! a longer walk means the child ids cycle.
+            hops = hops + 1
+            if (hops > bt%npages) then
+                stat = BT_CORRUPT
+                return
+            end if
+            call child_pid(bt, pg, route(bt, pg, key, payload, cmp, ctx), pid, stat)
+            if (stat /= BT_OK) return
         end do descend
 
         ! The exact pair, if present, is the entry just before the first one
@@ -841,21 +936,28 @@ contains
         type(bt_cursor_t), intent(out) :: cur
         integer,           intent(out) :: stat
         character(len=:), allocatable :: pg
-        integer :: pid, slot
+        integer :: pid, slot, hops
 
         cur%valid = .false.
         cur%leaf  = 0
         cur%slot  = 0
         allocate(character(len=bt%page_size) :: pg)
-        pid = bt%root
+        pid  = bt%root
+        hops = 0
         ! Lower bound on key alone: at each internal node take the first
         ! child whose separator key is not less than the target, so we
         ! never start past the first matching entry.
         descend: do
-            call read_page(bt, pid, pg, stat)
+            call read_node(bt, pid, pg, stat)
             if (stat /= BT_OK) return
             if (node_kind(pg) == K_LEAF) exit descend
-            pid = int_child(pg, key_lower_bound(bt, pg, key, cmp, ctx))
+            hops = hops + 1                      ! cycle guard, as in del
+            if (hops > bt%npages) then
+                stat = BT_CORRUPT
+                return
+            end if
+            call child_pid(bt, pg, key_lower_bound(bt, pg, key, cmp, ctx), pid, stat)
+            if (stat /= BT_OK) return
         end do descend
 
         ! First leaf slot whose key is >= target; cursor sits one before it
@@ -888,7 +990,7 @@ contains
             if (cur%cpid /= cur%leaf .or. .not. allocated(cur%cpg)) then
                 if (.not. allocated(cur%cpg)) &
                     allocate(character(len=bt%page_size) :: cur%cpg)
-                call read_page(bt, cur%leaf, cur%cpg, stat)
+                call read_node(bt, cur%leaf, cur%cpg, stat)
                 if (stat /= BT_OK) return
                 cur%cpid = cur%leaf
             end if
@@ -904,6 +1006,17 @@ contains
             cur%slot = 0
             if (cur%leaf == 0) then
                 cur%valid = .false.
+                return
+            end if
+            ! Leaf-chain cycle guard. It has to be carried in the cursor, not
+            ! counted per call: a cycle of non-empty leaves yields an entry on
+            ! every call, so each call returns normally while the caller's own
+            ! walk (db_verify, index_find) never ends. A full left-to-right
+            ! scan makes at most npages-1 transitions.
+            cur%hops = cur%hops + 1
+            if (cur%hops > bt%npages) then
+                cur%valid = .false.
+                stat = BT_CORRUPT
                 return
             end if
         end do advance

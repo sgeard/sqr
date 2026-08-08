@@ -958,8 +958,23 @@ module sqr
         end subroutine
 
         ! ===== Row buffer helpers =====
+        !
+        ! Every `row_*` accessor below takes the buffer as `character(len=*)`
+        ! and indexes the column slot the passed `column_t` describes.  They
+        ! are the hot path of every insert and every row read, so none of them
+        ! re-checks that: the caller's contract is
+        !
+        !     len(buf) >= db_record_size(db, table)
+        !
+        ! with `col` one of that same table's `db%tables(ti)%cols`.  Size the
+        ! buffer with `row_alloc(buf, db_record_size(db, table))` and the
+        ! contract holds by construction.  A shorter buffer, or a column from
+        ! another table, reads or writes past its end — the enclosing
+        ! `db_insert` / `db_update` / `db_get_by_key` do check their buffer's
+        ! length, so the exposure is to hand-rolled packing only.
 
-        !! Allocate a zeroed row buffer of `n` bytes.
+        !! Allocate a zeroed row buffer of `n` bytes.  A negative `n` yields an
+        !! empty buffer.
         pure module subroutine row_alloc(buf, n)
             character(len=:), allocatable, intent(out) :: buf  !! Allocated, zero-filled buffer
             integer,                       intent(in)  :: n  !! Buffer size in bytes

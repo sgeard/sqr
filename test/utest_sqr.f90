@@ -51,6 +51,8 @@ program utest_sqr
     call test_compact_recovery()
     call test_deep_tree()
     call test_torn_journal()
+    call test_schema_next_id()
+    call test_corrupt_index()
     call test_pack()
     call test_natural_keys()
     call test_null_columns()
@@ -2446,7 +2448,291 @@ contains
         call check(rs == SQR_OK, 'torn: row still readable after truncated-journal open')
         call db_close(db)
 
+        ! Case 4: payload_len exactly huge(int32). The old ceiling was
+        ! "> huge(0)", so this value slipped through and drove a 2 GiB allocate
+        ! whose checksum fold then ran off the end. The file's own size is the
+        ! real bound: a journal cannot hold more payload than it is long.
+        call write_hot_journal_plen(jpath, int(huge(0), int64))
+        call db_open(db, JDIR, rs, emsg)
+        call check(rs == SQR_OK, 'torn: open voids a plen of huge(int32)')
+        call db_get(db, 't', 1_int32, buf, rs)
+        call check(rs == SQR_OK, 'torn: row intact after huge-plen journal')
+        call db_close(db)
+
+        ! Case 5: an absurd record count with an empty payload. nrec sized an
+        ! unguarded allocate, so this aborted db_open with "insufficient
+        ! virtual memory" rather than reporting anything. A record cannot be
+        ! shorter than 40 bytes, so the payload length caps the count.
+        call write_hot_journal(jpath, huge(0), 0, '')
+        call db_open(db, JDIR, rs, emsg)
+        call check(rs == SQR_OK, 'torn: open voids an absurd record count')
+        call db_get(db, 't', 1_int32, buf, rs)
+        call check(rs == SQR_OK, 'torn: row intact after absurd-nrec journal')
+        call db_close(db)
+
+        ! Case 6: a record whose pathlen is near huge(int32). The guard used to
+        ! read `p + pathlen - 1 > len(buf)`, which overflows to a negative
+        ! number and passes; the next field was then cut at a negative index
+        ! (SIGSEGV in an optimised build). Bounding against the bytes REMAINING
+        ! cannot wrap. The payload carries its own checksum so it reaches the
+        ! decoder rather than being rejected earlier.
+        wild_pathlen: block
+            character(len=:), allocatable :: pl
+            pl = i32b(1) // i32b(huge(0)) // 'x' // repeat(char(0), 32)
+            call write_hot_journal(jpath, 1, cksum_of(pl), pl)
+        end block wild_pathlen
+        call db_open(db, JDIR, rs, emsg)
+        call check(rs == SQR_OK, 'torn: open voids a wild pathlen')
+        call db_get(db, 't', 1_int32, buf, rs)
+        call check(rs == SQR_OK, 'torn: row intact after wild-pathlen journal')
+        call db_close(db)
+
+        ! Cases 7-10: well-formed records (valid checksum, parseable fields)
+        ! carrying hostile *meanings*. Each must leave t.dat exactly as it is:
+        ! an undo restores bytes a file already held, so replaying one can
+        ! never make a file longer.
+        undo_bounds: block
+            integer(int64) :: sz0, sz1
+            character(len=:), allocatable :: dpath, pl
+            dpath = JDIR // '/t.dat'
+            inquire(file=dpath, size=sz0)
+
+            ! 7: a region a gigabyte past the end. Applied blind this punches a
+            ! sparse hole and leaves a data file whose length no longer matches
+            ! its record geometry.
+            pl = jrec_bytes(1, 't.dat', sz0, 1000000000_int64, 4_int64, 'ABCD')
+            call write_hot_journal(jpath, 1, cksum_of(pl), pl)
+            call db_open(db, JDIR, rs, emsg)
+            call check(rs == SQR_OK, 'torn: open survives a region past EOF')
+            call db_close(db)
+            inquire(file=dpath, size=sz1)
+            call check(sz1 == sz0, 'torn: region past EOF did not grow the file')
+
+            ! 8: the same, at an offset that would overflow a length sum.
+            pl = jrec_bytes(1, 't.dat', sz0, 9223372036854775000_int64, 4_int64, 'ABCD')
+            call write_hot_journal(jpath, 1, cksum_of(pl), pl)
+            call db_open(db, JDIR, rs, emsg)
+            call check(rs == SQR_OK, 'torn: open survives a wild region offset')
+            call db_close(db)
+            inquire(file=dpath, size=sz1)
+            call check(sz1 == sz0, 'torn: wild region offset did not grow the file')
+
+            ! 9: an EXTEND undo whose captured length exceeds the file. Truncate
+            ! grows as readily as it shrinks; an undo must only ever shrink.
+            pl = jrec_bytes(2, 't.dat', sz0 + 1000000_int64, 0_int64, 0_int64, '')
+            call write_hot_journal(jpath, 1, cksum_of(pl), pl)
+            call db_open(db, JDIR, rs, emsg)
+            call check(rs == SQR_OK, 'torn: open survives an oversized extend undo')
+            call db_close(db)
+            inquire(file=dpath, size=sz1)
+            call check(sz1 == sz0, 'torn: oversized extend undo did not grow the file')
+
+            ! 10: a path that escapes the database directory, and an unknown
+            ! record kind. Both are structural, so the set is voided whole and
+            ! the committed row is still readable.
+            pl = jrec_bytes(1, '../escaped', 0_int64, 1_int64, 4_int64, 'PWND')
+            call write_hot_journal(jpath, 1, cksum_of(pl), pl)
+            call db_open(db, JDIR, rs, emsg)
+            call check(rs == SQR_OK, 'torn: open voids a journal naming a path outside the db')
+            call db_close(db)
+            call check(.not. c_path_exists(JDIR // '/../escaped'), &
+                       'torn: no file written outside the database directory')
+
+            pl = jrec_bytes(99, 't.dat', sz0, 1_int64, 4_int64, 'ABCD')
+            call write_hot_journal(jpath, 1, cksum_of(pl), pl)
+            call db_open(db, JDIR, rs, emsg)
+            call check(rs == SQR_OK, 'torn: open voids an unknown record kind')
+            call db_get(db, 't', 1_int32, buf, rs)
+            call check(rs == SQR_OK .and. row_get_int(buf, db%tables(1)%cols(1)) == 7, &
+                       'torn: row intact after the hostile-record cases')
+            call db_close(db)
+        end block undo_bounds
+
         ios = c_rmtree(JDIR)
+    end subroutine
+
+    ! One serialised undo record, field order per sqr_journal::put_rec:
+    ! kind | pathlen | path | orig_len | offset | length | byteslen | bytes.
+    function jrec_bytes(kind, path, orig_len, offset, length, bytes) result(s)
+        integer,          intent(in) :: kind
+        character(len=*), intent(in) :: path, bytes
+        integer(int64),   intent(in) :: orig_len, offset, length
+        character(len=:), allocatable :: s
+        s = i32b(kind) // i32b(len(path)) // path // i64b(orig_len) // &
+            i64b(offset) // i64b(length) // i64b(int(len(bytes), int64)) // bytes
+    end function
+
+    ! int64 -> its 8 native bytes, for hand-built journal payloads.
+    function i64b(v) result(s)
+        integer(int64), intent(in) :: v
+        character(len=8) :: s
+        s = transfer(v, s)
+    end function
+
+    ! int32 -> its 4 native bytes, for hand-built journal payloads.
+    function i32b(v) result(s)
+        integer, intent(in) :: v
+        character(len=4) :: s
+        s = transfer(int(v, int32), s)
+    end function
+
+    ! The engine's rolling payload checksum (sqr_base::checksum), duplicated
+    ! here so a hand-built payload can carry a valid one and so reach the
+    ! record decoder instead of being turned away by the checksum guard.
+    function cksum_of(buf) result(c)
+        character(len=*), intent(in) :: buf
+        integer :: c, i
+        integer(int64) :: acc
+        acc = 0_int64
+        do i = 1, len(buf)
+            acc = mod(acc * 31_int64 + iachar(buf(i:i)), 2147483647_int64)
+        end do
+        c = int(acc)
+    end function
+
+    ! A schema's next_id is the high-water row id; the .dat file is the truth.
+    ! A corrupt value ABOVE what the file can justify used to survive open
+    ! (open_data only ever repaired upward), after which one insert extended
+    ! the data file to tens of GB and the undo/redo history sized a read region
+    ! from the gap — a wild allocate reached from nothing but a reopen.
+    subroutine test_schema_next_id()
+        character(len=*), parameter :: NDIR = 'utest_sqr_nextid_db'
+        type(db_t) :: db
+        type(column_t) :: c(1)
+        integer :: rs, ios, u, k
+        integer(int32) :: rid
+        character(len=:), allocatable :: buf
+        character(len=128) :: emsg
+
+        ios = c_rmtree(NDIR)
+        c(1)%name = 'v'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        call db_open(db, NDIR, rs, emsg)
+        call db_create_table(db, 't', c, rs, emsg)
+        call row_alloc(buf, db%tables(1)%record_size)
+        do k = 1, 5
+            call row_set_int(buf, db%tables(1)%cols(1), int(k, int32))
+            call db_insert(db, 't', buf, rid, rs)
+        end do
+        call db_close(db)
+
+        ! next_id lives at schema byte 21 (magic 4, BOM 4, version/ncols/
+        ! record_size 12).
+        open(newunit=u, file=NDIR // '/t.schema', access='stream', &
+             form='unformatted', status='old', action='write', iostat=ios)
+        write(u, pos=21) 1000000000_int32
+        close(u)
+        call db_open(db, NDIR, rs, emsg)
+        call check(rs == SQR_INVALID, 'nextid: value beyond the data file rejected')
+        call db_close(db)
+
+        ! One past the true high-water is still corruption, not staleness:
+        ! staleness only ever runs the other way (a crash leaves next_id LOW).
+        open(newunit=u, file=NDIR // '/t.schema', access='stream', &
+             form='unformatted', status='old', action='write', iostat=ios)
+        write(u, pos=21) 7_int32
+        close(u)
+        call db_open(db, NDIR, rs, emsg)
+        call check(rs == SQR_INVALID, 'nextid: one past the high-water rejected')
+        call db_close(db)
+
+        ! The legitimate value still opens, and a LOW one is still repaired
+        ! upward from the file (the crash-recovery path).
+        open(newunit=u, file=NDIR // '/t.schema', access='stream', &
+             form='unformatted', status='old', action='write', iostat=ios)
+        write(u, pos=21) 6_int32
+        close(u)
+        call db_open(db, NDIR, rs, emsg)
+        call check(rs == SQR_OK, 'nextid: correct value opens')
+        call db_close(db)
+
+        open(newunit=u, file=NDIR // '/t.schema', access='stream', &
+             form='unformatted', status='old', action='write', iostat=ios)
+        write(u, pos=21) 2_int32
+        close(u)
+        call db_open(db, NDIR, rs, emsg)
+        call check(rs == SQR_OK .and. db%tables(1)%next_id == 6, &
+                   'nextid: stale-low value still recovered from the file')
+        call db_close(db)
+
+        ios = c_rmtree(NDIR)
+    end subroutine
+
+    ! The engine's view of a corrupt index: every entry point that touches one
+    ! must come back with SQR_INVALID rather than crash, and db_verify — the
+    ! routine a user reaches for BECAUSE they suspect corruption — must return
+    ! at all on a leaf chain that cycles.
+    subroutine test_corrupt_index()
+        character(len=*), parameter :: CDIR = 'utest_sqr_badidx_db'
+        type(db_t) :: db
+        type(db_cursor_t) :: cur
+        type(column_t) :: c(1)
+        integer :: rs, ios, k, ti
+        integer(int32) :: rid
+        character(len=:), allocatable :: buf
+        character(len=128) :: emsg
+        logical :: ok
+
+        ios = c_rmtree(CDIR)
+        c(1)%name = 'v'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        call db_open(db, CDIR, rs, emsg)
+        call db_create_table(db, 't', c, rs, emsg)
+        ti = db_table_index(db, 't')
+        call row_alloc(buf, db%tables(ti)%record_size)
+        do k = 1, 600
+            call row_set_int(buf, db%tables(ti)%cols(1), int(k, int32))
+            call db_insert(db, 't', buf, rid, rs)
+        end do
+        call db_create_index(db, 't', 'v', rs)
+        call check(rs == SQR_OK, 'badidx: 600 rows indexed')
+        call db_close(db)
+
+        ! nkeys of the first leaf (page 2, byte 2 within it) far past capacity.
+        call poke_index('utest_sqr_badidx_db/t__i1.idx', 4096 + 2, 100000_int32)
+        call db_open(db, CDIR, rs, emsg)
+        call check(rs == SQR_OK, 'badidx: open succeeds (the schema is fine)')
+        call db_find_by_int(db, 't', 'v', 3_int32, rid, rs)
+        call check(rs == SQR_INVALID, 'badidx: find_by_int reports corruption')
+        call db_verify(db, 't', rs, emsg)
+        call check(rs /= SQR_OK, 'badidx: verify reports rather than crashes')
+        ! Opening a cursor reads no page (bt_first only positions it), so the
+        ! corruption surfaces on the first pull — which is the contract that
+        ! matters: the caller gets a status, not a crash.
+        call db_open_cursor(db, 't', 'v', cur, rs)
+        call check(rs == SQR_OK, 'badidx: cursor opens without touching a page')
+        call db_cursor_next(db, cur, rid, buf, ok, rs)
+        call check(rs == SQR_INVALID, 'badidx: first cursor pull reports corruption')
+        ! A LOW key: the index-maintenance descent then routes into the damaged
+        ! leaf (page 2 holds the low keys) rather than the intact one, which is
+        ! the path that used to write past the page buffer.
+        call row_clear(buf)
+        call row_set_int(buf, db%tables(1)%cols(1), 1_int32)
+        call db_insert(db, 't', buf, rid, rs)
+        call check(rs == SQR_INVALID, 'badidx: insert reports corruption')
+        call db_close(db)
+
+        ! A leaf chain that cycles: db_verify walks it entry by entry, so
+        ! before the cursor's hop ceiling this never returned at all.
+        call poke_index('utest_sqr_badidx_db/t__i1.idx', 4096 + 2, 294_int32)
+        call poke_index('utest_sqr_badidx_db/t__i1.idx', 4096 + 6, 2_int32)
+        call db_open(db, CDIR, rs, emsg)
+        call db_verify(db, 't', rs, emsg)
+        call check(rs /= SQR_OK, 'badidx: verify terminates on a cyclic leaf chain')
+        call db_close(db)
+
+        ios = c_rmtree(CDIR)
+    end subroutine
+
+    ! Overwrite one native int32 at a 1-based byte position of an index file.
+    subroutine poke_index(path, pos, v)
+        character(len=*), intent(in) :: path
+        integer,          intent(in) :: pos
+        integer(int32),   intent(in) :: v
+        integer :: u, ios
+        open(newunit=u, file=path, access='stream', form='unformatted', &
+             status='old', action='write', iostat=ios)
+        if (ios /= 0) return
+        write(u, pos=pos) v
+        close(u)
     end subroutine
 
     ! Step 7: pack a database directory into a single .sqr container and unpack
@@ -2665,6 +2951,25 @@ contains
         call check(rs == SQR_OK .and. db%tables(td)%nindices == 1, &
                    'nk: non-unique index over duplicates OK')
 
+        ! A key-bearing buffer shorter than a record: extract_key slices the
+        ! member columns at their record offsets, so this used to read past the
+        ! buffer's end (undefined, and an ASan overflow in an -O3 build). All
+        ! three by-key entry points share resolve_by_key, so all three are
+        ! covered by the one check.
+        short_keyrow: block
+            character(len=:), allocatable :: shortk, obuf
+            ti = db_table_index(db, 'inv')
+            call row_alloc(obuf, db%tables(ti)%record_size)
+            call row_alloc(shortk, 4)          ! well short of a record
+            call db_get_by_key(db, 'inv', KEYCOLS, shortk, obuf, rs)
+            call check(rs == SQR_INVALID, 'nk: get_by_key with a short keyrow rejected')
+            call db_update_by_key(db, 'inv', KEYCOLS, shortk, obuf, rs)
+            call check(rs == SQR_INVALID, 'nk: update_by_key with a short keyrow rejected')
+            call db_delete_by_key(db, 'inv', KEYCOLS, shortk, rs)
+            call check(rs == SQR_INVALID, 'nk: delete_by_key with a short keyrow rejected')
+            call check(db%tables(ti)%live_count == 3, 'nk: rejected by-key ops changed nothing')
+        end block short_keyrow
+
         call db_close(db)
         ios = c_rmtree(NK)
     end subroutine
@@ -2697,6 +3002,16 @@ contains
         end do
         call db_create_table(db, 'huge', big, rs, emsg)
         call check(rs == SQR_INVALID, 'cov: oversized record rejected')
+
+        ! A negative buffer size: repeat()'s ncopies must be non-negative, so
+        ! this was a runtime abort rather than a buffer that plainly cannot
+        ! hold a row (which the write paths then reject on length).
+        neg_alloc: block
+            character(len=:), allocatable :: nbuf
+            call row_alloc(nbuf, -5)
+            call check(allocated(nbuf) .and. len(nbuf) == 0, &
+                       'cov: row_alloc with a negative size gives an empty buffer')
+        end block neg_alloc
 
         ! Invalid column name exercises valid_name's '/' and '..' scans.
         bad(1)%name = 'a/b'; bad(1)%dtype = DT_INT; bad(1)%csize = 4

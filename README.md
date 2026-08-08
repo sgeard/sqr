@@ -55,6 +55,7 @@ The primary build is `make` with `ifx` (load the Intel environment first):
 make all            # build + run unit, B+-tree and fault tests
 make utest          # unit tests + B+-tree tests
 make faulttest      # fault-injection sweep (FAULT=on, debug build)
+make destruct       # destruction/fuzz corpora against a -check all build
 make bench          # micro-benchmarks
 make docs           # FORD API docs -> ford_docs/
 make distclean      # remove ALL generated files
@@ -78,12 +79,9 @@ fpm run sqrsh
 fpm run sqlsh        # the SQL-subset REPL (front-end over the same API)
 ```
 
-> Note: the core build has **no external dependencies** — the `cmdgraph`
-> engine that drives `sqrsh` is vendored under `src/`. The only optional extra
-> is the regex `match` command (and its test): it links the external
-> [`tcl_re`](https://github.com/sgeard/regex_f) binding and is built via
-> `make sqrsh-regex` / `make test-regex` (not through `fpm`). Clone `tcl_re`
-> as a sibling directory first if you want it.
+> Note: the regex-dependent `match` action and its test link the external
+> `tcl_re` binding and are built via `make sqrsh-regex` / `make test-regex`,
+> not through `fpm`.
 
 ---
 
@@ -249,19 +247,46 @@ process dies, so a crashed writer never wedges the database.
 The durability path is deliberately conservative — an `fsync` per write —
 because the project prioritises integrity over throughput.
 
+That choice has a measurable price, and it is worth knowing the shape of it:
+a statement outside an explicit transaction is its own transaction, costing
+two to five durability barriers. On real storage the barrier dominates
+everything else — on the machine this was measured on, one `fsync` costs
+~9 ms, so an autocommit indexed insert costs ~42 ms while the same insert
+inside an explicit transaction costs ~35 µs. **Batch your writes in
+`db_begin` / `db_commit`**; the journal's dedup means the barriers stop
+scaling with the row count, so per-insert cost *falls* as the transaction
+grows.
+
+---
+
+## Robustness
+
+Three test layers back the guarantees above:
+
+```sh
+make utest          # unit + B+-tree tests    (1118 assertions)
+make faulttest      # every I/O call site made to fail in turn   (67)
+make destruct       # corrupt input: ~3000 cases across 4 corpora
+```
+
+`destruct/` is a black-box harness built against a `-check all` library. It
+holds the engine to one contract: **it may return any error it likes, but it
+may not crash, abort, hang, or read or write outside its buffers.** Four
+corpora exercise it — targeted and random mutation of every on-disk artefact
+(catalog, schema, data, blob and index files, and the journal), the `.sqr`
+single-file container, hostile SQL text, and hostile arguments to the public
+API. The blind-mutation sections are seeded so a run is reproducible;
+`make destruct DESTRUCT_SEED=n` sweeps ground the default seed never reaches.
+
+The sweep that introduced it found eight defects — out-of-bounds reads and
+writes reachable from ordinary calls on a database whose index or journal had
+a single wrong `int32`. All eight are fixed: B+-tree page bodies are now
+validated on every read, child and leaf-chain pointers are bounded at each
+dereference, descent is depth-limited, and every journal field is bounded
+against the bytes actually remaining rather than a sum that can overflow.
+
 ---
 
 ## Documentation
 
-The full FORD API reference is browsable online at
-**<https://sgeard.github.io/sqr/>** (rebuilt from source on every push by the
-`docs` GitHub Actions workflow). To generate it locally, run `make docs` — the
-HTML lands in `ford_docs/`.
-
----
-
-## Licence
-
-`sqr` is released under the MIT Licence — see [LICENSE](LICENSE). The vendored
-`cmdgraph` engine (`src/cmdgraph*.f90`, `src/dlist*.f90`) is also MIT, from
-[github.com/sgeard/cmdgraph](https://github.com/sgeard/cmdgraph).
+`make docs` generates the full FORD API reference into `ford_docs/`.

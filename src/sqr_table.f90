@@ -147,6 +147,20 @@ contains
                                         'cannot finish interrupted compact for ' // trim(names(i)))
                                     exit open_seq
                                 end if
+                                ! The renumbered, tombstone-free file is now the
+                                ! truth for next_id; the pre-compact schema is
+                                ! stale HIGH, which open_data rejects as
+                                ! corruption (a schema cannot legitimately claim
+                                ! ids past the end of its data file). Take the
+                                ! count from the swapped-in file first, so the
+                                ! handle open_data validates already describes
+                                ! it. live_count still needs the open unit and
+                                ! is recounted below.
+                                stale_id: block
+                                    integer(int64) :: fsize
+                                    inquire(file=data_path(db, t%name), size=fsize)
+                                    t%next_id = int(fsize / t%record_size, int32) + 1_int32
+                                end block stale_id
                             end if
 
                             call open_data(db, t, 'old', rs)
@@ -156,15 +170,9 @@ contains
                                 exit open_seq
                             end if
 
-                            ! The renumbered, tombstone-free file is the truth
-                            ! for next_id/live_count — the pre-compact schema is
-                            ! stale (too high) and open_data only repairs upward.
                             if (interrupted) then
                                 recount: block
-                                    integer(int64) :: fsize
-                                    integer        :: ios
-                                    inquire(unit=t%unit, size=fsize)
-                                    t%next_id = int(fsize / t%record_size, int32) + 1_int32
+                                    integer :: ios
                                     call recount_live(t%unit, t, ios)
                                     if (ios /= 0) then
                                         rs = SQR_ERR
@@ -685,6 +693,14 @@ contains
                 return
             end if
 
+            ! Adopt the compacted counters BEFORE reopening. The renamed file is
+            ! the shorter one now, and open_data cross-checks next_id against
+            ! its size — a schema claiming ids past the end of the data file is
+            ! corruption. Carrying the pre-compact next_id across the reopen
+            ! would trip that check on a table we have just rewritten.
+            t%next_id    = new_rid + 1
+            t%live_count = new_rid
+
             call open_data(db, t, 'old', rs)
             if (rs /= SQR_OK) then
                 if (present(stat)) stat = rs
@@ -697,9 +713,6 @@ contains
                     return
                 end if
             end if
-
-            t%next_id    = new_rid + 1
-            t%live_count = new_rid
 
             reindex: do j = 1, t%nindices
                 if (.not. idx_live(t%indices(j))) cycle reindex

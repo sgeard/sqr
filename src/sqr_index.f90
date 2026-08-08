@@ -198,13 +198,13 @@ contains
             call ensure_kc_ctx(t, ix)
             call bt_seek(ix%bt, probe, bt_key_cmp, ix%kc, cur, bs)
             if (bs /= BT_OK) then
-                stat = SQR_ERR
+                stat = sqr_of_bt(bs)
                 return
             end if
             scan: do
                 call bt_next(ix%bt, cur, ckey, rid, ok, bs)
                 if (bs /= BT_OK) then
-                    stat = SQR_ERR
+                    stat = sqr_of_bt(bs)
                     return
                 end if
                 if (.not. ok) exit scan
@@ -622,7 +622,7 @@ contains
                 call bt_next(ix%bt, cur%bt, ckey, rid, got, bs)
                 if (bs /= BT_OK) then
                     cur%active = .false.
-                    if (present(stat)) stat = SQR_ERR
+                    if (present(stat)) stat = sqr_of_bt(bs)
                     return
                 end if
                 if (.not. got) then
@@ -685,6 +685,14 @@ contains
                 return
             end if
             if (.not. t%indices(j)%unique) then
+                stat = SQR_INVALID
+                return
+            end if
+            ! extract_key slices the member columns straight out of keyrow at
+            ! their record offsets, so a short buffer would be read past its
+            ! end.  Strict, like db_insert: a by-key caller builds this buffer
+            ! with row_alloc(db_record_size(...)) exactly as it builds a row.
+            if (len(keyrow) /= t%record_size) then
                 stat = SQR_INVALID
                 return
             end if

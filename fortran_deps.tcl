@@ -76,34 +76,45 @@ foreach path $scan_paths {
         if {$ci >= 0} { set line [string range $line 0 $ci-1] }
         set lc [string tolower [string trim $line]]
 
+        # Fortran is case-insensitive, so every keyword/identifier regex is -nocase.
+        # (The line is also pre-lowered into $lc above, which additionally canonicalises
+        # the CAPTURED names to lowercase - essential so `module Geom2D` in one file and
+        # `use :: geom2d` in another resolve to the same .mod dependency; -nocase alone
+        # would not do that.)
+
         # module <name>  — "module name" alone on the logical line
-        if {[regexp {^module\s+([a-z_]\w*)\s*$} $lc -> mname]} {
+        if {[regexp -nocase {^module\s+([a-z_]\w*)\s*$} $lc -> mname]} {
             lappend provides($fname) $mname
             continue
         }
 
         # submodule (<parent>[:<ancestor>]) <name>
-        if {[regexp {^submodule\s*\(\s*([a-z_]\w*)} $lc -> parent]} {
+        if {[regexp -nocase {^submodule\s*\(\s*([a-z_]\w*)} $lc -> parent]} {
             if {$parent ni $parents($fname)} {
                 lappend parents($fname) $parent
             }
             continue
         }
 
-        # use <name>[, ...]
-        if {[regexp {^use\s+([a-z_]\w*)} $lc -> mname]} {
+        # use [::] <name>[, ...]   — plain, or with the optional "::" separator
+        # ("use :: geom2d"). The "::" form matched NEITHER this nor the comma rule
+        # below, so its dependency was silently dropped and the build could compile a
+        # user before its module's .mod existed.
+        if {[regexp -nocase {^use\s+(?:::\s*)?([a-z_]\w*)} $lc -> mname]} {
             if {$mname ni $uses($fname)} { lappend uses($fname) $mname }
             continue
         }
 
-        # use, <attribute> :: <name>[, ...]  (e.g. "use, intrinsic :: iso_fortran_env")
-        if {[regexp {^use\s*,\s*[a-z_]\w*\s*::\s*([a-z_]\w*)} $lc -> mname]} {
-            if {$mname ni $uses($fname)} { lappend uses($fname) $mname }
+        # use, <attribute> :: <name>[, ...]  — an "intrinsic" module is compiler-
+        # provided (no .mod to build), so it is NOT a build dependency and is skipped;
+        # a "non_intrinsic" attribute names a real local module, so it is recorded.
+        if {[regexp -nocase {^use\s*,\s*([a-z_]\w*)\s*::\s*([a-z_]\w*)} $lc -> attr mname]} {
+            if {$attr ne "intrinsic" && $mname ni $uses($fname)} { lappend uses($fname) $mname }
             continue
         }
 
         # program <name>
-        if {[regexp {^program\s+[a-z_]\w*} $lc]} {
+        if {[regexp -nocase {^program\s+[a-z_]\w*} $lc]} {
             set is_prog($fname) 1
             continue
         }

@@ -54,7 +54,7 @@ contains
 end module utest_btree_hook
 
 program utest_btree
-    use, intrinsic :: iso_fortran_env, only: int32, int64
+    use, intrinsic :: iso_fortran_env, only: int8, int32, int64
     use :: b_tree
     use :: utest_btree_cmp, only: icmp
     use :: utest_btree_hook
@@ -75,6 +75,8 @@ program utest_btree
     call t_meta_geometry()
     call t_journal_hook()
     call t_reload()
+    call t_page_bodies()
+    call t_page_size_vs_file()
 
     print '(a,i0,a,i0,a)', 'b_tree tests: ', pass, ' passed, ', fail, ' failed'
     if (fail > 0) error stop 1
@@ -530,6 +532,204 @@ contains
         call bt_reload(bt, st)
         call check(st == BT_ERR, 'reload: closed handle rejected')
         call fresh('utest_btree_10.bt')
+    end subroutine
+
+    ! The meta page was validated from the start; the leaf/internal pages under
+    ! it were not — nkeys and the child/next ids were transfer'd out and
+    ! trusted. One wrong int32 then drove a substring past the page buffer: a
+    ! read on lookup, and (via the shift that makes room in a full leaf) a WRITE
+    ! on insert, which in an optimised build is silent heap corruption. Each
+    ! case below pokes exactly one field of a body page through stream access,
+    ! the way t_meta_geometry pokes the meta page, and demands BT_CORRUPT
+    ! instead. See the on-disk invariant list at the head of b_tree_sm.
+    subroutine t_page_bodies()
+        integer, parameter :: PS = 4096          ! page size for key_len 4
+        type(btree_t)     :: bt
+        type(bt_cursor_t) :: cur
+        integer :: st, i
+        ! maxk for key_len 4 at page 4096: (page_size - key_len - 17) /
+        ! (key_len + 8). Spelled as a literal because the compilers warn on a
+        ! constant-folded integer division.
+        integer, parameter :: MK = 339
+        integer(int32) :: pay
+        character(len=4) :: kk
+        logical :: ok, found
+
+        ! A 600-entry tree: root + two leaves, so both a leaf and an internal
+        ! page exist to corrupt.
+        call fresh('utest_btree_11.bt')
+        call bt_open(bt, 'utest_btree_11.bt', 4, .true., .true., st)
+        do i = 1, 600
+            call bt_insert(bt, k4(int(i, int32)), int(i, int32), icmp, dummy, st)
+        end do
+        call bt_close(bt, st)
+        call check(st == BT_OK, 'body: 600-entry tree built')
+
+        ! --- nkeys ------------------------------------------------------
+        ! Just inside the bound must still work: the guard must not reject a
+        ! legitimately full node.
+        call poke_i32('utest_btree_11.bt', PS + 2, int(MK, int32))
+        call bt_open(bt, 'utest_btree_11.bt', 4, .false., .false., st)
+        call check(st == BT_OK, 'body: nkeys == maxk accepted')
+        call bt_seek(bt, k4(1_int32), icmp, dummy, cur, st)
+        call check(st == BT_OK, 'body: seek over a maxk-full leaf')
+        call bt_close(bt, st)
+
+        ! One past it cannot have been written by this library.
+        call poke_i32('utest_btree_11.bt', PS + 2, int(MK + 1, int32))
+        call bt_open(bt, 'utest_btree_11.bt', 4, .false., .false., st)
+        call bt_seek(bt, k4(1_int32), icmp, dummy, cur, st)
+        call check(st == BT_CORRUPT, 'body: nkeys past maxk rejected on seek')
+        call bt_close(bt, st)
+
+        ! The value that reached the out-of-bounds WRITE: 510 is in-page for
+        ! every read a lookup does, and one slot short for the shift that makes
+        ! room on insert, so before the fix only the write ran off the end.
+        ! Key 1 routes to this leaf (page 2 holds the low keys).
+        call poke_i32('utest_btree_11.bt', PS + 2, 510_int32)
+        call bt_open(bt, 'utest_btree_11.bt', 4, .true., .false., st)
+        call bt_insert(bt, k4(1_int32), 9001_int32, icmp, dummy, st)
+        call check(st == BT_CORRUPT, 'body: nkeys 510 rejected on insert (the OOB write)')
+        call bt_close(bt, st)
+
+        call poke_i32('utest_btree_11.bt', PS + 2, 100000_int32)
+        call bt_open(bt, 'utest_btree_11.bt', 4, .false., .false., st)
+        call bt_seek(bt, k4(1_int32), icmp, dummy, cur, st)
+        call check(st == BT_CORRUPT, 'body: absurd nkeys rejected')
+        call bt_close(bt, st)
+
+        call poke_i32('utest_btree_11.bt', PS + 2, -1_int32)
+        call bt_open(bt, 'utest_btree_11.bt', 4, .false., .false., st)
+        call bt_seek(bt, k4(1_int32), icmp, dummy, cur, st)
+        call check(st == BT_CORRUPT, 'body: negative nkeys rejected')
+        call bt_close(bt, st)
+        call poke_i32('utest_btree_11.bt', PS + 2, 294_int32)   ! restore
+
+        ! --- node kind --------------------------------------------------
+        call poke_i8('utest_btree_11.bt', PS + 1, 0_int8)
+        call bt_open(bt, 'utest_btree_11.bt', 4, .false., .false., st)
+        call bt_seek(bt, k4(1_int32), icmp, dummy, cur, st)
+        call check(st == BT_CORRUPT, 'body: node kind 0 rejected')
+        call bt_close(bt, st)
+
+        call poke_i8('utest_btree_11.bt', PS + 1, 99_int8)
+        call bt_open(bt, 'utest_btree_11.bt', 4, .false., .false., st)
+        call bt_seek(bt, k4(1_int32), icmp, dummy, cur, st)
+        call check(st == BT_CORRUPT, 'body: unknown node kind rejected')
+        call bt_close(bt, st)
+        call poke_i8('utest_btree_11.bt', PS + 1, 1_int8)       ! restore K_LEAF
+
+        ! --- leaf chain -------------------------------------------------
+        ! A leaf whose next-id points at itself used to make the cursor yield
+        ! entries forever: every bt_next call returned normally, so the CALLER
+        ! (db_verify) never terminated. The ceiling has to live in the cursor.
+        call poke_i32('utest_btree_11.bt', PS + 6, 2_int32)     ! page 2 -> page 2
+        call bt_open(bt, 'utest_btree_11.bt', 4, .false., .false., st)
+        call bt_first(bt, cur, st)
+        drain: do i = 1, 100000
+            call bt_next(bt, cur, kk, pay, ok, st)
+            if (.not. ok .or. st /= BT_OK) exit drain
+        end do drain
+        call check(st == BT_CORRUPT, 'body: self-referential leaf chain terminates')
+        call bt_close(bt, st)
+
+        call poke_i32('utest_btree_11.bt', PS + 6, 99999_int32)
+        call bt_open(bt, 'utest_btree_11.bt', 4, .false., .false., st)
+        call bt_seek(bt, k4(1_int32), icmp, dummy, cur, st)
+        call check(st == BT_CORRUPT, 'body: leaf next id past npages rejected')
+        call bt_close(bt, st)
+        call poke_i32('utest_btree_11.bt', PS + 6, 3_int32)     ! restore
+
+        ! --- child ids --------------------------------------------------
+        ! Root is page 4 (two leaves plus the meta page); its first child slot
+        ! sits at page byte 6.
+        call poke_i32('utest_btree_11.bt', 3 * PS + 6, 1_int32)  ! the meta page
+        call bt_open(bt, 'utest_btree_11.bt', 4, .false., .false., st)
+        call bt_seek(bt, k4(1_int32), icmp, dummy, cur, st)
+        call check(st == BT_CORRUPT, 'body: child id 1 (meta page) rejected')
+        call bt_close(bt, st)
+
+        call poke_i32('utest_btree_11.bt', 3 * PS + 6, 4_int32)  ! the root itself
+        call bt_open(bt, 'utest_btree_11.bt', 4, .false., .false., st)
+        call bt_seek(bt, k4(1_int32), icmp, dummy, cur, st)
+        call check(st == BT_CORRUPT, 'body: child cycling back to the root terminates')
+        call bt_close(bt, st)
+
+        call poke_i32('utest_btree_11.bt', 3 * PS + 6, 12345_int32)
+        call bt_open(bt, 'utest_btree_11.bt', 4, .false., .false., st)
+        call bt_remove(bt, k4(1_int32), 1_int32, icmp, dummy, found, st)
+        call check(st == BT_CORRUPT, 'body: child id past npages rejected on remove')
+        call bt_close(bt, st)
+
+        call fresh('utest_btree_11.bt')
+    end subroutine
+
+    ! The stored page_size becomes the direct-access recl, so a value that does
+    ! not divide the file leaves every page read straddling two real pages —
+    ! nkeys and the pointers then come back from the middle of key data. The
+    ! geometry check passes it (4095 and 4097 both clear page_size >= 64 with
+    ! maxk >= 32), so the file length is what catches it.
+    subroutine t_page_size_vs_file()
+        type(btree_t) :: bt
+        integer :: st, i
+        call fresh('utest_btree_12.bt')
+        call bt_open(bt, 'utest_btree_12.bt', 4, .true., .true., st)
+        do i = 1, 600
+            call bt_insert(bt, k4(int(i, int32)), int(i, int32), icmp, dummy, st)
+        end do
+        call bt_close(bt, st)
+
+        call poke_i32('utest_btree_12.bt', 13, 4097_int32)
+        call bt_open(bt, 'utest_btree_12.bt', 4, .false., .false., st)
+        call check(st == BT_CORRUPT, 'psize: page_size 4097 rejected (file length)')
+
+        call poke_i32('utest_btree_12.bt', 13, 4095_int32)
+        call bt_open(bt, 'utest_btree_12.bt', 4, .false., .false., st)
+        call check(st == BT_CORRUPT, 'psize: page_size 4095 rejected (file length)')
+
+        call poke_i32('utest_btree_12.bt', 13, 4096_int32)
+        call bt_open(bt, 'utest_btree_12.bt', 4, .false., .false., st)
+        call check(st == BT_OK, 'psize: correct page_size still accepted')
+        call bt_close(bt, st)
+
+        ! npages inconsistent with the file is the same defect from the other side.
+        call poke_i32('utest_btree_12.bt', 29, 9_int32)
+        call bt_open(bt, 'utest_btree_12.bt', 4, .false., .false., st)
+        call check(st == BT_CORRUPT, 'psize: npages disagreeing with the file rejected')
+
+        call fresh('utest_btree_12.bt')
+    end subroutine
+
+    ! Overwrite one int32 / int8 at a 1-based byte position, using the same
+    ! native transfer the library reads with (so the test holds on either
+    ! byte order) — the poke t_endianness and t_meta_geometry do inline,
+    ! shared here because the body-page tests need a great many of them.
+    subroutine poke_i32(path, pos, v)
+        character(len=*), intent(in) :: path
+        integer,          intent(in) :: pos
+        integer(int32),   intent(in) :: v
+        character(len=4) :: b
+        integer :: u, ios
+        b = transfer(v, b)
+        open(newunit=u, file=path, access='stream', form='unformatted', &
+             status='old', action='write', iostat=ios)
+        if (ios /= 0) return
+        write(u, pos=pos) b
+        close(u)
+    end subroutine
+
+    subroutine poke_i8(path, pos, v)
+        character(len=*), intent(in) :: path
+        integer,          intent(in) :: pos
+        integer(int8),    intent(in) :: v
+        character(len=1) :: b
+        integer :: u, ios
+        b = transfer(v, b)
+        open(newunit=u, file=path, access='stream', form='unformatted', &
+             status='old', action='write', iostat=ios)
+        if (ios /= 0) return
+        write(u, pos=pos) b
+        close(u)
     end subroutine
 
 end program utest_btree

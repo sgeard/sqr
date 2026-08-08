@@ -41,6 +41,10 @@ submodule (sqr:sqr_base) sqr_journal
     integer,          parameter :: UNDO_EXTEND = 2        ! original length captured
     integer(int64),   parameter :: JHEADER     = 64_int64 ! reserved header size
     integer(int64),   parameter :: JPRESIZE    = 131072_int64  ! 128 KiB pre-allocation
+    ! Smallest a serialised undo record can be: kind(4) + pathlen(4) +
+    ! orig_len(8) + offset(8) + length(8) + byteslen(8), with an empty path and
+    ! no bytes. The header's record count is bounded by payload_len / this.
+    integer,          parameter :: MIN_REC     = 40
 
 contains
 
@@ -425,7 +429,7 @@ contains
         character(len=:), allocatable :: payload
         character(len=4) :: magic
         integer          :: u, ios, fmt, state, nrec, cksum, i, st
-        integer(int64)   :: plen
+        integer(int64)   :: plen, fsize
         st = SQR_OK
         if (.not. allocated(db%jrnl%path)) &
             db%jrnl%path = pathjoin(db%dir, '_journal.dat')
@@ -440,6 +444,7 @@ contains
             return
         end if
         read(u, pos=1, iostat=ios) magic, fmt, state, nrec, cksum, plen
+        inquire(unit=u, size=fsize)
         if (ios /= 0 .or. magic /= JMAGIC .or. fmt /= JFMT &
                      .or. state /= JSTATE_HOT) then
             close(u)                       ! absent/void/foreign -> nothing to do
@@ -450,7 +455,12 @@ contains
         ! checksum, int(plen) would truncate a >2 GiB value, and a corrupt huge
         ! plen must not abort db_open inside the allocate.  An implausible or
         ! unallocatable length means the header is corrupt -> void and move on.
-        if (plen < 0_int64 .or. plen > int(huge(0), int64)) then
+        ! The file's own size is the tightest bound available: a journal
+        ! claiming more payload than it holds is corrupt however plausible the
+        ! number looks, and checking it here keeps a plen of huge(int32) — which
+        ! clears the int32 ceiling — from reaching a 2 GiB allocate.
+        if (plen < 0_int64 .or. plen > int(huge(0), int64) .or. &
+            plen > fsize - JHEADER) then
             close(u)
             call void_header(db, st)
             if (present(stat)) stat = st
@@ -467,13 +477,32 @@ contains
         close(u)
         ! A torn or mismatched payload means arming never completed, so no base
         ! file was touched: discard the journal rather than replay garbage.
-        if (ios /= 0 .or. checksum(payload) /= cksum) then
+        ! Nested rather than `ios /= 0 .or. checksum(...) /= cksum`: .or. does
+        ! not short-circuit, so the one-line form folds a whole uninitialised
+        ! buffer whenever the read failed.
+        if (ios /= 0) then
+            call void_header(db, st)
+            if (present(stat)) stat = st
+            return
+        end if
+        if (checksum(payload) /= cksum) then
             call void_header(db, st)
             if (present(stat)) stat = st
             return
         end if
         call deserialise(payload, nrec, recs, ios)
         if (ios /= 0) then
+            call void_header(db, st)
+            if (present(stat)) stat = st
+            return
+        end if
+        ! Check the whole set before a single base file is touched: a replay
+        ! that aborts part-way leaves the database in a state neither the
+        ! transaction nor its undo describes.  A set this library never wrote
+        ! is not a repair record at all, so void it rather than apply the
+        ! prefix that happens to parse — unlike the transient I/O failure
+        ! below, this cannot come right on a retry.
+        if (.not. recs_sane(recs, nrec)) then
             call void_header(db, st)
             if (present(stat)) stat = st
             return
@@ -768,6 +797,18 @@ contains
     ! ---- private helpers ----
 
     ! Restore one undo record onto its base file and fsync it.
+    !
+    ! An undo restores bytes the file already held, so it must never make one
+    ! longer.  That is not just a safety rail.  A region captured for a page
+    ! whose extending write was still buffered when the crash hit legitimately
+    ! sits beyond the file's on-disk end, and the EXTEND record replayed after
+    ! it (capture runs forward, replay runs in reverse) truncates that area
+    ! away regardless — so the part of a region past EOF has nothing to
+    ! restore and is dropped, and a truncate that would grow the file is
+    ! skipped.  Without this a doctored offset punches a sparse hole gigabytes
+    ! into a base file.  apply_rollback flushes the base files and index trees
+    ! before it replays, so on the live path the clamp never has anything to
+    ! trim.
     subroutine apply_undo(db, r, st)
         class(db_t),      intent(in)    :: db
         type(undo_rec_t), intent(in)    :: r
@@ -777,13 +818,18 @@ contains
         full = pathjoin(db%dir, r%path)
         select case (r%kind)
         case (UNDO_REGION)
-            call write_region(full, r%offset, r%bytes, ios)
+            call restore_region(full, r%offset, r%bytes, ios)
             call io_check(ios)
             if (ios /= 0) st = SQR_ERR
         case (UNDO_EXTEND)
-            ios = c_truncate(full, r%orig_len)
-            call io_check(ios)
-            if (ios /= 0) st = SQR_ERR
+            ! An extend undo shrinks; c_truncate would grow just as readily.
+            ! A missing file gives file_len -1, so this skips and the fsync
+            ! below reports it.
+            if (r%orig_len <= file_len(full)) then
+                ios = c_truncate(full, r%orig_len)
+                call io_check(ios)
+                if (ios /= 0) st = SQR_ERR
+            end if
         end select
         ios = c_fsync_path(full)
         call io_check(ios)
@@ -956,6 +1002,54 @@ contains
         call hslot_insert(j, j%nrec)
     end subroutine
 
+    ! Structural sanity of a decoded undo set.  deserialise bounds the lengths
+    ! it needs to parse the payload safely; this checks what those fields
+    ! *mean*, once, before any of them reaches a base file:
+    !
+    !   * kind is one of the two this library writes
+    !   * a region starts at or after byte 1 and carries exactly the bytes its
+    !     length claims (both operands are already bounded, so the offset +
+    !     length test below cannot wrap)
+    !   * a captured file length is a real length
+    !
+    ! Deliberately no bound against the target file's current size — that is
+    ! apply_undo's business, and a legitimate region can sit past a crashed
+    ! file's end (see the note there).
+    pure logical function recs_sane(recs, nrec) result(ok)
+        type(undo_rec_t), intent(in) :: recs(:)
+        integer,          intent(in) :: nrec
+        integer :: i
+        ok = .false.
+        if (nrec < 0 .or. nrec > size(recs)) return
+        recs_loop: do i = 1, nrec
+            associate (r => recs(i))
+                if (r%kind /= UNDO_REGION .and. r%kind /= UNDO_EXTEND) return
+                if (.not. sane_relpath(r%path)) return
+                if (r%orig_len < 0_int64) return
+                if (r%kind == UNDO_REGION) then
+                    if (r%offset < 1_int64) return
+                    if (r%length /= int(len(r%bytes), int64)) return
+                    if (r%offset > huge(0_int64) - r%length) return
+                end if
+            end associate
+        end do recs_loop
+        ok = .true.
+    end function
+
+    ! A journal path names one file directly inside the database directory:
+    ! every relative path the engine forms is flat (`<t>.dat`, `<t>.blob`,
+    ! `<t>__i<n>.idx`), so a separator, a leading dot or an embedded NUL can
+    ! only have come from a doctored journal.
+    pure logical function sane_relpath(p) result(ok)
+        character(len=*), intent(in) :: p
+        ok = .false.
+        if (len(p) == 0) return
+        if (scan(p, '/\') /= 0) return          ! no directory component
+        if (p(1:1) == '.') return               ! no '.', '..', hidden names
+        if (scan(p, char(0)) /= 0) return       ! no truncation at a NUL
+        ok = .true.
+    end function
+
     ! Serialised byte length of one record: the fixed 40-byte header
     ! (kind + pathlen + orig_len + offset + length + byteslen) plus path + bytes.
     pure integer(int64) function rec_serial_len(r) result(n)
@@ -1006,29 +1100,51 @@ contains
         end do
     end subroutine
 
-    ! Parse nrec records back out of a payload buffer.
+    ! Parse nrec records back out of a payload buffer.  Both the count and
+    ! every length inside come off the disk untrusted, so each is bounded
+    ! against what is actually LEFT in the buffer (len(buf) - p + 1) rather
+    ! than by adding it to the cursor: the old `p + pathlen - 1 > len(buf)`
+    ! form overflows to a negative value for a pathlen near huge(int32),
+    ! passes, and then cuts the next field at a negative index.  Written this
+    ! way, no guard here can wrap.
     subroutine deserialise(buf, nrec, recs, ios)
         character(len=*),              intent(in)  :: buf
         integer,                       intent(in)  :: nrec
         type(undo_rec_t), allocatable, intent(out) :: recs(:)
         integer,                       intent(out) :: ios
-        integer        :: i, p, pathlen
+        integer        :: i, p, pathlen, ast
         integer(int64) :: blen
         ios = 0
-        allocate(recs(nrec))
+        ! A record is at least MIN_REC bytes on the wire, so a count implying
+        ! more than the payload can hold is corrupt — this bounds the allocate
+        ! by the data itself, with no arbitrary ceiling.
+        if (nrec < 0 .or. nrec > len(buf) / MIN_REC) then
+            ios = 1
+            allocate(recs(0))
+            return
+        end if
+        allocate(recs(nrec), stat=ast)
+        if (ast /= 0) then
+            ios = 1
+            allocate(recs(0))
+            return
+        end if
         p = 1
         do i = 1, nrec
-            if (p + 7 > len(buf)) then; ios = 1; return; end if
+            if (len(buf) - p + 1 < 8) then; ios = 1; return; end if
             recs(i)%kind = b32(buf(p:p+3));     p = p + 4
             pathlen      = b32(buf(p:p+3));      p = p + 4
-            if (pathlen < 0 .or. p + pathlen - 1 > len(buf)) then; ios = 1; return; end if
+            if (pathlen < 0 .or. pathlen > len(buf) - p + 1) then; ios = 1; return; end if
             recs(i)%path = buf(p:p+pathlen-1);   p = p + pathlen
-            if (p + 23 > len(buf)) then; ios = 1; return; end if
+            if (len(buf) - p + 1 < 32) then; ios = 1; return; end if
             recs(i)%orig_len = b64(buf(p:p+7));  p = p + 8
             recs(i)%offset   = b64(buf(p:p+7));  p = p + 8
             recs(i)%length   = b64(buf(p:p+7));  p = p + 8
             blen             = b64(buf(p:p+7));  p = p + 8
-            if (blen < 0 .or. p + blen - 1 > len(buf)) then; ios = 1; return; end if
+            if (blen < 0_int64 .or. blen > int(len(buf) - p + 1, int64)) then
+                ios = 1
+                return
+            end if
             if (blen > 0) then
                 recs(i)%bytes = buf(p:p+int(blen)-1); p = p + int(blen)
             else
@@ -1076,17 +1192,56 @@ contains
         if (ios /= 0) n = -1_int64
     end function
 
+    ! Read `length` bytes at `offset`.  The length can be derived from on-disk
+    ! metadata (a history delta spans whatever the schema's counters imply), so
+    ! it is bounded before `int()` sees it: an int64 beyond the int32 range
+    ! truncates, and a negative result then reaches the allocate as a wild
+    ! size.  An unallocatable length is reported, never fatal.
     subroutine read_region(path, offset, length, bytes, ios)
         character(len=*),              intent(in)  :: path
         integer(int64),                intent(in)  :: offset, length
         character(len=:), allocatable, intent(out) :: bytes
         integer,                       intent(out) :: ios
         integer :: u
-        allocate(character(len=int(length)) :: bytes)
+        if (length < 0_int64 .or. length > int(huge(0), int64)) then
+            bytes = ''
+            ios   = 1
+            return
+        end if
+        allocate(character(len=int(length)) :: bytes, stat=ios)
+        if (ios /= 0) then
+            bytes = ''
+            ios   = 1
+            return
+        end if
         open(newunit=u, file=path, access='stream', form='unformatted', &
              status='old', action='read', iostat=ios)
         if (ios /= 0) return
         read(u, pos=offset, iostat=ios) bytes
+        close(u)
+    end subroutine
+
+    ! write_region for the undo path: the part of the region beyond the file's
+    ! end is dropped (see apply_undo).  The size is taken from the same unit
+    ! that performs the write, so nothing can change it in between — and it
+    ! costs no extra open, which matters because rollback runs this per
+    ! captured record.
+    subroutine restore_region(path, offset, bytes, ios)
+        character(len=*), intent(in)  :: path
+        integer(int64),   intent(in)  :: offset
+        character(len=*), intent(in)  :: bytes
+        integer,          intent(out) :: ios
+        integer        :: u
+        integer(int64) :: cursize, span
+        open(newunit=u, file=path, access='stream', form='unformatted', &
+             status='old', action='readwrite', iostat=ios)
+        if (ios /= 0) return
+        inquire(unit=u, size=cursize)
+        span = min(int(len(bytes), int64), cursize - offset + 1_int64)
+        if (span > 0_int64) then
+            write(u, pos=offset, iostat=ios) bytes(1:int(span))
+            if (ios == 0) flush(u, iostat=ios)
+        end if
         close(u)
     end subroutine
 

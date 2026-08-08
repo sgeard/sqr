@@ -11,10 +11,13 @@ submodule (sqr:sqr_base) sqr_rowbuf
     implicit none
 contains
 
+    ! max(0, n): repeat's ncopies must be non-negative, so a negative size
+    ! (an arithmetic slip in the caller) would otherwise be a runtime abort
+    ! rather than the empty buffer that plainly cannot hold a row.
     pure module subroutine row_alloc(buf, n)
         character(len=:), allocatable, intent(out) :: buf
         integer,                       intent(in)  :: n
-        buf = repeat(char(0), n)
+        buf = repeat(char(0), max(0, n))
     end subroutine
 
     pure module subroutine row_clear(buf)

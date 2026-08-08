@@ -328,14 +328,18 @@ contains
             allocate(character(len=ix%key_size) :: ckey, rkey)
             call bt_first(ix%bt, cur, bs)
             if (bs /= BT_OK) then
-                rs = SQR_ERR; detail = 'cannot read index'
+                rs = sqr_of_bt(bs); detail = idx_detail(bs)
                 return
             end if
             matched = 0
             walk: do
+                ! A cyclic leaf chain used to make this walk run forever: every
+                ! bt_next returned an entry, so the corruption showed up as a
+                ! hang in the very routine a user runs to detect corruption.
+                ! The cursor now counts its leaf hops and reports instead.
                 call bt_next(ix%bt, cur, ckey, rid, ok, bs)
                 if (bs /= BT_OK) then
-                    rs = SQR_ERR; detail = 'cannot read index'
+                    rs = sqr_of_bt(bs); detail = idx_detail(bs)
                     return
                 end if
                 if (.not. ok) exit walk
@@ -371,5 +375,18 @@ contains
             end if
         end associate
     end subroutine
+
+    ! db_verify's wording for a failed index read: BT_CORRUPT means the tree's
+    ! own bytes are wrong (a bad page header, a pointer out of range, a leaf
+    ! chain that cycles), which is a different report from a filesystem error.
+    pure function idx_detail(bs) result(d)
+        integer, intent(in) :: bs
+        character(len=:), allocatable :: d
+        if (bs == BT_CORRUPT) then
+            d = 'corrupt index structure'
+        else
+            d = 'cannot read index'
+        end if
+    end function
 
 end submodule sqr_admin

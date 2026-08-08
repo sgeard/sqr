@@ -1,4 +1,4 @@
-.PHONY: all clean veryclean distclean utest sqlttest faulttest run-faulttest proctest bench run-bench coverage coverage-gcov coverage-clean docs docs-clean help windows win-build sqrsh-regex test-regex
+.PHONY: all clean veryclean distclean utest sqlttest faulttest run-faulttest proctest bench run-bench destruct run-destruct coverage coverage-gcov coverage-clean docs docs-clean help windows win-build sqrsh-regex test-regex
 .SUFFIXES:
 .DEFAULT_GOAL := all
 
@@ -9,6 +9,7 @@ TEST_DIR  := test
 REGEX_DIR := regex
 FAULT_DIR := fault
 BENCH_DIR := bench
+DESTRUCT_DIR := destruct
 
 # Fault-injection variant (sqr_fault submodule). off = production
 # (zero machinery, shared with fpm); on = coverage/fault test only.
@@ -35,6 +36,14 @@ $(OPTIONS_FNAME): generate_fopts.tcl
 F_OPTS := $(F_BASE) $(F_BUILD) $(MOD_OPTS) -I$(SRC_DIR)
 LFLAGS := $(F_LOPTS)
 
+# C shim (osshim.c) — the OS/platform split lives in C, where the C
+# preprocessor reliably predefines _WIN32. A plain C compiler suffices and its
+# objects are ABI-compatible with every Fortran compiler offered here.
+CC     ?= cc
+# -D_FILE_OFFSET_BITS=64: a 64-bit off_t on 32-bit glibc targets, so
+# sqr_os_truncate's int64 length survives the cast (no-op on 64-bit hosts).
+CFLAGS ?= -O2 -Wall -Wextra -D_FILE_OFFSET_BITS=64
+
 # --- Sources ---
 # Core (all in $(SRC_DIR), fpm-shared). The fault module interface and the
 # production (off) submodule live here too, so fpm builds a zero-machinery
@@ -55,14 +64,6 @@ else
   FAULT_SM_SRC := $(SRC_DIR)/sqr_fault_off_sm.f90
 endif
 FAULT_SM_OBJ := $(ODIR)/sqr_fault_$(FAULT)_sm.o
-
-# C shim (osshim.c) — the OS/platform split lives in C, where the C
-# preprocessor reliably predefines _WIN32. A plain C compiler suffices and its
-# objects are ABI-compatible with every Fortran compiler offered here.
-CC     ?= cc
-# -D_FILE_OFFSET_BITS=64: a 64-bit off_t on 32-bit glibc targets, so
-# sqr_os_truncate's int64 length survives the cast (no-op on 64-bit hosts).
-CFLAGS ?= -O2 -Wall -Wextra -D_FILE_OFFSET_BITS=64
 
 # The platform shim is C; everything else is Fortran.
 LIB_C_SRC := osshim.c
@@ -195,6 +196,13 @@ $(ODIR)/cmdgraph.o $(ODIR)/cmdgraph.mod &: $(SRC_DIR)/cmdgraph.f90 $(ODIR)/dlist
 $(ODIR)/cmdgraph_sm.o: $(SRC_DIR)/cmdgraph_sm.f90 $(ODIR)/cmdgraph.mod | $(ODIR)
 	$(F) -c $(F_OPTS) -o $@ $<
 
+# Progress feedback for long loops. Depends on nothing but iso_fortran_env,
+# and nothing in the library depends on it — it lives in $(BENCH_DIR) with its
+# only consumer, so it is neither archived into libsqr nor globbed by fpm.
+$(ODIR)/fb_monitor.o $(ODIR)/fb_monitor.mod &: $(BENCH_DIR)/fb_monitor.f90 | $(ODIR)
+	$(F) -c $(F_OPTS) -o $(ODIR)/fb_monitor.o $<
+	@touch $(ODIR)/fb_monitor.mod
+
 # Library archive. Rebuilt from scratch (not `ar r` onto a stale archive):
 # the FAULT=off and FAULT=on fault submodules have distinct object names, so
 # adding to an existing archive could leave BOTH in it and let the linker
@@ -291,14 +299,58 @@ proctest: $(PROC_TEST_BIN)
 # Performance benchmark. Always the production (FAULT=off) library and
 # the default optimised build — never debug — so timings are
 # representative. Recursive make pins F through unchanged.
-$(BENCH_BIN): $(BENCH_SRC) $(LIB) | $(ODIR)
-	$(F) $(F_OPTS) -o $@ $< $(LIB) $(LFLAGS)
+$(BENCH_BIN): $(BENCH_SRC) $(ODIR)/fb_monitor.o $(LIB) | $(ODIR)
+	$(F) $(F_OPTS) -o $@ $< $(ODIR)/fb_monitor.o $(LIB) $(LFLAGS)
 
 bench:
 	$(MAKE) F=$(F) run-bench
 
 run-bench: $(BENCH_BIN)
 	@echo "==> $(BENCH_BIN)" && $(BENCH_BIN)
+
+# Destruction testing: deliberate bad DATA, where faulttest injects bad I/O.
+# Three corpora (on-disk corruption, .sqr container, SQL text) replay a few
+# thousand malformed inputs through the public API and assert the engine
+# always comes back with a status rather than crashing, hanging or running
+# off a buffer. Debug build (-check all) so an out-of-bounds access is a
+# diagnostic instead of silent; see destruct/README.md.
+DESTRUCT_BINS := $(addprefix $(ODIR)/,mkdb$(EXT) hammer$(EXT) unpack_probe$(EXT) apiabuse$(EXT))
+DESTRUCT_RUN  := $(ODIR)/destruct-run
+# Seeds the blind-mutation sections of all three corpora.  The default keeps
+# `make destruct` a reproducible regression run; override it
+# (make destruct DESTRUCT_SEED=n) to reach cases the default never generates.
+DESTRUCT_SEED ?= 20260806
+
+$(ODIR)/mkdb$(EXT) $(ODIR)/hammer$(EXT) $(ODIR)/unpack_probe$(EXT) $(ODIR)/apiabuse$(EXT): \
+  $(ODIR)/%$(EXT): $(DESTRUCT_DIR)/%.f90 $(LIB) | $(ODIR)
+	$(F) $(F_OPTS) -o $@ $< $(LIB) $(LFLAGS)
+
+destruct:
+	$(MAKE) F=$(F) debug=1 run-destruct
+
+# The drivers work in the CWD, so they run inside a scratch directory and are
+# handed absolute paths to the binaries they drive.
+run-destruct: $(DESTRUCT_BINS) $(ODIR)/sqlsh$(EXT)
+	@rm -rf $(DESTRUCT_RUN) && mkdir -p $(DESTRUCT_RUN)
+	@cd $(DESTRUCT_RUN) && \
+	  R=$(CURDIR) && B=$$R/$(ODIR) && \
+	  export DESTRUCT_SEED=$(DESTRUCT_SEED) && \
+	  echo "seed $$DESTRUCT_SEED" && \
+	  $$B/mkdb$(EXT) pristine && \
+	  echo "==> on-disk corruption" && \
+	  HAMMER=$$B/hammer$(EXT) tclsh $$R/$(DESTRUCT_DIR)/corrupt.tcl pristine && \
+	  rm -rf work work.pack work.unpacked && cp -a pristine work && \
+	  $$B/hammer$(EXT) work > /dev/null && cp work.pack pristine.sqr && \
+	  echo "==> .sqr container" && \
+	  PROBE=$$B/unpack_probe$(EXT) tclsh $$R/$(DESTRUCT_DIR)/corrupt_pack.tcl pristine.sqr && \
+	  echo "==> SQL text" && \
+	  tclsh $$R/$(DESTRUCT_DIR)/sqlfuzz.tcl $$B/sqlsh$(EXT) pristine && \
+	  echo "==> API arguments" && \
+	  for k in 1 2 3 4 5 6 7 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37; do \
+	      rm -rf wa && cp -a pristine wa && \
+	      $$B/apiabuse$(EXT) wa $$k > /dev/null 2>&1 || echo "   api case $$k did not return"; \
+	  done
+	@echo "destruct: corpora complete (see $(DESTRUCT_RUN) for any findings)"
 
 coverage: coverage-gcov
 
@@ -326,7 +378,7 @@ docs-clean:
 	@rm -vfr $(DOCS_DIR)
 
 clean:
-	@rm -vf $(ODIR)/*.o $(ODIR)/*.mod $(ODIR)/*.smod $(LIB) $(TEST_BIN) $(FAULT_TEST_BIN) $(PROC_TEST_BIN) $(PROC_SHIM_OBJ) $(BENCH_BIN) $(APP_BIN) depends.mk $(OPTIONS_FNAME) *~ *.mod *.smod
+	@rm -vf $(ODIR)/*.o $(ODIR)/*.mod $(ODIR)/*.smod $(LIB) $(TEST_BIN) $(FAULT_TEST_BIN) $(PROC_TEST_BIN) $(PROC_SHIM_OBJ) $(BENCH_BIN) $(DESTRUCT_BINS) $(APP_BIN) depends.mk $(OPTIONS_FNAME) *~ *.mod *.smod
 
 veryclean: clean
 	@rm -vfr obj_* *.gcov
@@ -381,7 +433,7 @@ windows:
 	@for t in $(WIN_TESTS); do echo "    $(WIN_ODIR)/$$t.exe"; done
 
 help:
-	@echo "Targets : all, utest, sqlttest, faulttest, bench, clean, veryclean, distclean"
+	@echo "Targets : all, utest, sqlttest, faulttest, destruct, bench, clean, veryclean, distclean"
 	@echo "          coverage, coverage-gcov, coverage-clean, docs, docs-clean, windows"
 	@echo "          sqrsh-regex, test-regex (opt-in DT_CHAR regex search via tcl_re)"
 	@echo "Options : F=gfortran|ifx|lfortran|flang (default ifx)  debug=1  valgrind=1 (ifx: AVX2 cap)"

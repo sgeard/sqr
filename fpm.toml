@@ -1,6 +1,6 @@
 name = "sqr"
-version = "1.1.1"
-license = "MIT"
+version = "1.1.2"
+license = "license"
 author = "sgeard"
 maintainer = "geardsj@gmail.com"
 copyright = "Copyright 2026, sgeard"
@@ -28,6 +28,5 @@ copyright = "Copyright 2026, sgeard"
 [preprocess.cpp]
    suffixes = [".f90", ".F90"]
 
-# The cmdgraph engine (driving sqrsh) is vendored into src/ from
-# github.com/sgeard/cmdgraph, so there is no external dependency to resolve —
-# a fresh clone builds with `fpm test` / `fpm run sqrsh` out of the box.
+[dependencies]
+cmdgraph_f.path = "../cmdgraph/fortran"

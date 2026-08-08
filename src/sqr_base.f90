@@ -48,7 +48,8 @@ submodule (sqr) sqr_base
     use :: sqr_fault, only: io_check
     use :: b_tree, only: btree_t, bt_open, bt_close, bt_reload, bt_sync, bt_insert, &
                          bt_remove, bt_bulk_load, bt_seek, bt_first, bt_next, &
-                         bt_cursor_t, bt_set_journal_hook, BT_OK, BT_VERSION
+                         bt_cursor_t, bt_set_journal_hook, BT_OK, BT_VERSION, &
+                         BT_CORRUPT
     implicit none
 
     ! (kc_ctx_t, the opaque comparator context threaded through the
@@ -933,26 +934,35 @@ contains
         ! it safe now.
         if (mode == 'old') then
             inquire(unit=u, size=fsize)
-            if (fsize > 0) then
-                ! Compute in int64: a file implying more records than the
-                ! int32 id space can address is clamped — the rows beyond
-                ! huge(int32)-1 are unreachable and the insert guard then
-                ! refuses new rows with SQR_FULL.
-                recovered = int(min(fsize / int(tbl%record_size, int64) + 1_int64, &
-                                    int(huge(0_int32), int64)), int32)
-                if (recovered > tbl%next_id) then
-                    ! A crash left both counters stale together. Having moved
-                    ! next_id to the true high-water, recount the live rows so
-                    ! the schema's live_count is not carried forward wrong: it
-                    ! is public state, shown by the shell, written back by
-                    ! db_close, and the baseline for later insert/delete.
-                    tbl%next_id = recovered
-                    call recount_live(u, tbl, ios)
-                    if (ios /= 0) then
-                        stat = SQR_ERR
-                        return
-                    end if
+            ! Compute in int64: a file implying more records than the
+            ! int32 id space can address is clamped — the rows beyond
+            ! huge(int32)-1 are unreachable and the insert guard then
+            ! refuses new rows with SQR_FULL.
+            recovered = int(min(fsize / int(tbl%record_size, int64) + 1_int64, &
+                                int(huge(0_int32), int64)), int32)
+            if (recovered > tbl%next_id) then
+                ! A crash left both counters stale together. Having moved
+                ! next_id to the true high-water, recount the live rows so
+                ! the schema's live_count is not carried forward wrong: it
+                ! is public state, shown by the shell, written back by
+                ! db_close, and the baseline for later insert/delete.
+                tbl%next_id = recovered
+                call recount_live(u, tbl, ios)
+                if (ios /= 0) then
+                    stat = SQR_ERR
+                    return
                 end if
+            else if (tbl%next_id > recovered) then
+                ! The mirror case, and corruption rather than staleness: the
+                ! file is the high-water mark, so a schema claiming ids beyond
+                ! it cannot have been written by this engine. Left unchecked, a
+                ! next_id of 1e9 makes the next insert extend the .dat file to
+                ! tens of GB and the history delta then sizes a read region
+                ! from the gap. read_schema bounds the other header counts by
+                ! SQR_MAX_RECORD; this one can only be bounded here, where the
+                ! file is open.
+                stat = SQR_INVALID
+                return
             end if
         end if
         stat = SQR_OK
@@ -987,7 +997,13 @@ contains
             s = SQR_OK
         case (BT_VERSION)
             s = SQR_VERSION
-        case default                 ! BT_ERR / BT_CORRUPT
+        case (BT_CORRUPT)
+            ! Corrupt on-disk metadata is exactly what SQR_INVALID names, and
+            ! keeping it distinct from SQR_ERR tells a caller whether the index
+            ! is damaged or the filesystem merely failed — the same split
+            ! read_schema and read_catalog already make.
+            s = SQR_INVALID
+        case default                 ! BT_ERR
             s = SQR_ERR
         end select
     end function
@@ -1519,13 +1535,13 @@ contains
                 call ensure_kc_ctx(t, ix)
                 call bt_seek(ix%bt, key, bt_key_cmp, ix%kc, cur, bs)
                 if (bs /= BT_OK) then
-                    stat = SQR_ERR
+                    stat = sqr_of_bt(bs)
                     return
                 end if
                 scan: do
                     call bt_next(ix%bt, cur, ckey, rid, ok, bs)
                     if (bs /= BT_OK) then
-                        stat = SQR_ERR
+                        stat = sqr_of_bt(bs)
                         return
                     end if
                     if (.not. ok) exit scan
@@ -1571,14 +1587,14 @@ contains
             allocate(character(len=t%record_size) :: rbuf)
             call bt_first(ix%bt, cur, bs)
             if (bs /= BT_OK) then
-                stat = SQR_ERR
+                stat = sqr_of_bt(bs)
                 return
             end if
             have_live = .false.
             pairs: do
                 call bt_next(ix%bt, cur, ckey, rid, ok, bs)
                 if (bs /= BT_OK) then
-                    stat = SQR_ERR
+                    stat = sqr_of_bt(bs)
                     return
                 end if
                 if (.not. ok) exit pairs

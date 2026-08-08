@@ -5,6 +5,10 @@
 !! via system_clock(int64); pseudo-random keys via a deterministic LCG so
 !! runs are reproducible and the indexed-insert path is exercised on
 !! unsorted keys (the case that was quadratic before the B+-tree).
+!!
+!! Progress feedback comes from fb_monitor (bench/fb_monitor.f90) — a
+!! standalone utility with no sqr dependency, kept here beside its only
+!! consumer rather than in the library.
 
 program bench_sqr
     use, intrinsic :: iso_fortran_env, only: int32, int64, real64, output_unit
@@ -13,6 +17,7 @@ program bench_sqr
     use clib_wrap, only: c_rmtree
     implicit none
 
+    
     type :: scan_ctx_t
         type(column_t) :: col
         integer(int32) :: target = 0
@@ -94,32 +99,40 @@ contains
 
     ! --- 1. Bulk insert, no index -------------------------------------
     subroutine bench_bulk_insert()
+        use iso_fortran_env, only: output_unit
+        use fb_monitor
+        
         type(db_t) :: db
         character(len=:), allocatable :: buf
         integer :: rs, i, ti
         integer(int32) :: rid
         integer(int64) :: t0, t1
         integer, parameter :: N = 16000
-
+        integer, parameter :: FB_RATE = 1000
         call cleanup()
-        call db_open(db, DBDIR, rs);                       call die('open', rs)
+        call db_open(db, DBDIR, rs);                         call die('open', rs)
         call db_create_table(db, 'noidx', bench_cols(), rs); call die('create', rs)
         ti = db_table_index(db, 'noidx')
         call row_alloc(buf, db%tables(ti)%record_size)
 
         call system_clock(t0)
-        do i = 1, N
-            call row_set_status(buf, ROW_ALIVE)
-            call row_set_int (buf, db%tables(ti)%cols(1), int(i, int32))
-            call row_set_int (buf, db%tables(ti)%cols(2), int(i, int32))
-            call row_set_char(buf, db%tables(ti)%cols(3), 'payload')
-            call db_insert(db, 'noidx', buf, rid, rs)
-            if (rs /= SQR_OK) call die('insert', rs)
-        end do
+        print '(a)', '-- 1. bulk insert, no index --'
+        block
+            type(fb_monitor_t) :: fb_monitor
+            call fb_monitor%create(N,FB_RATE)
+            do i = 1, N
+                call fb_monitor%update
+                call row_set_status(buf, ROW_ALIVE)
+                call row_set_int (buf, db%tables(ti)%cols(1), int(i, int32))
+                call row_set_int (buf, db%tables(ti)%cols(2), int(i, int32))
+                call row_set_char(buf, db%tables(ti)%cols(3), 'payload')
+                call db_insert(db, 'noidx', buf, rid, rs)
+                if (rs /= SQR_OK) call die('insert', rs)
+            end do
+        end block
         call system_clock(t1)
         call db_close(db)
 
-        print '(a)', '-- 1. bulk insert, no index --'
         call report_rate('insert (no index)', N, secs(t0, t1))
         print '(a)', ''
     end subroutine
@@ -157,7 +170,7 @@ contains
 
         ! (a) random-key insert with a live index
         call cleanup()
-        call db_open(db, DBDIR, rs);                            call die('open', rs)
+        call db_open(db, DBDIR, rs);                         call die('open', rs)
         call db_create_table(db, 't', bench_cols(), rs);     call die('create', rs)
         call db_create_index(db, 't', 'k', rs);              call die('index', rs)
         ti = db_table_index(db, 't')
@@ -177,7 +190,7 @@ contains
 
         ! (b) ascending-key insert with a live index (append at end)
         call cleanup()
-        call db_open(db, DBDIR, rs);                            call die('open', rs)
+        call db_open(db, DBDIR, rs);                         call die('open', rs)
         call db_create_table(db, 't', bench_cols(), rs);     call die('create', rs)
         call db_create_index(db, 't', 'k', rs);              call die('index', rs)
         ti = db_table_index(db, 't')
@@ -194,7 +207,7 @@ contains
 
         ! (c) no-index insert (pure data-file write baseline)
         call cleanup()
-        call db_open(db, DBDIR, rs);                            call die('open', rs)
+        call db_open(db, DBDIR, rs);                         call die('open', rs)
         call db_create_table(db, 't', bench_cols(), rs);     call die('create', rs)
         ti = db_table_index(db, 't')
         call system_clock(t4)
