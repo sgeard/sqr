@@ -291,6 +291,45 @@ against the bytes actually remaining rather than a sum that can overflow.
 
 ---
 
+## Why Fortran?
+
+Partly because it is the author's language of choice — but the fit is
+better than it might first appear. Three language features carry real
+architectural weight here:
+
+- **Direct-access files.** `open(..., access='direct', recl=...)` is
+  fixed-size record I/O, native to the language: one B+-tree page or one
+  table row is one record, read and written by number. The entire on-disk
+  layer is built on it — no `mmap`, no `pread` wrappers, no serialization
+  framework — which is why that layer is as small as it is.
+
+- **Allocatable components.** Rows, keys, blob buffers and per-cursor
+  scratch are `allocatable` — sized at run time, freed deterministically
+  when they go out of scope, never leaked and never manually released.
+  Memory management with neither a garbage collector nor a single
+  `free`: the test suites run valgrind-clean essentially by construction.
+
+- **Compiler discipline.** The standard's strictness about argument
+  intent, `pure` procedures and interface checking turns whole bug
+  classes into compile-time errors. The project builds warning-clean on
+  two compilers (ifx and gfortran), and the destruction harness runs
+  against a `-check all` build, so bounds and shape violations fail loudly
+  in test rather than silently in production.
+
+Honesty requires the debit column too:
+
+- `.and.` / `.or.` do **not** short-circuit; a guard and the expression it
+  guards must be separate `if` statements. (The sweep found exactly this
+  bug once: a checksum folding an uninitialised buffer.)
+- There are no unsigned integers, so bounds arithmetic on hostile values
+  near `huge(int32)` must be arranged never to overflow an intermediate —
+  fields are checked against the bytes *remaining*, not accumulated sums.
+- The standard has no notion of durability or file locking. `fsync`,
+  `flock`/`LockFileEx` and `chmod` live in a small C shim — the only
+  non-Fortran code in the store, confined to the OS-facing edge.
+
+---
+
 ## Documentation
 
 `make docs` generates the full FORD API reference into `ford_docs/`.
