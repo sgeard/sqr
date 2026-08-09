@@ -28,7 +28,11 @@
 !! A fixed magic + version is written into every `.schema` file; a
 !! mismatch on open returns `SQR_VERSION`.  Errors are reported via
 !! optional `stat`/`errmsg` out arguments — there is no `error stop` in
-!! library code.
+!! library code.  The handle additionally keeps sticky error state: every
+!! fallible operation records its outcome, so a caller that skipped `stat`
+!! can still ask `db_last_error` what the most recent call did and why
+!! (detail where the failure site recorded it, the canonical
+!! `sqr_errstr(code)` text otherwise).
 
 module sqr
     use, intrinsic :: iso_fortran_env, only: int8, int32, int64, real64
@@ -92,6 +96,10 @@ module sqr
     !! both to reject over-large schemas at create time and as a corruption
     !! guard when reading a schema back from disk.
     integer, parameter, public :: SQR_MAX_RECORD = 1024*1024
+
+    !! Capacity of the handle's sticky error-detail buffer (`db_last_error`);
+    !! longer messages are truncated.
+    integer, parameter, public :: SQR_ERRMSG_LEN = 256
 
     ! --- Types ---
 
@@ -274,6 +282,14 @@ module sqr
         integer(c_int64_t)            :: lock_tok = -1  !! Advisory-lock token held while open (-1 = none)
         type(journal_t)               :: jrnl  !! Rollback journal state
         type(history_t)               :: hist  !! In-memory Undo/Redo history of committed gestures
+        ! Sticky error state: every fallible public operation clears it on
+        ! entry and records its outcome on exit, so after any call
+        ! `db_last_error` reports that call's code and failure detail.  A
+        ! fixed buffer + length, not an allocatable: clearing happens on
+        ! every call (hot paths included) and must be one integer store.
+        integer           :: last_stat = SQR_OK  !! Code of the most recent operation (`SQR_OK` after success)
+        character(len=SQR_ERRMSG_LEN) :: last_errmsg = ''  !! Failure detail for `last_stat`
+        integer           :: last_errlen = 0  !! Live length of `last_errmsg`
     contains
         !! Object-oriented spelling of the `db_*` operations: `call db%insert(...)`
         !! is exactly `call db_insert(db, ...)`.  The free `db_*` procedures remain
@@ -291,6 +307,10 @@ module sqr
         procedure :: list_tables  => db_list_tables
         procedure :: table_index  => db_table_index
         procedure :: record_size  => db_record_size
+        procedure :: describe     => db_describe
+        procedure :: row_count    => db_row_count
+        procedure :: in_txn       => db_in_txn
+        procedure :: last_error   => db_last_error
         procedure :: insert       => db_insert
         procedure :: insert_many  => db_insert_many
         procedure :: get          => db_get
@@ -373,7 +393,8 @@ module sqr
     public :: db_create_table, db_drop_table, db_compact
     public :: db_pack, db_unpack
     public :: db_add_column, db_drop_column
-    public :: db_list_tables, db_table_index, db_record_size, idx_live
+    public :: db_list_tables, db_table_index, db_record_size, db_describe, db_row_count, db_in_txn, idx_live
+    public :: db_last_error, sqr_errstr
     public :: db_insert, db_get, db_update, db_delete, db_scan
     public :: db_set_text, db_get_text
     public :: db_create_index, db_drop_index
@@ -478,9 +499,10 @@ module sqr
         !! `stat` reports the first flush failure (schema counters are
         !! persisted only here, so a failed close is where recent data is
         !! lost); the handle is still fully closed regardless.
-        module subroutine db_close(db, stat)
+        module subroutine db_close(db, stat, errmsg)
             class(db_t), intent(inout)               :: db  !! Database handle
             integer,    intent(out),       optional :: stat  !! First flush failure, else `SQR_OK`
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Demote an open read-write handle to read-only: subsequent writes
@@ -489,9 +511,10 @@ module sqr
         !! (`SQR_INVALID`) on a closed handle or while a transaction is live;
         !! a no-op on a handle already read-only.  A failure to downgrade the
         !! lock leaves the handle safely read-only but reports `SQR_ERR`.
-        module subroutine db_set_readonly(db, stat)
+        module subroutine db_set_readonly(db, stat, errmsg)
             class(db_t), intent(inout)               :: db  !! Database handle
             integer,    intent(out),       optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Create a new table from a column-definition array.  Fails with
@@ -507,10 +530,11 @@ module sqr
 
         !! Drop a table and delete all of its files (data, schema,
         !! indices, blob).
-        module subroutine db_drop_table(db, name, stat)
+        module subroutine db_drop_table(db, name, stat, errmsg)
             class(db_t),       intent(inout)        :: db  !! Database handle
             character(len=*), intent(in)           :: name  !! Table to drop
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Reclaim space for one table: drop tombstoned rows, copy only
@@ -532,10 +556,11 @@ module sqr
         !! though the on-disk state is the correct compacted file: `stat`
         !! reports the error, and the caller should `db_close` and
         !! `db_open` afresh rather than keep using the handle.
-        module subroutine db_compact(db, table_name, stat)
+        module subroutine db_compact(db, table_name, stat, errmsg)
             class(db_t),       intent(inout)         :: db  !! Database handle
             character(len=*), intent(in)            :: table_name  !! Table to compact
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Pack a database directory into a single-file `.sqr` container (a
@@ -546,10 +571,11 @@ module sqr
         !! container atomically (temp + rename + fsync).  Overwrites `file`.
         !! Fails with `SQR_NOT_FOUND` (no such database), `SQR_READONLY` (needs
         !! recovery — reopen read-write first), `SQR_LOCKED`, or `SQR_ERR` (I/O).
-        module subroutine db_pack(dir, file, stat)
+        module subroutine db_pack(dir, file, stat, errmsg)
             character(len=*), intent(in)            :: dir   !! Database directory to pack
             character(len=*), intent(in)            :: file  !! Container file to write
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Unpack a `.sqr` container written by [[db_pack]] into a new database
@@ -561,10 +587,11 @@ module sqr
         !! `SQR_ERR` (bad magic/truncated/I-O), `SQR_VERSION` (newer format or
         !! wrong byte order), `SQR_INVALID` (a malformed archived name), or
         !! `SQR_DUP` (`dir` already exists).
-        module subroutine db_unpack(file, dir, stat)
+        module subroutine db_unpack(file, dir, stat, errmsg)
             character(len=*), intent(in)            :: file  !! Container file to read
             character(len=*), intent(in)            :: dir   !! New database directory to create
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Add a column to an existing table (schema evolution by table
@@ -640,6 +667,57 @@ module sqr
             integer                      :: sz  !! Record size in bytes, 0 if absent
         end function
 
+        !! Copy of `table_name`'s column metadata in declaration order — the
+        !! procedural route to column names/types/sizes/offsets for
+        !! front-ends (the `sql` layer, shells), so they need not walk
+        !! `db_t%tables` directly.  The copy is a snapshot: refresh it after
+        !! any `db_add_column`/`db_drop_column`.  With no such table `cols`
+        !! comes back zero-length and `stat` is `SQR_NOT_FOUND`.
+        pure module subroutine db_describe(db, table_name, cols, stat)
+            class(db_t),      intent(in)             :: db  !! Database handle
+            character(len=*), intent(in)             :: table_name  !! Table to describe
+            type(column_t), allocatable, intent(out) :: cols(:)  !! Column metadata, declaration order
+            integer,          intent(out), optional  :: stat  !! `SQR_OK` or `SQR_NOT_FOUND`
+        end subroutine
+
+        !! Number of live rows in `table_name` — 0 if there is no such
+        !! table (indistinguishable from an empty one; use `db_table_index`
+        !! to test existence).
+        pure module function db_row_count(db, table_name) result(n)
+            class(db_t),      intent(in) :: db  !! Database handle
+            character(len=*), intent(in) :: table_name  !! Table to count
+            integer(int32)               :: n  !! Live rows, 0 if absent
+        end function
+
+        !! `.true.` while a transaction is in flight on this handle — for
+        !! application code, an explicit `db_begin` not yet committed or
+        !! rolled back.  Front-ends use it to decide whether to open their
+        !! own bracket around a multi-row statement.
+        pure module function db_in_txn(db) result(active)
+            class(db_t), intent(in) :: db  !! Database handle
+            logical                 :: active  !! Transaction in flight
+        end function
+
+        !! Code and failure detail of the most recent fallible operation on
+        !! this handle: `SQR_OK` (and an empty `msg`) after a successful
+        !! call.  The sticky complement to per-call `stat`/`errmsg` — usable
+        !! after a chain of calls whose statuses were not threaded through.
+        !! Pure metadata getters (`db_record_size`, `db_describe`, …) do not
+        !! touch the state.
+        pure module subroutine db_last_error(db, code, msg)
+            class(db_t),      intent(in)             :: db  !! Database handle
+            integer,          intent(out),  optional :: code  !! Most recent operation's code
+            character(len=:), allocatable, intent(out), optional :: msg  !! Failure detail ('' after success)
+        end subroutine
+
+        !! Canonical one-line text for an `SQR_*` status code — the fallback
+        !! `errmsg`/`db_last_error` detail when the failure site recorded
+        !! nothing more specific.
+        pure module function sqr_errstr(code) result(s)
+            integer, intent(in)           :: code  !! An `SQR_*` status code
+            character(len=:), allocatable :: s  !! Canonical description
+        end function
+
         !! `.true.` if an index slot is live; `.false.` if it has been dropped
         !! (tombstoned with `ncols = 0`).  Callers walking `table_t%indices`
         !! must skip dead slots — their `columns` array is deallocated.
@@ -656,12 +734,13 @@ module sqr
         !! populated afterwards with `db_set_text`.  A unique-index
         !! violation fails with `SQR_DUP` and writes no row; an exhausted
         !! row-id space fails with `SQR_FULL`.
-        module subroutine db_insert(db, table_name, buf, row_id, stat)
+        module subroutine db_insert(db, table_name, buf, row_id, stat, errmsg)
             class(db_t),       intent(inout)        :: db  !! Database handle
             character(len=*), intent(in)           :: table_name  !! Target table
             character(len=*), intent(in)           :: buf  !! Row buffer to insert
             integer(int32),   intent(out)          :: row_id  !! Assigned row id (0 on failure)
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Fetch a live row by id into `buf`.  A tombstoned or
@@ -669,12 +748,13 @@ module sqr
         !! the buffer length (the record is truncated or blank-padded to
         !! fit), but `db_record_size(db, table_name)` is the length that
         !! captures the whole record.
-        module subroutine db_get(db, table_name, row_id, buf, stat)
+        module subroutine db_get(db, table_name, row_id, buf, stat, errmsg)
             class(db_t),       intent(inout)        :: db  !! Database handle
             character(len=*), intent(in)           :: table_name  !! Target table
             integer(int32),   intent(in)           :: row_id  !! Row id to fetch
             character(len=*), intent(out)          :: buf  !! Receives the record buffer
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Rewrite an existing live row in place.  Records are fixed-size
@@ -684,81 +764,89 @@ module sqr
         !! via `db_set_text`, as for insert).  As for insert, `buf` must be
         !! exactly `db_record_size(db, table_name)` long or the update is
         !! rejected with `SQR_INVALID`.
-        module subroutine db_update(db, table_name, row_id, buf, stat)
+        module subroutine db_update(db, table_name, row_id, buf, stat, errmsg)
             class(db_t),       intent(inout)        :: db  !! Database handle
             character(len=*), intent(in)           :: table_name  !! Target table
             integer(int32),   intent(in)           :: row_id  !! Row id to rewrite
             character(len=*), intent(in)           :: buf  !! New record buffer
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Tombstone a live row.  Space is not reclaimed until
         !! `db_compact`.
-        module subroutine db_delete(db, table_name, row_id, stat)
+        module subroutine db_delete(db, table_name, row_id, stat, errmsg)
             class(db_t),       intent(inout)        :: db  !! Database handle
             character(len=*), intent(in)           :: table_name  !! Target table
             integer(int32),   intent(in)           :: row_id  !! Row id to delete
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Iterate every live row, invoking `cb` for each until it sets
         !! `stop` or the table is exhausted.
-        module subroutine db_scan(db, table_name, cb, ctx, stat)
+        module subroutine db_scan(db, table_name, cb, ctx, stat, errmsg)
             class(db_t),       intent(inout)        :: db  !! Database handle
             character(len=*), intent(in)           :: table_name  !! Target table
             procedure(scan_cb)                     :: cb  !! Per-row callback
             class(*),         intent(inout)        :: ctx  !! Opaque context threaded to `cb`
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Set (or replace) the text of a `DT_TEXT` column on a live row.
         !! Bytes are appended to `<table>.blob` and the in-row descriptor
         !! updated.
-        module subroutine db_set_text(db, table_name, row_id, col_name, text, stat)
+        module subroutine db_set_text(db, table_name, row_id, col_name, text, stat, errmsg)
             class(db_t),       intent(inout)        :: db  !! Database handle
             character(len=*), intent(in)           :: table_name  !! Target table
             integer(int32),   intent(in)           :: row_id  !! Row id
             character(len=*), intent(in)           :: col_name  !! `DT_TEXT` column name
             character(len=*), intent(in)           :: text  !! New text value
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Read the text of a `DT_TEXT` column from a live row.  Returns
         !! an empty string for an empty value.
-        module subroutine db_get_text(db, table_name, row_id, col_name, text, stat)
+        module subroutine db_get_text(db, table_name, row_id, col_name, text, stat, errmsg)
             class(db_t),       intent(inout)            :: db  !! Database handle
             character(len=*), intent(in)               :: table_name  !! Target table
             integer(int32),   intent(in)               :: row_id  !! Row id
             character(len=*), intent(in)               :: col_name  !! `DT_TEXT` column name
             character(len=:), allocatable, intent(out) :: text  !! Receives the text value
             integer,          intent(out), optional    :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Single-column overload of `db_create_index`.
-        module subroutine db_create_index_1(db, table_name, col_name, stat, unique)
+        module subroutine db_create_index_1(db, table_name, col_name, stat, errmsg, unique)
             class(db_t),       intent(inout)         :: db  !! Database handle
             character(len=*), intent(in)            :: table_name  !! Target table
             character(len=*), intent(in)            :: col_name  !! Column to index
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
             logical,          intent(in),  optional :: unique  !! Enforce uniqueness (default `.false.`)
         end subroutine
 
         !! Composite overload of `db_create_index`.  Member columns form
         !! the key in the given order.
-        module subroutine db_create_index_m(db, table_name, col_names, stat, unique)
+        module subroutine db_create_index_m(db, table_name, col_names, stat, errmsg, unique)
             class(db_t),       intent(inout)         :: db  !! Database handle
             character(len=*), intent(in)            :: table_name  !! Target table
             character(len=*), intent(in)            :: col_names(:)  !! Ordered member columns
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
             logical,          intent(in),  optional :: unique  !! Enforce uniqueness (default `.false.`)
         end subroutine
 
         !! Single-column overload of `db_drop_index`.
-        module subroutine db_drop_index_1(db, table_name, col_name, stat)
+        module subroutine db_drop_index_1(db, table_name, col_name, stat, errmsg)
             class(db_t),       intent(inout)         :: db  !! Database handle
             character(len=*), intent(in)            :: table_name  !! Target table
             character(len=*), intent(in)            :: col_name  !! Indexed column
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Drop the secondary index whose member columns exactly match
@@ -766,11 +854,12 @@ module sqr
         !! slot numbers stay stable so the `__i<slot>` file naming of surviving
         !! indices is undisturbed, and a later `db_create_index` simply appends a
         !! fresh slot.  `SQR_NOT_FOUND` if no index covers exactly those columns.
-        module subroutine db_drop_index_m(db, table_name, col_names, stat)
+        module subroutine db_drop_index_m(db, table_name, col_names, stat, errmsg)
             class(db_t),       intent(inout)         :: db  !! Database handle
             character(len=*), intent(in)            :: table_name  !! Target table
             character(len=*), intent(in)            :: col_names(:)  !! Index member columns
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Insert a batch of rows in one call, deferring index maintenance to a
@@ -783,12 +872,13 @@ module sqr
         !! batch with nothing inserted (`row_ids = 0`).  `row_ids` must be at
         !! least `size(bufs)` long, and — as for `db_insert` — the buffers
         !! exactly `db_record_size(db, table_name)` long.
-        module subroutine db_insert_many(db, table_name, bufs, row_ids, stat)
+        module subroutine db_insert_many(db, table_name, bufs, row_ids, stat, errmsg)
             class(db_t),       intent(inout)         :: db  !! Database handle
             character(len=*), intent(in)            :: table_name  !! Target table
             character(len=*), intent(in)            :: bufs(:)  !! Row buffers to insert
             integer(int32),   intent(out)           :: row_ids(:)  !! Assigned ids (0 on failure)
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Walk a table's on-disk structures and check they agree: the live-row
@@ -811,35 +901,38 @@ module sqr
         !! `row_set_*` helpers.  `row_id` optionally returns the resolved
         !! live row's id (0 if not resolved) so the caller can follow up
         !! with row-id-keyed operations such as `db_get_text`.
-        module subroutine db_get_by_key(db, table_name, col_names, keyrow, buf, stat, row_id)
+        module subroutine db_get_by_key(db, table_name, col_names, keyrow, buf, stat, errmsg, row_id)
             class(db_t),       intent(inout)         :: db  !! Database handle
             character(len=*), intent(in)            :: table_name  !! Target table
             character(len=*), intent(in)            :: col_names(:)  !! Unique index member columns
             character(len=*), intent(in)            :: keyrow  !! Row-shaped buffer holding the key columns
             character(len=*), intent(out)           :: buf  !! Receives the matched record
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
             integer(int32),   intent(out), optional :: row_id  !! Resolved row id (0 if unresolved)
         end subroutine
 
         !! Update a row by natural key (resolve via the unique index,
         !! then delegate to `db_update`).
-        module subroutine db_update_by_key(db, table_name, col_names, keyrow, newrow, stat)
+        module subroutine db_update_by_key(db, table_name, col_names, keyrow, newrow, stat, errmsg)
             class(db_t),       intent(inout)         :: db  !! Database handle
             character(len=*), intent(in)            :: table_name  !! Target table
             character(len=*), intent(in)            :: col_names(:)  !! Unique index member columns
             character(len=*), intent(in)            :: keyrow  !! Row-shaped buffer holding the key columns
             character(len=*), intent(in)            :: newrow  !! New record buffer
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Delete a row by natural key (resolve via the unique index,
         !! then delegate to `db_delete`).
-        module subroutine db_delete_by_key(db, table_name, col_names, keyrow, stat)
+        module subroutine db_delete_by_key(db, table_name, col_names, keyrow, stat, errmsg)
             class(db_t),       intent(inout)         :: db  !! Database handle
             character(len=*), intent(in)            :: table_name  !! Target table
             character(len=*), intent(in)            :: col_names(:)  !! Unique index member columns
             character(len=*), intent(in)            :: keyrow  !! Row-shaped buffer holding the key columns
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Equality lookup of the first live row whose indexed `int32`
@@ -849,13 +942,14 @@ module sqr
         !! several rows may share the leading value — the one returned is
         !! the first in key order (lowest trailing members, then lowest
         !! row id).
-        module subroutine db_find_by_int(db, table_name, col_name, key, row_id, stat)
+        module subroutine db_find_by_int(db, table_name, col_name, key, row_id, stat, errmsg)
             class(db_t),       intent(inout)        :: db  !! Database handle
             character(len=*), intent(in)           :: table_name  !! Target table
             character(len=*), intent(in)           :: col_name  !! Indexed column
             integer(int32),   intent(in)           :: key  !! Value to match
             integer(int32),   intent(out)          :: row_id  !! Matched row id (0 if none)
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Equality lookup on an indexed `real64` column.
@@ -870,13 +964,14 @@ module sqr
         !! inherent to floating point.  Tolerance matching is a range
         !! query, not an equality lookup.  Index selection and composite
         !! leading-member semantics as for `db_find_by_int`.
-        module subroutine db_find_by_real(db, table_name, col_name, key, row_id, stat)
+        module subroutine db_find_by_real(db, table_name, col_name, key, row_id, stat, errmsg)
             class(db_t),       intent(inout)        :: db  !! Database handle
             character(len=*), intent(in)           :: table_name  !! Target table
             character(len=*), intent(in)           :: col_name  !! Indexed column
             real(real64),     intent(in)           :: key  !! Value to match (exact)
             integer(int32),   intent(out)          :: row_id  !! Matched row id (0 if none)
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Equality lookup on an indexed `DT_CHAR` column.  The key is
@@ -884,13 +979,14 @@ module sqr
         !! blanks insignificant; a key longer than the column matches
         !! nothing).  Index selection and composite leading-member
         !! semantics as for `db_find_by_int`.
-        module subroutine db_find_by_char(db, table_name, col_name, key, row_id, stat)
+        module subroutine db_find_by_char(db, table_name, col_name, key, row_id, stat, errmsg)
             class(db_t),       intent(inout)        :: db  !! Database handle
             character(len=*), intent(in)           :: table_name  !! Target table
             character(len=*), intent(in)           :: col_name  !! Indexed column
             character(len=*), intent(in)           :: key  !! Value to match
             integer(int32),   intent(out)          :: row_id  !! Matched row id (0 if none)
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         ! ===== Ordered cursor / range queries =====
@@ -902,16 +998,17 @@ module sqr
         !! complement to `db_find_range`; pull rows with `db_cursor_next`.  Fails
         !! with `SQR_NOT_FOUND` if the table has no such index.  NULL-member rows
         !! are not in the index and so are never yielded.
-        module subroutine db_open_cursor(db, table_name, col_name, cur, stat)
+        module subroutine db_open_cursor(db, table_name, col_name, cur, stat, errmsg)
             class(db_t),        intent(inout)         :: db  !! Database handle
             character(len=*),  intent(in)            :: table_name  !! Target table
             character(len=*),  intent(in)            :: col_name  !! Indexed column to order by
             type(db_cursor_t), intent(out)           :: cur  !! Positioned cursor
             integer,           intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! `int32` band overload of `db_find_range`.
-        module subroutine db_find_range_int(db, table_name, col_name, lo, hi, cur, stat)
+        module subroutine db_find_range_int(db, table_name, col_name, lo, hi, cur, stat, errmsg)
             class(db_t),        intent(inout)         :: db  !! Database handle
             character(len=*),  intent(in)            :: table_name  !! Target table
             character(len=*),  intent(in)            :: col_name  !! Indexed column
@@ -919,10 +1016,11 @@ module sqr
             integer(int32),    intent(in)            :: hi  !! Inclusive upper bound
             type(db_cursor_t), intent(out)           :: cur  !! Positioned cursor
             integer,           intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! `real64` band overload of `db_find_range`.
-        module subroutine db_find_range_real(db, table_name, col_name, lo, hi, cur, stat)
+        module subroutine db_find_range_real(db, table_name, col_name, lo, hi, cur, stat, errmsg)
             class(db_t),        intent(inout)         :: db  !! Database handle
             character(len=*),  intent(in)            :: table_name  !! Target table
             character(len=*),  intent(in)            :: col_name  !! Indexed column
@@ -930,11 +1028,12 @@ module sqr
             real(real64),      intent(in)            :: hi  !! Inclusive upper bound
             type(db_cursor_t), intent(out)           :: cur  !! Positioned cursor
             integer,           intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! `DT_CHAR` band overload of `db_find_range` (bounds NUL-padded to
         !! the column width).
-        module subroutine db_find_range_char(db, table_name, col_name, lo, hi, cur, stat)
+        module subroutine db_find_range_char(db, table_name, col_name, lo, hi, cur, stat, errmsg)
             class(db_t),        intent(inout)         :: db  !! Database handle
             character(len=*),  intent(in)            :: table_name  !! Target table
             character(len=*),  intent(in)            :: col_name  !! Indexed column
@@ -942,19 +1041,21 @@ module sqr
             character(len=*),  intent(in)            :: hi  !! Inclusive upper bound
             type(db_cursor_t), intent(out)           :: cur  !! Positioned cursor
             integer,           intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Yield the next live row at or after the cursor, in ascending key
         !! order, advancing past it.  `ok` is `.false.` (with `stat == SQR_OK`)
         !! when the cursor is exhausted — for `db_find_range`, when the band's
         !! upper bound is passed — and `row_id`/`buf` are then unset.
-        module subroutine db_cursor_next(db, cur, row_id, buf, ok, stat)
+        module subroutine db_cursor_next(db, cur, row_id, buf, ok, stat, errmsg)
             class(db_t),        intent(inout)         :: db  !! Database handle
             type(db_cursor_t), intent(inout)         :: cur  !! Cursor (advanced)
             integer(int32),    intent(out)           :: row_id  !! Yielded row id (0 if none)
             character(len=*),  intent(out)           :: buf  !! Receives the record buffer
             logical,           intent(out)           :: ok  !! `.true.` if a row was yielded
             integer,           intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         ! ===== Row buffer helpers =====
@@ -1074,9 +1175,10 @@ module sqr
         !! transaction is a user GESTURE: `db_commit` records it as one
         !! Undo/Redo step under that name (see `db_undo`).  Without `label` the
         !! transaction commits with no history entry (the SQL path).
-        module subroutine db_begin(db, stat, label)
+        module subroutine db_begin(db, stat, label, errmsg)
             class(db_t), intent(inout), target :: db  !! Database handle
             integer,    intent(out),  optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
             character(len=*), intent(in), optional :: label  !! Gesture name (records a history step)
         end subroutine
 
@@ -1085,18 +1187,20 @@ module sqr
         !! redo history.  Returns `SQR_NO_UNDO` (and an empty `label`) when the
         !! undo history is empty, `SQR_READONLY` on a read-only handle.  `label`
         !! returns the undone gesture's name (for menu feedback).
-        module subroutine db_undo(db, stat, label)
+        module subroutine db_undo(db, stat, label, errmsg)
             class(db_t), intent(inout) :: db  !! Database handle
             integer,    intent(out), optional :: stat  !! `SQR_OK`, `SQR_NO_UNDO`, ...
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
             character(len=:), allocatable, intent(out), optional :: label  !! Undone gesture name
         end subroutine
 
         !! Redo the most recently undone gesture: re-apply it and move the step
         !! back onto the undo history.  Mirror of `db_undo`; `SQR_NO_UNDO` when
         !! the redo history is empty.
-        module subroutine db_redo(db, stat, label)
+        module subroutine db_redo(db, stat, label, errmsg)
             class(db_t), intent(inout) :: db  !! Database handle
             integer,    intent(out), optional :: stat  !! `SQR_OK`, `SQR_NO_UNDO`, ...
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
             character(len=:), allocatable, intent(out), optional :: label  !! Redone gesture name
         end subroutine
 
@@ -1122,18 +1226,20 @@ module sqr
         !! Commit the explicit transaction opened by `db_begin`, keeping every
         !! change and discarding the undo set.  Fails `SQR_INVALID` if no
         !! explicit transaction is in flight.  Maps onto SQL `COMMIT`.
-        module subroutine db_commit(db, stat)
+        module subroutine db_commit(db, stat, errmsg)
             class(db_t), intent(inout) :: db  !! Database handle
             integer,    intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Roll back the explicit transaction opened by `db_begin`, restoring
         !! every base file and in-memory counter to its pre-`db_begin` state.
         !! Fails `SQR_INVALID` if no explicit transaction is in flight.  Maps
         !! onto SQL `ROLLBACK`.
-        module subroutine db_rollback(db, stat)
+        module subroutine db_rollback(db, stat, errmsg)
             class(db_t), intent(inout) :: db  !! Database handle
             integer,    intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
         !! Begin a transaction.  Clears the in-memory undo set and marks the

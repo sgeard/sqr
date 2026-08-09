@@ -55,19 +55,21 @@ contains
     ! auto-commit bracket a single mutator opens around itself, and it is what
     ! makes nesting detectable.  v1 has no nested transactions.
 
-    module subroutine db_begin(db, stat, label)
+    module subroutine db_begin(db, stat, label, errmsg)
         class(db_t), intent(inout), target :: db
         integer,    intent(out), optional  :: stat
+        character(len=*), intent(inout), optional :: errmsg
         character(len=*), intent(in), optional :: label
         integer :: st
-        if (present(stat)) stat = SQR_OK
+        call clear_last_err(db)
+        call report(db, SQR_OK, stat, errmsg)
         if (db%jrnl%active) then          ! no nesting in v1
-            if (present(stat)) stat = SQR_INVALID
+            call report(db, SQR_INVALID, stat, errmsg)
             return
         end if
         call txn_begin(db, st)
         if (st /= SQR_OK) then
-            if (present(stat)) stat = st
+            call report(db, st, stat, errmsg)
             return
         end if
         db%jrnl%explicit = .true.
@@ -78,13 +80,15 @@ contains
         if (present(label)) db%hist%pending_label = label
     end subroutine
 
-    module subroutine db_commit(db, stat)
+    module subroutine db_commit(db, stat, errmsg)
         class(db_t), intent(inout) :: db
         integer,    intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         integer :: cst
-        if (present(stat)) stat = SQR_OK
+        call clear_last_err(db)
+        call report(db, SQR_OK, stat, errmsg)
         if (.not. (db%jrnl%active .and. db%jrnl%explicit)) then
-            if (present(stat)) stat = SQR_INVALID
+            call report(db, SQR_INVALID, stat, errmsg)
             return
         end if
         ! Snapshot this gesture as one Undo step BEFORE txn_commit discards the
@@ -98,12 +102,14 @@ contains
         call txn_commit(db, stat)         ! also clears the explicit latch
     end subroutine
 
-    module subroutine db_rollback(db, stat)
+    module subroutine db_rollback(db, stat, errmsg)
         class(db_t), intent(inout) :: db
         integer,    intent(out), optional :: stat
-        if (present(stat)) stat = SQR_OK
+        character(len=*), intent(inout), optional :: errmsg
+        call clear_last_err(db)
+        call report(db, SQR_OK, stat, errmsg)
         if (.not. (db%jrnl%active .and. db%jrnl%explicit)) then
-            if (present(stat)) stat = SQR_INVALID
+            call report(db, SQR_INVALID, stat, errmsg)
             return
         end if
         call txn_rollback(db, stat)       ! also clears the explicit latch
@@ -750,10 +756,7 @@ contains
                         ! unit, so it is not enough (see resync_index_trees); a
                         ! clean close + reopen discards the buffer. bt_open resets
                         ! the handle, which also clears the journal hook.
-                        if (t%indices(j)%bt%unit /= -1) then
-                            close(t%indices(j)%bt%unit)
-                            t%indices(j)%bt%unit = -1
-                        end if
+                        call bt_discard(t%indices(j)%bt)
                         call open_index(db, t, t%indices(j), j, 'old', rst)
                         if (rst /= SQR_OK .and. stat == SQR_OK) stat = rst
                     else
@@ -1267,50 +1270,54 @@ contains
     ! (restore counters, reopen units, reload index trees) to bring the in-memory
     ! db back into step.  Session-only: never serialised, never crash-durable.
 
-    module subroutine db_undo(db, stat, label)
+    module subroutine db_undo(db, stat, label, errmsg)
         class(db_t), intent(inout) :: db
         integer,     intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         character(len=:), allocatable, intent(out), optional :: label
         type(hist_step_t) :: step
         integer :: st
+        call clear_last_err(db)
         st = SQR_OK
         if (present(label)) label = ''
         if (db%readonly) then
-            if (present(stat)) stat = SQR_READONLY
+            call report(db, SQR_READONLY, stat, errmsg)
             return
         end if
         if (.not. db_can_undo(db)) then
-            if (present(stat)) stat = SQR_NO_UNDO
+            call report(db, SQR_NO_UNDO, stat, errmsg)
             return
         end if
         call pop_step(db%hist%undo, step)
         call apply_step(db, step, redo=.false., st=st)
         if (present(label) .and. allocated(step%label)) label = step%label
         call push_step(db%hist%redo, step, db%hist%cap)   ! empties step
-        if (present(stat)) stat = st
+        call report(db, st, stat, errmsg)
     end subroutine
 
-    module subroutine db_redo(db, stat, label)
+    module subroutine db_redo(db, stat, label, errmsg)
         class(db_t), intent(inout) :: db
         integer,     intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         character(len=:), allocatable, intent(out), optional :: label
         type(hist_step_t) :: step
         integer :: st
+        call clear_last_err(db)
         st = SQR_OK
         if (present(label)) label = ''
         if (db%readonly) then
-            if (present(stat)) stat = SQR_READONLY
+            call report(db, SQR_READONLY, stat, errmsg)
             return
         end if
         if (.not. db_can_redo(db)) then
-            if (present(stat)) stat = SQR_NO_UNDO
+            call report(db, SQR_NO_UNDO, stat, errmsg)
             return
         end if
         call pop_step(db%hist%redo, step)
         call apply_step(db, step, redo=.true., st=st)
         if (present(label) .and. allocated(step%label)) label = step%label
         call push_step(db%hist%undo, step, db%hist%cap)   ! empties step
-        if (present(stat)) stat = st
+        call report(db, st, stat, errmsg)
     end subroutine
 
     pure module function db_can_undo(db) result(yes)
@@ -1502,10 +1509,7 @@ contains
             associate (t => db%tables(ti))
                 do j = 1, t%nindices
                     if (.not. idx_live(t%indices(j))) cycle
-                    if (t%indices(j)%bt%unit /= -1) then
-                        close(t%indices(j)%bt%unit)
-                        t%indices(j)%bt%unit = -1
-                    end if
+                    call bt_discard(t%indices(j)%bt)
                     call open_index(db, t, t%indices(j), j, 'old', st)
                     if (st /= SQR_OK .and. stat == SQR_OK) stat = st
                 end do

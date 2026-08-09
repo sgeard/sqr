@@ -20,6 +20,7 @@ contains
         integer :: rs, i, j, n
         character(len=SQR_NAME_LEN), allocatable :: names(:)
         character(len=:), allocatable :: ndir
+        character(len=SQR_ERRMSG_LEN) :: em
 
         rs = SQR_OK
         ! Fold any '\' to '/' so the engine reasons about a single separator on
@@ -28,7 +29,7 @@ contains
         open_seq: block
             if (.not. valid_dir_name(ndir)) then
                 rs = SQR_INVALID
-                call raise(rs, stat, errmsg, &
+                call raise_db(db, rs, stat, errmsg, &
                            'invalid database directory name: "' // trim(dir) // '"')
                 exit open_seq
             end if
@@ -48,7 +49,7 @@ contains
             if (db%readonly) then
                 if (.not. file_exists(catalog_path(db))) then
                     rs = SQR_NOT_FOUND
-                    call raise(rs, stat, errmsg, &
+                    call raise_db(db, rs, stat, errmsg, &
                                'database not found: "' // trim(db%dir) // '"')
                     exit open_seq
                 end if
@@ -58,7 +59,7 @@ contains
                 ! fine (idempotent); a genuine failure to create is fatal.
                 if (.not. mkdir_p(db%dir)) then
                     rs = SQR_ERR
-                    call raise(rs, stat, errmsg, &
+                    call raise_db(db, rs, stat, errmsg, &
                                'cannot create database directory: "' // trim(db%dir) // '"')
                     exit open_seq
                 end if
@@ -75,13 +76,13 @@ contains
                 call c_lock_try(lock_path(db), .not. db%readonly, db%lock_tok, lerr)
                 if (lerr == 1) then
                     rs = SQR_LOCKED
-                    call raise(rs, stat, errmsg, &
+                    call raise_db(db, rs, stat, errmsg, &
                                'database is locked by another connection: "' &
                                // trim(db%dir) // '"')
                     exit open_seq
                 else if (lerr /= 0) then
                     rs = SQR_ERR
-                    call raise(rs, stat, errmsg, &
+                    call raise_db(db, rs, stat, errmsg, &
                                'cannot create lock file in: "' // trim(db%dir) // '"')
                     exit open_seq
                 end if
@@ -95,7 +96,7 @@ contains
             if (db%readonly) then
                 if (jrnl_hot(db)) then
                     rs = SQR_READONLY
-                    call raise(rs, stat, errmsg, &
+                    call raise_db(db, rs, stat, errmsg, &
                                'database needs recovery; reopen read-write: "' &
                                // trim(db%dir) // '"')
                     exit open_seq
@@ -103,14 +104,14 @@ contains
             else
                 call jrnl_recover(db, rs)
                 if (rs /= SQR_OK) then
-                    call raise(rs, stat, errmsg, 'journal recovery failed')
+                    call raise_db(db, rs, stat, errmsg, 'journal recovery failed')
                     exit open_seq
                 end if
             end if
 
             call read_catalog(db, names, n, rs)
             if (rs /= SQR_OK) then
-                call raise(rs, stat, errmsg, 'cannot read catalog')
+                call raise_db(db, rs, stat, errmsg, 'cannot read catalog')
                 exit open_seq
             end if
 
@@ -119,11 +120,14 @@ contains
                 allocate(db%tables(n))
                 tables_open: do i = 1, n
                     associate (t => db%tables(i))
-                        ! read_schema writes its own detailed errmsg
-                        ! (bad magic / version mismatch / ...).
-                        call read_schema(db, trim(names(i)), t, rs, errmsg)
+                        ! read_schema writes its own detailed message (bad
+                        ! magic / version mismatch / ...); thread it through a
+                        ! local so it reaches the sticky state even when the
+                        ! caller passed no errmsg.
+                        em = ''
+                        call read_schema(db, trim(names(i)), t, rs, em)
                         if (rs /= SQR_OK) then
-                            call raise(rs, stat, errmsg)
+                            call raise_db(db, rs, stat, errmsg, trim(em))
                             exit open_seq
                         end if
 
@@ -135,7 +139,7 @@ contains
                             interrupted = file_exists(compact_marker_path(db, trim(names(i))))
                             if (interrupted .and. db%readonly) then
                                 rs = SQR_READONLY
-                                call raise(rs, stat, errmsg, &
+                                call raise_db(db, rs, stat, errmsg, &
                                     'database needs compaction recovery; reopen read-write: "' &
                                     // trim(db%dir) // '"')
                                 exit open_seq
@@ -143,7 +147,7 @@ contains
                             if (interrupted) then
                                 call complete_compact_swap(db, t, rs)
                                 if (rs /= SQR_OK) then
-                                    call raise(rs, stat, errmsg, &
+                                    call raise_db(db, rs, stat, errmsg, &
                                         'cannot finish interrupted compact for ' // trim(names(i)))
                                     exit open_seq
                                 end if
@@ -165,7 +169,7 @@ contains
 
                             call open_data(db, t, 'old', rs)
                             if (rs /= SQR_OK) then
-                                call raise(rs, stat, errmsg, &
+                                call raise_db(db, rs, stat, errmsg, &
                                            'cannot open data file for ' // trim(names(i)))
                                 exit open_seq
                             end if
@@ -176,7 +180,7 @@ contains
                                     call recount_live(t%unit, t, ios)
                                     if (ios /= 0) then
                                         rs = SQR_ERR
-                                        call raise(rs, stat, errmsg, &
+                                        call raise_db(db, rs, stat, errmsg, &
                                             'cannot recount rows for ' // trim(names(i)))
                                         exit open_seq
                                     end if
@@ -186,7 +190,7 @@ contains
                             if (table_has_text(t)) then
                                 call open_blob(db, t, 'old', rs)
                                 if (rs /= SQR_OK) then
-                                    call raise(rs, stat, errmsg, &
+                                    call raise_db(db, rs, stat, errmsg, &
                                                'cannot open blob file for ' // trim(names(i)))
                                     exit open_seq
                                 end if
@@ -200,7 +204,7 @@ contains
                                     if (.not. idx_live(t%indices(j))) cycle rebuild_all
                                     call rebuild_index(db, i, j, rs)
                                     if (rs /= SQR_OK) then
-                                        call raise(rs, stat, errmsg, &
+                                        call raise_db(db, rs, stat, errmsg, &
                                             'cannot rebuild index for ' // trim(names(i)))
                                         exit open_seq
                                     end if
@@ -208,7 +212,7 @@ contains
                                 call write_schema(db, t, rs)
                                 if (rs == SQR_OK) call clear_compact_marker(db, trim(names(i)), rs)
                                 if (rs /= SQR_OK) then
-                                    call raise(rs, stat, errmsg, &
+                                    call raise_db(db, rs, stat, errmsg, &
                                         'cannot finalise compact recovery for ' // trim(names(i)))
                                     exit open_seq
                                 end if
@@ -217,7 +221,7 @@ contains
                                     if (.not. idx_live(t%indices(j))) cycle indices_open
                                     call open_index(db, t, t%indices(j), j, 'old', rs)
                                     if (rs /= SQR_OK) then
-                                        call raise(rs, stat, errmsg, &
+                                        call raise_db(db, rs, stat, errmsg, &
                                                    'cannot open index file for ' // trim(names(i)))
                                         exit open_seq
                                     end if
@@ -239,12 +243,14 @@ contains
         end if
     end subroutine
 
-    module subroutine db_close(db, stat)
+    module subroutine db_close(db, stat, errmsg)
         class(db_t), intent(inout)         :: db
         integer,    intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         integer :: i, j, rs, first, cs
+        call clear_last_err(db)
         first = SQR_OK
-        if (present(stat)) stat = SQR_OK
+        call report(db, SQR_OK, stat, errmsg)
         if (.not. db%opened) return
         ! A still-open explicit transaction must be UNDONE at close, not silently
         ! persisted.  Otherwise write_schema below flushes the in-flight counters,
@@ -312,22 +318,24 @@ contains
         db%ntables  = 0
         db%opened   = .false.
         db%readonly = .false.
-        if (present(stat)) stat = first
+        call report(db, first, stat, errmsg)
     end subroutine
 
-    module subroutine db_set_readonly(db, stat)
+    module subroutine db_set_readonly(db, stat, errmsg)
         class(db_t), intent(inout)        :: db
         integer,    intent(out), optional :: stat
-        if (present(stat)) stat = SQR_OK
+        character(len=*), intent(inout), optional :: errmsg
+        call clear_last_err(db)
+        call report(db, SQR_OK, stat, errmsg)
         if (.not. db%opened) then
-            if (present(stat)) stat = SQR_INVALID
+            call report(db, SQR_INVALID, stat, errmsg)
             return
         end if
         if (db%readonly) return            ! already read-only: nothing to do
         ! A live transaction owns uncommitted state; demoting now would strand
         ! it.  The caller must commit or roll back first.
         if (db%jrnl%active) then
-            if (present(stat)) stat = SQR_INVALID
+            call report(db, SQR_INVALID, stat, errmsg)
             return
         end if
         db%readonly = .true.               ! mutators now refuse via readonly_block
@@ -339,7 +347,7 @@ contains
         ! and report the failure; the caller must reopen.
         if (c_lock_share(db%lock_tok) /= 0) then
             call abandon_open(db)
-            if (present(stat)) stat = SQR_ERR
+            call report(db, SQR_ERR, stat, errmsg)
         end if
     end subroutine
 
@@ -352,26 +360,31 @@ contains
         type(table_t), allocatable :: new_tables(:)
         type(table_t) :: tbl
         integer :: rs
+        character(len=SQR_ERRMSG_LEN) :: em
 
-        if (readonly_block(db, stat)) return
-        if (txn_block(db, stat)) return
+        call clear_last_err(db)
+        if (readonly_block(db, stat, errmsg)) return
+        if (txn_block(db, stat, errmsg)) return
         db%generation = db%generation + 1   ! structural change: invalidate cursors
 
         if (.not. valid_name(name)) then
-            call raise(SQR_INVALID, stat, errmsg, &
+            call raise_db(db, SQR_INVALID, stat, errmsg, &
                        'invalid table name: "' // trim(name) // '"')
             return
         end if
 
-        ! validate_columns writes its own detailed errmsg; just route stat.
-        call validate_columns(cols, rs, errmsg)
+        ! validate_columns writes its own detailed message; thread it through
+        ! a local so the detail reaches the sticky state even when the caller
+        ! passed no errmsg.
+        em = ''
+        call validate_columns(cols, rs, em)
         if (rs /= SQR_OK) then
-            if (present(stat)) stat = rs
+            call raise_db(db, rs, stat, errmsg, trim(em))
             return
         end if
 
         if (db_table_index(db, name) > 0) then
-            call raise(SQR_DUP, stat, errmsg, &
+            call raise_db(db, SQR_DUP, stat, errmsg, &
                        'table already exists: ' // trim(name))
             return
         end if
@@ -389,20 +402,20 @@ contains
 
         call write_schema(db, tbl, rs)
         if (rs /= SQR_OK) then
-            if (present(stat)) stat = rs
+            call report(db, rs, stat, errmsg)
             return
         end if
         call open_data(db, tbl, 'new', rs)
         if (rs /= SQR_OK) then
             call discard_new_table(db, tbl)   ! remove the schema file
-            if (present(stat)) stat = rs
+            call report(db, rs, stat, errmsg)
             return
         end if
         if (table_has_text(tbl)) then
             call open_blob(db, tbl, 'replace', rs)
             if (rs /= SQR_OK) then
                 call discard_new_table(db, tbl)   ! close+delete .dat, remove schema
-                if (present(stat)) stat = rs
+                call report(db, rs, stat, errmsg)
                 return
             end if
         end if
@@ -420,11 +433,11 @@ contains
             ! remove its files so no orphans remain.
             db%ntables = db%ntables - 1
             call discard_new_table(db, tbl)
-            if (present(stat)) stat = rs
+            call report(db, rs, stat, errmsg)
             return
         end if
 
-        if (present(stat)) stat = SQR_OK
+        call report(db, SQR_OK, stat, errmsg)
     end subroutine
 
     !! Undo a half-created table: close its open units (deleting the files
@@ -446,19 +459,21 @@ contains
         call remove_file(schema_path(db, trim(tbl%name)))
     end subroutine
 
-    module subroutine db_drop_table(db, name, stat)
+    module subroutine db_drop_table(db, name, stat, errmsg)
         class(db_t),       intent(inout)        :: db
         character(len=*), intent(in)           :: name
         integer,          intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         type(table_t), allocatable :: nt(:)
         integer :: j, rs, idx, ni
-        if (readonly_block(db, stat)) return
-        if (txn_block(db, stat)) return
+        call clear_last_err(db)
+        if (readonly_block(db, stat, errmsg)) return
+        if (txn_block(db, stat, errmsg)) return
         db%generation = db%generation + 1   ! shifts table slots: invalidate cursors
         call db_reset_history(db)           ! slot shift ⇒ captured undo/redo steps can't replay
         idx = db_table_index(db, name)
         if (idx == 0) then
-            if (present(stat)) stat = SQR_NOT_FOUND
+            call report(db, SQR_NOT_FOUND, stat, errmsg)
             return
         end if
 
@@ -475,10 +490,7 @@ contains
         if (db%tables(idx)%blob_unit /= -1) close(db%tables(idx)%blob_unit)
         close_indices: do j = 1, ni
             associate (ix => db%tables(idx)%indices(j))
-                if (ix%bt%unit /= -1) then
-                    close(ix%bt%unit)
-                    ix%bt%unit = -1
-                end if
+                call bt_discard(ix%bt)
             end associate
         end do close_indices
 
@@ -493,7 +505,7 @@ contains
         if (rs /= SQR_OK) then
             ! Catalog not updated: leave the files in place so the table is
             ! still recoverable rather than orphaning a half-dropped table.
-            if (present(stat)) stat = rs
+            call report(db, rs, stat, errmsg)
             return
         end if
 
@@ -506,26 +518,28 @@ contains
         end do del_indices
         call remove_file(schema_path(db, name))
 
-        if (present(stat)) stat = SQR_OK
+        call report(db, SQR_OK, stat, errmsg)
     end subroutine
 
-    module subroutine db_compact(db, table_name, stat)
+    module subroutine db_compact(db, table_name, stat, errmsg)
         class(db_t),       intent(inout)         :: db
         character(len=*), intent(in)            :: table_name
         integer,          intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         integer :: idx, ud, ub, ios, rs, j, ci
         integer(int32) :: rid, new_rid, length
         integer(int64) :: off, newpos
         logical :: has_text
         character(len=:), allocatable :: rbuf, dpath, dtmp, bpath, btmp
+        call clear_last_err(db)
 
-        if (readonly_block(db, stat)) return
-        if (txn_block(db, stat)) return
+        if (readonly_block(db, stat, errmsg)) return
+        if (txn_block(db, stat, errmsg)) return
         db%generation = db%generation + 1   ! renumbers rows: invalidate cursors
         call db_reset_history(db)           ! row renumber ⇒ captured undo/redo steps can't replay
         idx = db_table_index(db, table_name)
         if (idx == 0) then
-            if (present(stat)) stat = SQR_NOT_FOUND
+            call report(db, SQR_NOT_FOUND, stat, errmsg)
             return
         end if
         ud = -1; ub = -1
@@ -632,7 +646,7 @@ contains
                 ! Originals untouched — discard the partial temp files.
                 if (ud /= -1) close(ud, status='delete')
                 if (ub /= -1) close(ub, status='delete')
-                if (present(stat)) stat = rs
+                call report(db, rs, stat, errmsg)
                 return
             end if
             ! Guard the temp closes: a failed final flush here means the temp is
@@ -640,7 +654,7 @@ contains
             close(ud, iostat=ios)
             if (ios == 0 .and. has_text) close(ub, iostat=ios)
             if (ios /= 0) then
-                if (present(stat)) stat = SQR_ERR
+                call report(db, SQR_ERR, stat, errmsg)
                 return
             end if
 
@@ -659,7 +673,7 @@ contains
                 call io_check(ios)
             end if
             if (ios /= 0) then
-                if (present(stat)) stat = SQR_ERR
+                call report(db, SQR_ERR, stat, errmsg)
                 return
             end if
 
@@ -671,25 +685,25 @@ contains
             ! atomically replaces the destination, so no separate delete needed.
             call write_compact_marker(db, t%name, rs)
             if (rs /= SQR_OK) then
-                if (present(stat)) stat = rs
+                call report(db, rs, stat, errmsg)
                 return
             end if
             close(t%unit); t%unit = -1
             if (c_rename(dtmp, dpath) /= 0) then
-                if (present(stat)) stat = SQR_ERR
+                call report(db, SQR_ERR, stat, errmsg)
                 return
             end if
             if (has_text) then
                 close(t%blob_unit); t%blob_unit = -1
                 if (c_rename(btmp, bpath) /= 0) then
-                    if (present(stat)) stat = SQR_ERR
+                    call report(db, SQR_ERR, stat, errmsg)
                     return
                 end if
             end if
             ios = c_fsync_dir(db%dir)   ! the renames themselves must be durable
             call io_check(ios)
             if (ios /= 0) then
-                if (present(stat)) stat = SQR_ERR
+                call report(db, SQR_ERR, stat, errmsg)
                 return
             end if
 
@@ -703,13 +717,13 @@ contains
 
             call open_data(db, t, 'old', rs)
             if (rs /= SQR_OK) then
-                if (present(stat)) stat = rs
+                call report(db, rs, stat, errmsg)
                 return
             end if
             if (has_text) then
                 call open_blob(db, t, 'old', rs)
                 if (rs /= SQR_OK) then
-                    if (present(stat)) stat = rs
+                    call report(db, rs, stat, errmsg)
                     return
                 end if
             end if
@@ -718,14 +732,14 @@ contains
                 if (.not. idx_live(t%indices(j))) cycle reindex
                 call rebuild_index(db, idx, j, rs)
                 if (rs /= SQR_OK) then
-                    if (present(stat)) stat = rs
+                    call report(db, rs, stat, errmsg)
                     return
                 end if
             end do reindex
 
             call write_schema(db, t, rs)
             if (rs /= SQR_OK) then
-                if (present(stat)) stat = rs
+                call report(db, rs, stat, errmsg)
                 return
             end if
             ! Fully durable: data+blob renamed, indices rebuilt, schema written
@@ -734,11 +748,11 @@ contains
             ! next open simply re-finishes and clears it.)
             call clear_compact_marker(db, t%name, rs)
             if (rs /= SQR_OK) then
-                if (present(stat)) stat = rs
+                call report(db, rs, stat, errmsg)
                 return
             end if
         end associate
-        if (present(stat)) stat = SQR_OK
+        call report(db, SQR_OK, stat, errmsg)
     end subroutine
 
     ! Drop the "compact in progress" marker (see compact_marker_path). Written
@@ -839,6 +853,38 @@ contains
         if (ti /= 0) sz = db%tables(ti)%record_size
     end function
 
+    pure module subroutine db_describe(db, table_name, cols, stat)
+        class(db_t),      intent(in)             :: db
+        character(len=*), intent(in)             :: table_name
+        type(column_t), allocatable, intent(out) :: cols(:)
+        integer,          intent(out), optional  :: stat
+        integer :: ti
+        ti = db_table_index(db, table_name)
+        if (ti == 0) then
+            allocate(cols(0))
+            if (present(stat)) stat = SQR_NOT_FOUND
+            return
+        end if
+        cols = db%tables(ti)%cols(1:db%tables(ti)%ncols)
+        if (present(stat)) stat = SQR_OK
+    end subroutine
+
+    pure module function db_row_count(db, table_name) result(n)
+        class(db_t),      intent(in) :: db
+        character(len=*), intent(in) :: table_name
+        integer(int32)               :: n
+        integer :: ti
+        n = 0
+        ti = db_table_index(db, table_name)
+        if (ti /= 0) n = db%tables(ti)%live_count
+    end function
+
+    pure module function db_in_txn(db) result(active)
+        class(db_t), intent(in) :: db
+        logical                 :: active
+        active = db%jrnl%active .and. db%jrnl%explicit
+    end function
+
     ! ===== Schema evolution: add / drop column =====
 
     module subroutine db_add_column(db, table_name, col, stat, errmsg)
@@ -850,14 +896,16 @@ contains
         integer :: ti, rs, nold, k, new_rs
         type(column_t), allocatable :: newcols(:)
         integer, allocatable :: src(:), cascade(:)
+        character(len=SQR_ERRMSG_LEN) :: em
 
-        if (readonly_block(db, stat)) return
-        if (txn_block(db, stat)) return
+        call clear_last_err(db)
+        if (readonly_block(db, stat, errmsg)) return
+        if (txn_block(db, stat, errmsg)) return
         db%generation = db%generation + 1   ! structural change: invalidate cursors
         call db_reset_history(db)           ! record_size change ⇒ captured undo/redo steps can't replay
         ti = db_table_index(db, table_name)
         if (ti == 0) then
-            call raise(SQR_NOT_FOUND, stat, errmsg, 'no such table: ' // trim(table_name))
+            call raise_db(db, SQR_NOT_FOUND, stat, errmsg, 'no such table: ' // trim(table_name))
             return
         end if
         nold = db%tables(ti)%ncols
@@ -865,13 +913,14 @@ contains
         ! Candidate set = existing columns + the new one. validate_columns
         ! re-checks the whole set: the new name/dtype/csize, a name already in
         ! the table (its duplicate-name pass), and the widened record bound. It
-        ! writes its own errmsg, so just route stat — exactly as db_create_table.
+        ! writes its own detailed message — exactly as db_create_table.
         allocate(newcols(nold + 1))
         newcols(1:nold)   = db%tables(ti)%cols(1:nold)
         newcols(nold + 1) = col
-        call validate_columns(newcols, rs, errmsg)
+        em = ''
+        call validate_columns(newcols, rs, em)
         if (rs /= SQR_OK) then
-            if (present(stat)) stat = rs
+            call raise_db(db, rs, stat, errmsg, trim(em))
             return
         end if
         call layout_columns(newcols, new_rs)
@@ -883,7 +932,8 @@ contains
         src(nold + 1) = 0
         allocate(cascade(0))
 
-        call apply_layout_change(db, ti, newcols, new_rs, src, cascade, stat)
+        call apply_layout_change(db, ti, newcols, new_rs, src, cascade, rs)
+        call report(db, rs, stat, errmsg)
     end subroutine
 
     module subroutine db_drop_column(db, table_name, col_name, stat, errmsg)
@@ -892,28 +942,29 @@ contains
         character(len=*), intent(in)              :: col_name
         integer,          intent(out),  optional  :: stat
         character(len=*), intent(inout), optional :: errmsg
-        integer :: ti, p, nold, nj, nc, new_rs
+        integer :: ti, p, nold, nj, nc, new_rs, rs
         type(column_t), allocatable :: newcols(:)
         integer, allocatable :: src(:), cascade(:)
 
-        if (readonly_block(db, stat)) return
-        if (txn_block(db, stat)) return
+        call clear_last_err(db)
+        if (readonly_block(db, stat, errmsg)) return
+        if (txn_block(db, stat, errmsg)) return
         db%generation = db%generation + 1   ! structural change: invalidate cursors
         call db_reset_history(db)           ! record_size change ⇒ captured undo/redo steps can't replay
         ti = db_table_index(db, table_name)
         if (ti == 0) then
-            call raise(SQR_NOT_FOUND, stat, errmsg, 'no such table: ' // trim(table_name))
+            call raise_db(db, SQR_NOT_FOUND, stat, errmsg, 'no such table: ' // trim(table_name))
             return
         end if
         associate (t => db%tables(ti))
             p = col_index(t, col_name)
             if (p == 0) then
-                call raise(SQR_NOT_FOUND, stat, errmsg, &
+                call raise_db(db, SQR_NOT_FOUND, stat, errmsg, &
                            'no such column: "' // trim(col_name) // '"')
                 return
             end if
             if (t%ncols == 1) then
-                call raise(SQR_INVALID, stat, errmsg, &
+                call raise_db(db, SQR_INVALID, stat, errmsg, &
                            'cannot drop the only column of "' // trim(table_name) // '"')
                 return
             end if
@@ -935,7 +986,8 @@ contains
             call cascade_indices(t, col_name, cascade)
         end associate
 
-        call apply_layout_change(db, ti, newcols, new_rs, src, cascade, stat)
+        call apply_layout_change(db, ti, newcols, new_rs, src, cascade, rs)
+        call report(db, rs, stat, errmsg)
     end subroutine
 
     ! Slots of every live index of `t` that has `col_name` as a member — the
@@ -1092,10 +1144,7 @@ contains
             ! tree; the file is deleted after the schema commit.
             drop_cascade: do k = 1, size(cascade)
                 associate (ix => t%indices(cascade(k)))
-                    if (ix%bt%unit /= -1) then
-                        close(ix%bt%unit)
-                        ix%bt%unit = -1
-                    end if
+                    call bt_discard(ix%bt)
                     ix%ncols    = 0
                     ix%key_size = 0
                     ix%nentries = 0

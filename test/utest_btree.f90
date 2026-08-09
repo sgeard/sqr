@@ -77,6 +77,7 @@ program utest_btree
     call t_reload()
     call t_page_bodies()
     call t_page_size_vs_file()
+    call t_discard()
 
     print '(a,i0,a,i0,a)', 'b_tree tests: ', pass, ' passed, ', fail, ' failed'
     if (fail > 0) error stop 1
@@ -730,6 +731,30 @@ contains
         if (ios /= 0) return
         write(u, pos=pos) b
         close(u)
+    end subroutine
+
+    ! bt_discard: close without meta flush, handle reset, safe when already
+    ! closed, and the on-disk image (meta written by the last mutator) stays
+    ! openable.
+    subroutine t_discard()
+        type(btree_t) :: bt
+        integer :: st, i
+        call fresh('utest_btree_d.bt')
+        call bt_open(bt, 'utest_btree_d.bt', 4, .true., .true., st)
+        do i = 1, 100
+            call bt_insert(bt, k4(int(i, int32)), int(i, int32), icmp, dummy, st)
+            if (st /= BT_OK) exit
+        end do
+        call check(st == BT_OK, 'discard: 100 inserted')
+        call bt_discard(bt)
+        call check(bt%unit == -1, 'discard: handle closed')
+        call bt_discard(bt)
+        call check(bt%unit == -1, 'discard: idempotent on a closed handle')
+        call bt_open(bt, 'utest_btree_d.bt', 4, .true., .false., st)
+        call check(st == BT_OK .and. bt%nentries == 100, &
+                   'discard: file reopens with every entry')
+        call bt_close(bt, st)
+        call fresh('utest_btree_d.bt')
     end subroutine
 
 end program utest_btree

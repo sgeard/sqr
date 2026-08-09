@@ -633,6 +633,17 @@ contains
         if (present(stat)) stat = rs
     end subroutine
 
+    ! Close without touching the meta page (interface in the parent).  The
+    ! counterpart of bt_close for paths that must leave the on-disk image
+    ! exactly as it is.
+    module subroutine bt_discard(bt)
+        type(btree_t), intent(inout) :: bt
+        if (bt%unit /= -1) then
+            close(bt%unit)
+            bt%unit = -1
+        end if
+    end subroutine
+
     ! Flush a writable tree's buffered writes to the OS (interface in the
     ! parent).  Durability (the actual fsync) is the journal layer's job, done
     ! by path; this only drains the unit so that fsync sees every page write.

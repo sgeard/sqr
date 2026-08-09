@@ -31,9 +31,20 @@ submodule (sqr:sqr_base) sqr_pack
 
 contains
 
-    module subroutine db_pack(dir, file, stat)
+    ! No handle is exposed here (the snapshot db_t is local), so there is no
+    ! sticky state to record: route the code and its canonical text only.
+    subroutine pk_report(rs, stat, errmsg)
+        integer,          intent(in)              :: rs
+        integer,          intent(out),   optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
+        if (present(stat)) stat = rs
+        if (rs /= SQR_OK .and. present(errmsg)) errmsg = sqr_errstr(rs)
+    end subroutine
+
+    module subroutine db_pack(dir, file, stat, errmsg)
         character(len=*), intent(in)            :: dir, file
         integer,          intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         type(db_t)     :: sdb                 ! only %dir / %lock_tok are used
         type(table_t), allocatable :: tbls(:)
         type(pfile_t), allocatable :: pf(:)
@@ -46,7 +57,7 @@ contains
         rs = SQR_OK
         sdb%dir = trim(dir)
         if (.not. file_exists(catalog_path(sdb))) then
-            if (present(stat)) stat = SQR_NOT_FOUND
+            call pk_report(SQR_NOT_FOUND, stat, errmsg)
             return
         end if
         ! Read-lock the snapshot (shared) and refuse a hot journal — the same
@@ -54,10 +65,10 @@ contains
         ! (which would then be connected to units and unreadable via stream).
         call c_lock_try(lock_path(sdb), .false., sdb%lock_tok, lerr)
         if (lerr == 1) then
-            if (present(stat)) stat = SQR_LOCKED
+            call pk_report(SQR_LOCKED, stat, errmsg)
             return
         else if (lerr /= 0) then
-            if (present(stat)) stat = SQR_ERR
+            call pk_report(SQR_ERR, stat, errmsg)
             return
         end if
         pack_body: block
@@ -120,7 +131,7 @@ contains
             call write_container(file, pf, offs, cks, rs)
         end block pack_body
         call c_lock_release(sdb%lock_tok)       ! snapshot read; drop the shared lock
-        if (present(stat)) stat = rs
+        call pk_report(rs, stat, errmsg)
     end subroutine
 
     ! Write the container to `file` atomically: build a temp sibling, fsync it,
@@ -172,9 +183,10 @@ contains
         stat = merge(SQR_ERR, SQR_OK, c_fsync_dir(parent_dir(file)) /= 0)
     end subroutine
 
-    module subroutine db_unpack(file, dir, stat)
+    module subroutine db_unpack(file, dir, stat, errmsg)
         character(len=*), intent(in)            :: file, dir
         integer,          intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         character(len=:), allocatable :: payload, tmpd, nm
         character(len=:), allocatable :: names(:)
         integer(int64), allocatable   :: sizes(:), offs(:)
@@ -187,13 +199,13 @@ contains
         ! c_path_exists (stat), not file_exists (inquire) — inquire on a
         ! directory is unreliable across compilers (ifx reports .false.).
         if (c_path_exists(trim(dir))) then      ! never overwrite (Save-As semantics)
-            if (present(stat)) stat = SQR_DUP
+            call pk_report(SQR_DUP, stat, errmsg)
             return
         end if
         open(newunit=u, file=file, access='stream', form='unformatted', &
              status='old', action='read', iostat=ios)
         if (ios /= 0) then
-            if (present(stat)) stat = SQR_ERR
+            call pk_report(SQR_ERR, stat, errmsg)
             return
         end if
         read_body: block
@@ -302,7 +314,7 @@ contains
             ios = c_fsync_dir(parent_dir(trim(dir)))
         end block read_body
         close(u, iostat=ios)
-        if (present(stat)) stat = rs
+        call pk_report(rs, stat, errmsg)
     end subroutine
 
     ! Read a whole file into an allocatable byte string.

@@ -139,6 +139,15 @@ module b_tree
             integer,       intent(out), optional :: stat  !! `BT_OK` or an error code
         end subroutine
 
+        !! Close the unit *without* flushing the meta page, resetting the
+        !! handle.  For teardown paths where the on-disk image must not be
+        !! touched: the file is about to be deleted, or a journal rollback
+        !! has restored it and the cached meta is stale.  Safe to call on an
+        !! already-closed handle; never fails.
+        module subroutine bt_discard(bt)
+            type(btree_t), intent(inout) :: bt    !! Tree handle
+        end subroutine
+
         !! Re-read the mutable meta fields (`root`, `free_head`, `npages`,
         !! `first_leaf`, `nentries`) from the on-disk meta page into the open
         !! handle, discarding the cached in-memory copies.  This re-syncs a
@@ -254,7 +263,7 @@ module b_tree
         end subroutine
     end interface
 
-    public :: bt_open, bt_close, bt_reload, bt_sync, bt_insert, bt_remove, bt_bulk_load
+    public :: bt_open, bt_close, bt_discard, bt_reload, bt_sync, bt_insert, bt_remove, bt_bulk_load
     public :: bt_seek, bt_first, bt_next, bt_set_journal_hook
 
 contains

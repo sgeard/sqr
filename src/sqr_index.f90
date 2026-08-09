@@ -19,24 +19,32 @@ contains
 
     ! ===== Index support =====
 
-    module subroutine db_create_index_1(db, table_name, col_name, stat, unique)
+    module subroutine db_create_index_1(db, table_name, col_name, stat, errmsg, unique)
         class(db_t),       intent(inout)         :: db
         character(len=*), intent(in)            :: table_name
         character(len=*), intent(in)            :: col_name
         integer,          intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         logical,          intent(in),  optional :: unique
         character(len=len(col_name)) :: one(1)   ! named 1-elt array: no constructor temp
+        integer :: rs
+        call clear_last_err(db)
         one(1) = col_name
-        call create_index_impl(db, table_name, one, stat, unique)
+        call create_index_impl(db, table_name, one, rs, unique)
+        call report(db, rs, stat, errmsg)
     end subroutine
 
-    module subroutine db_create_index_m(db, table_name, col_names, stat, unique)
+    module subroutine db_create_index_m(db, table_name, col_names, stat, errmsg, unique)
         class(db_t),       intent(inout)         :: db
         character(len=*), intent(in)            :: table_name
         character(len=*), intent(in)            :: col_names(:)
         integer,          intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         logical,          intent(in),  optional :: unique
-        call create_index_impl(db, table_name, col_names, stat, unique)
+        integer :: rs
+        call clear_last_err(db)
+        call create_index_impl(db, table_name, col_names, rs, unique)
+        call report(db, rs, stat, errmsg)
     end subroutine
 
     ! Build a (possibly composite, possibly unique) secondary index over
@@ -47,7 +55,7 @@ contains
         type(db_t),       intent(inout)         :: db
         character(len=*), intent(in)            :: table_name
         character(len=*), intent(in)            :: col_names(:)
-        integer,          intent(out), optional :: stat
+        integer,          intent(out)           :: stat
         logical,          intent(in),  optional :: unique
         integer :: ti, rs, m, p, nc, koff
         logical :: uniq
@@ -65,16 +73,16 @@ contains
         nc = size(col_names)
         ti = db_table_index(db, table_name)
         if (ti == 0) then
-            if (present(stat)) stat = SQR_NOT_FOUND
+            stat = SQR_NOT_FOUND
             return
         end if
         associate (t => db%tables(ti))
             if (nc < 1) then
-                if (present(stat)) stat = SQR_INVALID
+                stat = SQR_INVALID
                 return
             end if
             if (index_for_columns(t, col_names) > 0) then
-                if (present(stat)) stat = SQR_DUP
+                stat = SQR_DUP
                 return
             end if
             ix%ncols = nc
@@ -84,16 +92,16 @@ contains
                 ix%columns(m) = col_names(m)
                 ix%col_idx(m) = col_index(t, col_names(m))
                 if (ix%col_idx(m) == 0) then
-                    if (present(stat)) stat = SQR_NOT_FOUND
+                    stat = SQR_NOT_FOUND
                     return
                 end if
                 if (t%cols(ix%col_idx(m))%dtype == DT_TEXT) then
-                    if (present(stat)) stat = SQR_INVALID
+                    stat = SQR_INVALID
                     return
                 end if
                 dup_member: do p = 1, m - 1
                     if (ix%col_idx(p) == ix%col_idx(m)) then
-                        if (present(stat)) stat = SQR_INVALID
+                        stat = SQR_INVALID
                         return
                     end if
                 end do dup_member
@@ -113,7 +121,7 @@ contains
             call rebuild_index(db, ti, t%nindices, rs)
             if (rs /= SQR_OK) then
                 call drop_last_index(db, ti)
-                if (present(stat)) stat = rs
+                stat = rs
                 return
             end if
 
@@ -123,12 +131,12 @@ contains
                 call has_dup_live_keys(db, ti, t%nindices, uniq, rs)
                 if (rs /= SQR_OK) then
                     call drop_last_index(db, ti)
-                    if (present(stat)) stat = rs
+                    stat = rs
                     return
                 end if
                 if (uniq) then   ! reused as the "violation found" out-flag
                     call drop_last_index(db, ti)
-                    if (present(stat)) stat = SQR_DUP
+                    stat = SQR_DUP
                     return
                 end if
             end if
@@ -140,10 +148,10 @@ contains
                 ! retry hit SQR_DUP for an index the caller was told failed (and
                 ! it vanishes on reopen anyway). Tear it back down.
                 call drop_last_index(db, ti)
-                if (present(stat)) stat = rs
+                stat = rs
                 return
             end if
-            if (present(stat)) stat = SQR_OK
+            stat = SQR_OK
         end associate
     end subroutine
 
@@ -157,11 +165,8 @@ contains
         integer :: s
         associate (t => db%tables(ti))
             s = t%nindices
-            ! File is deleted next — close without flushing meta.
-            if (t%indices(s)%bt%unit /= -1) then
-                close(t%indices(s)%bt%unit)
-                t%indices(s)%bt%unit = -1
-            end if
+            ! File is deleted next.
+            call bt_discard(t%indices(s)%bt)
             call remove_file(index_path(db, t%name, s))
             allocate(keep(s - 1))
             keep(1:s-1) = t%indices(1:s-1)
@@ -220,68 +225,74 @@ contains
         end associate
     end subroutine
 
-    module subroutine db_find_by_int(db, table_name, col_name, key, row_id, stat)
+    module subroutine db_find_by_int(db, table_name, col_name, key, row_id, stat, errmsg)
         class(db_t),       intent(inout)        :: db
         character(len=*), intent(in)           :: table_name
         character(len=*), intent(in)           :: col_name
         integer(int32),   intent(in)           :: key
         integer(int32),   intent(out)          :: row_id
         integer,          intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         integer :: ti, j, rs
         character(len=4) :: kbuf
+        call clear_last_err(db)
         row_id = 0
         call resolve_leading(db, table_name, col_name, DT_INT, ti, j, rs)
         if (rs /= SQR_OK) then
-            if (present(stat)) stat = rs
+            call report(db, rs, stat, errmsg)
             return
         end if
         kbuf = transfer(key, kbuf)
         call find_leading(db, ti, j, kbuf, row_id, rs)
-        if (present(stat)) stat = rs
+        call report(db, rs, stat, errmsg)
     end subroutine
 
     ! Exact decoded-value equality (±0.0 equal) — see the interface
     ! comment in sqr.f90.
-    module subroutine db_find_by_real(db, table_name, col_name, key, row_id, stat)
+    module subroutine db_find_by_real(db, table_name, col_name, key, row_id, stat, errmsg)
         class(db_t),       intent(inout)        :: db
         character(len=*), intent(in)           :: table_name
         character(len=*), intent(in)           :: col_name
         real(real64),     intent(in)           :: key
         integer(int32),   intent(out)          :: row_id
         integer,          intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         integer :: ti, j, rs
         character(len=8) :: kbuf
+        call clear_last_err(db)
         row_id = 0
         call resolve_leading(db, table_name, col_name, DT_REAL, ti, j, rs)
         if (rs /= SQR_OK) then
-            if (present(stat)) stat = rs
+            call report(db, rs, stat, errmsg)
             return
         end if
         ! A NaN key is never stored (rejected on write) and key_cmp's </>
         ! comparison would treat it as equal to every stored real, so it could
         ! return an unrelated row. It can match nothing — say so.
         if (ieee_is_nan(key)) then
-            if (present(stat)) stat = SQR_NOT_FOUND
+            call report(db, SQR_NOT_FOUND, stat, errmsg)
             return
         end if
         kbuf = transfer(key, kbuf)
         call find_leading(db, ti, j, kbuf, row_id, rs)
-        if (present(stat)) stat = rs
+        call report(db, rs, stat, errmsg)
     end subroutine
 
-    module subroutine db_find_by_char(db, table_name, col_name, key, row_id, stat)
+    module subroutine db_find_by_char(db, table_name, col_name, key, row_id, stat, errmsg)
         class(db_t),       intent(inout)        :: db
         character(len=*), intent(in)           :: table_name
         character(len=*), intent(in)           :: col_name
         character(len=*), intent(in)           :: key
         integer(int32),   intent(out)          :: row_id
         integer,          intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         integer :: ti, j, rs, lw, nc
         character(len=:), allocatable :: kbuf
+        call clear_last_err(db)
         row_id = 0
         call resolve_leading(db, table_name, col_name, DT_CHAR, ti, j, rs)
         if (rs /= SQR_OK) then
-            if (present(stat)) stat = rs
+            call report(db, rs, stat, errmsg)
             return
         end if
         lw = db%tables(ti)%cols(db%tables(ti)%indices(j)%col_idx(1))%csize
@@ -291,7 +302,7 @@ contains
         ! and matching a shorter stored value. Trailing blanks are
         ! insignificant padding.
         if (len_trim(key) > lw) then
-            if (present(stat)) stat = SQR_NOT_FOUND
+            call report(db, SQR_NOT_FOUND, stat, errmsg)
             return
         end if
         nc = min(lw, len_trim(key))     ! trailing blanks insignificant: match the canonical key
@@ -299,7 +310,7 @@ contains
         kbuf              = repeat(char(0), lw)
         if (nc > 0) kbuf(1:nc) = key(1:nc)
         call find_leading(db, ti, j, kbuf, row_id, rs)
-        if (present(stat)) stat = rs
+        call report(db, rs, stat, errmsg)
     end subroutine
 
     ! ===== Ordered cursor / range queries =====
@@ -454,15 +465,17 @@ contains
         call open_range(db, ti, j, lk, hk, cur, stat)
     end subroutine
 
-    module subroutine db_open_cursor(db, table_name, col_name, cur, stat)
+    module subroutine db_open_cursor(db, table_name, col_name, cur, stat, errmsg)
         class(db_t),        intent(inout)         :: db
         character(len=*),  intent(in)            :: table_name, col_name
         type(db_cursor_t), intent(out)           :: cur
         integer,           intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         integer :: ti, j, rs, bs
+        call clear_last_err(db)
         call find_leading_index(db, table_name, col_name, ti, j, rs)
         if (rs /= SQR_OK) then
-            if (present(stat)) stat = rs
+            call report(db, rs, stat, errmsg)
             return
         end if
         cur%ti      = ti
@@ -471,7 +484,7 @@ contains
         cur%gen     = db%generation
         call bt_first(db%tables(ti)%indices(j)%bt, cur%bt, bs)
         cur%active = bs == BT_OK
-        if (present(stat)) stat = sqr_of_bt(bs)
+        call report(db, sqr_of_bt(bs), stat, errmsg)
     end subroutine
 
     ! Shared opener for the typed db_find_range_* wrappers. lokey/hikey are
@@ -498,62 +511,68 @@ contains
         stat = sqr_of_bt(bs)
     end subroutine
 
-    module subroutine db_find_range_int(db, table_name, col_name, lo, hi, cur, stat)
+    module subroutine db_find_range_int(db, table_name, col_name, lo, hi, cur, stat, errmsg)
         class(db_t),        intent(inout)         :: db
         character(len=*),  intent(in)            :: table_name, col_name
         integer(int32),    intent(in)            :: lo, hi
         type(db_cursor_t), intent(out)           :: cur
         integer,           intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         integer :: ti, j, rs
         character(len=4) :: lb, hb
+        call clear_last_err(db)
         call resolve_leading(db, table_name, col_name, DT_INT, ti, j, rs)
         if (rs /= SQR_OK) then
-            if (present(stat)) stat = rs
+            call report(db, rs, stat, errmsg)
             return
         end if
         lb = transfer(lo, lb)
         hb = transfer(hi, hb)
         call find_leading_range(db, ti, j, lb, hb, cur, rs)
-        if (present(stat)) stat = rs
+        call report(db, rs, stat, errmsg)
     end subroutine
 
-    module subroutine db_find_range_real(db, table_name, col_name, lo, hi, cur, stat)
+    module subroutine db_find_range_real(db, table_name, col_name, lo, hi, cur, stat, errmsg)
         class(db_t),        intent(inout)         :: db
         character(len=*),  intent(in)            :: table_name, col_name
         real(real64),      intent(in)            :: lo, hi
         type(db_cursor_t), intent(out)           :: cur
         integer,           intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         integer :: ti, j, rs
         character(len=8) :: lb, hb
+        call clear_last_err(db)
         call resolve_leading(db, table_name, col_name, DT_REAL, ti, j, rs)
         if (rs /= SQR_OK) then
-            if (present(stat)) stat = rs
+            call report(db, rs, stat, errmsg)
             return
         end if
         ! A NaN bound is unordered against every stored real (key_cmp's </>
         ! both read false), so it cannot define a band. Reject it rather than
         ! seek on a nonsensical range.
         if (ieee_is_nan(lo) .or. ieee_is_nan(hi)) then
-            if (present(stat)) stat = SQR_INVALID
+            call report(db, SQR_INVALID, stat, errmsg)
             return
         end if
         lb = transfer(lo, lb)
         hb = transfer(hi, hb)
         call find_leading_range(db, ti, j, lb, hb, cur, rs)
-        if (present(stat)) stat = rs
+        call report(db, rs, stat, errmsg)
     end subroutine
 
-    module subroutine db_find_range_char(db, table_name, col_name, lo, hi, cur, stat)
+    module subroutine db_find_range_char(db, table_name, col_name, lo, hi, cur, stat, errmsg)
         class(db_t),        intent(inout)         :: db
         character(len=*),  intent(in)            :: table_name, col_name
         character(len=*),  intent(in)            :: lo, hi
         type(db_cursor_t), intent(out)           :: cur
         integer,           intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         integer :: ti, j, rs, lw
         character(len=:), allocatable :: lb, hb
+        call clear_last_err(db)
         call resolve_leading(db, table_name, col_name, DT_CHAR, ti, j, rs)
         if (rs /= SQR_OK) then
-            if (present(stat)) stat = rs
+            call report(db, rs, stat, errmsg)
             return
         end if
         lw = db%tables(ti)%cols(db%tables(ti)%indices(j)%col_idx(1))%csize   ! leading char member width
@@ -561,7 +580,7 @@ contains
         ! narrowing or widening the band to something the caller did not ask
         ! for; reject it instead. Trailing blanks are insignificant padding.
         if (len_trim(lo) > lw .or. len_trim(hi) > lw) then
-            if (present(stat)) stat = SQR_INVALID
+            call report(db, SQR_INVALID, stat, errmsg)
             return
         end if
         allocate(character(len=lw) :: lb, hb)
@@ -575,39 +594,41 @@ contains
             if (nhi > 0) hb(1:nhi) = hi(1:nhi)
         end associate
         call find_leading_range(db, ti, j, lb, hb, cur, rs)
-        if (present(stat)) stat = rs
+        call report(db, rs, stat, errmsg)
     end subroutine
 
     ! Pull the next live row at/after the cursor in ascending key order,
     ! skipping tombstoned rows (lazy delete leaves their index entries) and
     ! stopping at the band's upper bound. The same seek+forward idiom as
     ! index_find, but yielding one row per call rather than the first match.
-    module subroutine db_cursor_next(db, cur, row_id, buf, ok, stat)
+    module subroutine db_cursor_next(db, cur, row_id, buf, ok, stat, errmsg)
         class(db_t),        intent(inout)         :: db
         type(db_cursor_t), intent(inout)         :: cur
         integer(int32),    intent(out)           :: row_id
         character(len=*),  intent(out)           :: buf
         logical,           intent(out)           :: ok
         integer,           intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         integer :: bs, ios
         integer(int32) :: rid
         logical :: got
+        call clear_last_err(db)
         row_id = 0
         ok     = .false.
         ! A mutating call (or close) since this cursor was opened may have
         ! shifted or freed table slots; cur%ti/cur%j would then address the
         ! wrong table or run off the array. Detect it instead of risking UB.
         if (.not. db%opened) then
-            if (present(stat)) stat = SQR_INVALID
+            call report(db, SQR_INVALID, stat, errmsg)
             return
         end if
         if (cur%gen /= db%generation) then
             cur%active = .false.
-            if (present(stat)) stat = SQR_INVALID
+            call report(db, SQR_INVALID, stat, errmsg)
             return
         end if
         if (.not. cur%active) then
-            if (present(stat)) stat = SQR_OK
+            call report(db, SQR_OK, stat, errmsg)
             return
         end if
         associate (t => db%tables(cur%ti), ix => db%tables(cur%ti)%indices(cur%j))
@@ -622,18 +643,18 @@ contains
                 call bt_next(ix%bt, cur%bt, ckey, rid, got, bs)
                 if (bs /= BT_OK) then
                     cur%active = .false.
-                    if (present(stat)) stat = sqr_of_bt(bs)
+                    call report(db, sqr_of_bt(bs), stat, errmsg)
                     return
                 end if
                 if (.not. got) then
                     cur%active = .false.
-                    if (present(stat)) stat = SQR_OK
+                    call report(db, SQR_OK, stat, errmsg)
                     return
                 end if
                 if (cur%bounded) then
                     if (key_cmp_ix(t, ix, ckey, cur%hikey) > 0) then
                         cur%active = .false.
-                        if (present(stat)) stat = SQR_OK
+                        call report(db, SQR_OK, stat, errmsg)
                         return
                     end if
                 end if
@@ -641,14 +662,14 @@ contains
                 call io_check(ios)
                 if (ios /= 0) then
                     cur%active = .false.
-                    if (present(stat)) stat = SQR_ERR
+                    call report(db, SQR_ERR, stat, errmsg)
                     return
                 end if
                 if (row_status(rbuf) == ROW_ALIVE) then
                     row_id = rid
                     buf    = rbuf
                     ok     = .true.
-                    if (present(stat)) stat = SQR_OK
+                    call report(db, SQR_OK, stat, errmsg)
                     return
                 end if
             end do scan
@@ -702,59 +723,65 @@ contains
         end associate
     end subroutine
 
-    module subroutine db_get_by_key(db, table_name, col_names, keyrow, buf, stat, row_id)
+    module subroutine db_get_by_key(db, table_name, col_names, keyrow, buf, stat, errmsg, row_id)
         class(db_t),       intent(inout)         :: db
         character(len=*), intent(in)            :: table_name
         character(len=*), intent(in)            :: col_names(:)
         character(len=*), intent(in)            :: keyrow
         character(len=*), intent(out)           :: buf
         integer,          intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         integer(int32),   intent(out), optional :: row_id
         integer :: ti, rs
         integer(int32) :: rid
+        call clear_last_err(db)
         if (present(row_id)) row_id = 0
         call resolve_by_key(db, table_name, col_names, keyrow, ti, rid, rs)
         if (rs /= SQR_OK) then
-            if (present(stat)) stat = rs
+            call report(db, rs, stat, errmsg)
             return
         end if
-        call db_get(db, table_name, rid, buf, stat)
+        call db_get(db, table_name, rid, buf, stat, errmsg)
         if (present(row_id)) row_id = rid
     end subroutine
 
-    module subroutine db_update_by_key(db, table_name, col_names, keyrow, newrow, stat)
+    module subroutine db_update_by_key(db, table_name, col_names, keyrow, newrow, stat, errmsg)
         class(db_t),       intent(inout)         :: db
         character(len=*), intent(in)            :: table_name
         character(len=*), intent(in)            :: col_names(:)
         character(len=*), intent(in)            :: keyrow
         character(len=*), intent(in)            :: newrow
         integer,          intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         integer :: ti, rs
         integer(int32) :: rid
-        if (readonly_block(db, stat)) return
+        call clear_last_err(db)
+        if (readonly_block(db, stat, errmsg)) return
         call resolve_by_key(db, table_name, col_names, keyrow, ti, rid, rs)
         if (rs /= SQR_OK) then
-            if (present(stat)) stat = rs
+            call report(db, rs, stat, errmsg)
             return
         end if
-        call db_update(db, table_name, rid, newrow, stat)
+        call db_update(db, table_name, rid, newrow, stat, errmsg)
     end subroutine
 
-    module subroutine db_delete_by_key(db, table_name, col_names, keyrow, stat)
+    module subroutine db_delete_by_key(db, table_name, col_names, keyrow, stat, errmsg)
         class(db_t),       intent(inout)         :: db
         character(len=*), intent(in)            :: table_name
         character(len=*), intent(in)            :: col_names(:)
         character(len=*), intent(in)            :: keyrow
         integer,          intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         integer :: ti, rs
         integer(int32) :: rid
-        if (readonly_block(db, stat)) return
+        call clear_last_err(db)
+        if (readonly_block(db, stat, errmsg)) return
         call resolve_by_key(db, table_name, col_names, keyrow, ti, rid, rs)
         if (rs /= SQR_OK) then
-            if (present(stat)) stat = rs
+            call report(db, rs, stat, errmsg)
             return
         end if
-        call db_delete(db, table_name, rid, stat)
+        call db_delete(db, table_name, rid, stat, errmsg)
     end subroutine
 
 end submodule sqr_index

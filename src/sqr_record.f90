@@ -23,23 +23,51 @@ contains
 
     ! ===== Row operations =====
 
+    ! The common preamble of every by-id row accessor: validate the id
+    ! against the table's id space, read the record image into `rbuf`
+    ! (pre-sized to `t%record_size` by the caller), and require the row to
+    ! be live.  `stat` is SQR_NOT_FOUND for an out-of-range id or a
+    ! tombstoned row, SQR_ERR for an I/O failure ("I/O failure is not
+    ! row-absent"), SQR_OK with the image in `rbuf` otherwise.
+    subroutine load_live_row(t, row_id, rbuf, stat)
+        type(table_t),    intent(in)    :: t
+        integer(int32),   intent(in)    :: row_id
+        character(len=*), intent(inout) :: rbuf
+        integer,          intent(out)   :: stat
+        integer :: ios
+        stat = SQR_OK
+        if (row_id < 1 .or. row_id >= t%next_id) then
+            stat = SQR_NOT_FOUND
+            return
+        end if
+        read(t%unit, rec=row_id, iostat=ios) rbuf
+        call io_check(ios)
+        if (ios /= 0) then
+            stat = SQR_ERR
+            return
+        end if
+        if (row_status(rbuf) /= ROW_ALIVE) stat = SQR_NOT_FOUND
+    end subroutine
+
     ! Auto-commit bracket: each row mutator wraps its core in an implicit
     ! transaction so a mid-op failure rolls back cleanly (no torn row/index).
     ! See ac_begin/ac_end in sqr_base.  When an explicit transaction is already
     ! in flight the bracket is a no-op and the explicit commit/rollback decides.
-    module subroutine db_insert(db, table_name, buf, row_id, stat)
+    module subroutine db_insert(db, table_name, buf, row_id, stat, errmsg)
         class(db_t),       intent(inout)        :: db
         character(len=*), intent(in)           :: table_name
         character(len=*), intent(in)           :: buf
         integer(int32),   intent(out)          :: row_id
         integer,          intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         integer :: rs
         logical :: owns
+        call clear_last_err(db)
         call ac_begin(db, owns, rs)
         if (rs == SQR_OK) call ins_core(db, table_name, buf, row_id, rs)
         call ac_end(db, owns, rs)
         if (rs /= SQR_OK) row_id = 0   ! atomic: a rolled-back insert leaves no row
-        if (present(stat)) stat = rs
+        call report(db, rs, stat, errmsg)
     end subroutine
 
     subroutine ins_core(db, table_name, buf, row_id, stat)
@@ -58,6 +86,7 @@ contains
         db%generation = db%generation + 1   ! write: invalidate cursors
         idx = db_table_index(db, table_name)
         if (idx == 0) then
+            call set_last_err(db, SQR_NOT_FOUND, 'no such table: ' // trim(table_name))
             stat = SQR_NOT_FOUND
             row_id = 0
             return
@@ -115,6 +144,8 @@ contains
                                 return
                             end if
                             if (viol) then
+                                call set_last_err(db, SQR_DUP, 'unique-key violation on index over "' &
+                                    // trim(ix%columns(1)) // '"')
                                 stat = SQR_DUP
                                 row_id = 0
                                 return
@@ -155,54 +186,35 @@ contains
         end associate
     end subroutine
 
-    module subroutine db_get(db, table_name, row_id, buf, stat)
+    module subroutine db_get(db, table_name, row_id, buf, stat, errmsg)
         class(db_t),       intent(inout)        :: db
         character(len=*), intent(in)           :: table_name
         integer(int32),   intent(in)           :: row_id
         character(len=*), intent(out)          :: buf
         integer,          intent(out), optional :: stat
-        integer :: idx, ios
+        character(len=*), intent(inout), optional :: errmsg
+        integer :: idx, rs
         character(len=:), allocatable :: rbuf
+        call clear_last_err(db)
         idx = db_table_index(db, table_name)
         if (idx == 0) then
-            if (present(stat)) stat = SQR_NOT_FOUND
+            call set_last_err(db, SQR_NOT_FOUND, 'no such table: ' // trim(table_name))
+            call report(db, SQR_NOT_FOUND, stat, errmsg)
             return
         end if
         associate (t => db%tables(idx))
-            if (row_id < 1 .or. row_id >= t%next_id) then
-                if (present(stat)) stat = SQR_NOT_FOUND
-                return
-            end if
             fast: if (len(buf) == t%record_size) then
                 ! The caller's buffer IS the record image — read straight
                 ! into it: no intermediate allocation, no copy.
-                read(t%unit, rec=row_id, iostat=ios) buf
-                call io_check(ios)
-                if (ios /= 0) then      ! I/O failure is not "row absent"
-                    if (present(stat)) stat = SQR_ERR
-                    return
-                end if
-                if (row_status(buf) /= ROW_ALIVE) then
-                    if (present(stat)) stat = SQR_NOT_FOUND
-                    return
-                end if
+                call load_live_row(t, row_id, buf, rs)
             else fast
                 ! Tolerant path: truncate / blank-pad through a scratch image.
                 allocate(character(len=t%record_size) :: rbuf)
-                read(t%unit, rec=row_id, iostat=ios) rbuf
-                call io_check(ios)
-                if (ios /= 0) then      ! I/O failure is not "row absent"
-                    if (present(stat)) stat = SQR_ERR
-                    return
-                end if
-                if (row_status(rbuf) /= ROW_ALIVE) then
-                    if (present(stat)) stat = SQR_NOT_FOUND
-                    return
-                end if
-                buf = rbuf
+                call load_live_row(t, row_id, rbuf, rs)
+                if (rs == SQR_OK) buf = rbuf
             end if fast
         end associate
-        if (present(stat)) stat = SQR_OK
+        call report(db, rs, stat, errmsg)
     end subroutine
 
     ! Rewrite an existing live row at the same record slot. Records are
@@ -212,18 +224,20 @@ contains
     ! be removed and reinserted, or a later lookup by the *old* key would
     ! resolve to this still-live row (index_find trusts the index and does not
     ! re-check the column value).
-    module subroutine db_update(db, table_name, row_id, buf, stat)
+    module subroutine db_update(db, table_name, row_id, buf, stat, errmsg)
         class(db_t),       intent(inout)        :: db
         character(len=*), intent(in)           :: table_name
         integer(int32),   intent(in)           :: row_id
         character(len=*), intent(in)           :: buf
         integer,          intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         integer :: rs
         logical :: owns
+        call clear_last_err(db)
         call ac_begin(db, owns, rs)
         if (rs == SQR_OK) call upd_core(db, table_name, row_id, buf, rs)
         call ac_end(db, owns, rs)
-        if (present(stat)) stat = rs
+        call report(db, rs, stat, errmsg)
     end subroutine
 
     subroutine upd_core(db, table_name, row_id, buf, stat)
@@ -242,6 +256,7 @@ contains
         db%generation = db%generation + 1   ! write: invalidate cursors
         idx = db_table_index(db, table_name)
         if (idx == 0) then
+            call set_last_err(db, SQR_NOT_FOUND, 'no such table: ' // trim(table_name))
             stat = SQR_NOT_FOUND
             return
         end if
@@ -252,21 +267,9 @@ contains
                 stat = SQR_INVALID
                 return
             end if
-            if (row_id < 1 .or. row_id >= t%next_id) then
-                stat = SQR_NOT_FOUND
-                return
-            end if
             allocate(character(len=t%record_size) :: rbuf)
-            read(t%unit, rec=row_id, iostat=ios) rbuf
-            call io_check(ios)
-            if (ios /= 0) then          ! I/O failure is not "row absent"
-                stat = SQR_ERR
-                return
-            end if
-            if (row_status(rbuf) /= ROW_ALIVE) then
-                stat = SQR_NOT_FOUND
-                return
-            end if
+            call load_live_row(t, row_id, rbuf, stat)
+            if (stat /= SQR_OK) return
 
             ! Build the new record image from the caller buffer.
             allocate(character(len=t%record_size) :: wbuf)
@@ -337,6 +340,8 @@ contains
                                 return
                             end if
                             if (viol) then
+                                call set_last_err(db, SQR_DUP, 'unique-key violation on index over "' &
+                                    // trim(ix%columns(1)) // '"')
                                 stat = SQR_DUP
                                 return
                             end if
@@ -396,17 +401,19 @@ contains
         end associate
     end subroutine
 
-    module subroutine db_delete(db, table_name, row_id, stat)
+    module subroutine db_delete(db, table_name, row_id, stat, errmsg)
         class(db_t),       intent(inout)        :: db
         character(len=*), intent(in)           :: table_name
         integer(int32),   intent(in)           :: row_id
         integer,          intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         integer :: rs
         logical :: owns
+        call clear_last_err(db)
         call ac_begin(db, owns, rs)
         if (rs == SQR_OK) call del_core(db, table_name, row_id, rs)
         call ac_end(db, owns, rs)
-        if (present(stat)) stat = rs
+        call report(db, rs, stat, errmsg)
     end subroutine
 
     subroutine del_core(db, table_name, row_id, stat)
@@ -421,25 +428,14 @@ contains
         db%generation = db%generation + 1   ! write: invalidate cursors
         idx = db_table_index(db, table_name)
         if (idx == 0) then
+            call set_last_err(db, SQR_NOT_FOUND, 'no such table: ' // trim(table_name))
             stat = SQR_NOT_FOUND
             return
         end if
         associate (t => db%tables(idx))
-            if (row_id < 1 .or. row_id >= t%next_id) then
-                stat = SQR_NOT_FOUND
-                return
-            end if
             allocate(character(len=t%record_size) :: rbuf)
-            read(t%unit, rec=row_id, iostat=ios) rbuf
-            call io_check(ios)
-            if (ios /= 0) then          ! I/O failure is not "row absent"
-                stat = SQR_ERR
-                return
-            end if
-            if (row_status(rbuf) /= ROW_ALIVE) then
-                stat = SQR_NOT_FOUND
-                return
-            end if
+            call load_live_row(t, row_id, rbuf, stat)
+            if (stat /= SQR_OK) return
             ! Capture the live image before tombstoning it in place (rbuf is
             ! about to be mutated), so a rollback brings the row back alive.
             call journal_record(db, t, row_id, rbuf, rs)
@@ -458,19 +454,22 @@ contains
         end associate
     end subroutine
 
-    module subroutine db_scan(db, table_name, cb, ctx, stat)
+    module subroutine db_scan(db, table_name, cb, ctx, stat, errmsg)
         class(db_t),       intent(inout)        :: db
         character(len=*), intent(in)           :: table_name
         procedure(scan_cb)                     :: cb
         class(*),         intent(inout)        :: ctx
         integer,          intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         integer :: idx, ios
         integer(int32) :: rid
         logical :: stop_flag
         character(len=:), allocatable :: rbuf
+        call clear_last_err(db)
         idx = db_table_index(db, table_name)
         if (idx == 0) then
-            if (present(stat)) stat = SQR_NOT_FOUND
+            call set_last_err(db, SQR_NOT_FOUND, 'no such table: ' // trim(table_name))
+            call report(db, SQR_NOT_FOUND, stat, errmsg)
             return
         end if
         associate (t => db%tables(idx))
@@ -479,7 +478,7 @@ contains
                 read(t%unit, rec=rid, iostat=ios) rbuf
                 call io_check(ios)
                 if (ios /= 0) then          ! stop, don't silently omit rows
-                    if (present(stat)) stat = SQR_ERR
+                    call report(db, SQR_ERR, stat, errmsg)
                     return
                 end if
                 if (row_status(rbuf) /= ROW_ALIVE) cycle scan_loop
@@ -487,24 +486,26 @@ contains
                 if (stop_flag) exit scan_loop
             end do scan_loop
         end associate
-        if (present(stat)) stat = SQR_OK
+        call report(db, SQR_OK, stat, errmsg)
     end subroutine
 
     ! ===== Variable-length text (blob-backed) =====
 
-    module subroutine db_set_text(db, table_name, row_id, col_name, text, stat)
+    module subroutine db_set_text(db, table_name, row_id, col_name, text, stat, errmsg)
         class(db_t),       intent(inout)        :: db
         character(len=*), intent(in)           :: table_name
         integer(int32),   intent(in)           :: row_id
         character(len=*), intent(in)           :: col_name
         character(len=*), intent(in)           :: text
         integer,          intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         integer :: rs
         logical :: owns
+        call clear_last_err(db)
         call ac_begin(db, owns, rs)
         if (rs == SQR_OK) call set_text_core(db, table_name, row_id, col_name, text, rs)
         call ac_end(db, owns, rs)
-        if (present(stat)) stat = rs
+        call report(db, rs, stat, errmsg)
     end subroutine
 
     subroutine set_text_core(db, table_name, row_id, col_name, text, stat)
@@ -521,14 +522,13 @@ contains
         if (readonly_block(db, stat)) return
         idx = db_table_index(db, table_name)
         if (idx == 0) then
+            call set_last_err(db, SQR_NOT_FOUND, 'no such table: ' // trim(table_name))
             stat = SQR_NOT_FOUND
             return
         end if
         associate (t => db%tables(idx))
-            if (row_id < 1 .or. row_id >= t%next_id) then
-                stat = SQR_NOT_FOUND
-                return
-            end if
+            ! Argument checks before any row I/O (matching the buffer-length
+            ! check in upd_core).
             ci = col_index(t, col_name)
             if (ci == 0) then
                 stat = SQR_NOT_FOUND
@@ -539,16 +539,8 @@ contains
                 return
             end if
             allocate(character(len=t%record_size) :: rbuf)
-            read(t%unit, rec=row_id, iostat=ios) rbuf
-            call io_check(ios)
-            if (ios /= 0) then          ! I/O failure is not "row absent"
-                stat = SQR_ERR
-                return
-            end if
-            if (row_status(rbuf) /= ROW_ALIVE) then
-                stat = SQR_NOT_FOUND
-                return
-            end if
+            call load_live_row(t, row_id, rbuf, stat)
+            if (stat /= SQR_OK) return
             off = t%blob_next
             if (len(text) > 0) then
                 ! The text is appended at blob_next, the blob file's end, so the
@@ -589,50 +581,45 @@ contains
         end associate
     end subroutine
 
-    module subroutine db_get_text(db, table_name, row_id, col_name, text, stat)
+    module subroutine db_get_text(db, table_name, row_id, col_name, text, stat, errmsg)
         class(db_t),       intent(inout)            :: db
         character(len=*), intent(in)               :: table_name
         integer(int32),   intent(in)               :: row_id
         character(len=*), intent(in)               :: col_name
         character(len=:), allocatable, intent(out) :: text
         integer,          intent(out), optional    :: stat
-        integer :: idx, ci, ios
+        character(len=*), intent(inout), optional :: errmsg
+        integer :: idx, ci, ios, rs
         integer(int64) :: off
         integer(int32) :: length
         character(len=:), allocatable :: rbuf
+        call clear_last_err(db)
         text = ''
         idx = db_table_index(db, table_name)
         if (idx == 0) then
-            if (present(stat)) stat = SQR_NOT_FOUND
+            call set_last_err(db, SQR_NOT_FOUND, 'no such table: ' // trim(table_name))
+            call report(db, SQR_NOT_FOUND, stat, errmsg)
             return
         end if
         associate (t => db%tables(idx))
-            if (row_id < 1 .or. row_id >= t%next_id) then
-                if (present(stat)) stat = SQR_NOT_FOUND
-                return
-            end if
+            ! Argument checks before any row I/O (matching set_text_core).
             ci = col_index(t, col_name)
             if (ci == 0) then
-                if (present(stat)) stat = SQR_NOT_FOUND
+                call report(db, SQR_NOT_FOUND, stat, errmsg)
                 return
             end if
             if (t%cols(ci)%dtype /= DT_TEXT) then
-                if (present(stat)) stat = SQR_INVALID
+                call report(db, SQR_INVALID, stat, errmsg)
                 return
             end if
             allocate(character(len=t%record_size) :: rbuf)
-            read(t%unit, rec=row_id, iostat=ios) rbuf
-            call io_check(ios)
-            if (ios /= 0) then          ! I/O failure is not "row absent"
-                if (present(stat)) stat = SQR_ERR
-                return
-            end if
-            if (row_status(rbuf) /= ROW_ALIVE) then
-                if (present(stat)) stat = SQR_NOT_FOUND
+            call load_live_row(t, row_id, rbuf, rs)
+            if (rs /= SQR_OK) then
+                call report(db, rs, stat, errmsg)
                 return
             end if
             if (row_is_null(rbuf, t%cols(ci))) then   ! NULL reads as absent
-                if (present(stat)) stat = SQR_OK
+                call report(db, SQR_OK, stat, errmsg)
                 return                                 ! text already ''
             end if
             call row_get_text_desc(rbuf, t%cols(ci), off, length)
@@ -646,7 +633,7 @@ contains
                     integer(int64) :: bsize
                     inquire(unit=t%blob_unit, size=bsize)
                     if (off < 1 .or. off - 1 + int(length, int64) > bsize) then
-                        if (present(stat)) stat = SQR_INVALID
+                        call report(db, SQR_INVALID, stat, errmsg)
                         return
                     end if
                 end block bound_desc
@@ -657,19 +644,19 @@ contains
                 allocate(character(len=length) :: text, stat=ios)
                 if (ios /= 0) then
                     text = ''
-                    if (present(stat)) stat = SQR_ERR
+                    call report(db, SQR_ERR, stat, errmsg)
                     return
                 end if
                 read(t%blob_unit, pos=off, iostat=ios) text
                 call io_check(ios)
                 if (ios /= 0) then
                     text = ''
-                    if (present(stat)) stat = SQR_ERR
+                    call report(db, SQR_ERR, stat, errmsg)
                     return
                 end if
             end if
         end associate
-        if (present(stat)) stat = SQR_OK
+        call report(db, SQR_OK, stat, errmsg)
     end subroutine
 
     ! ===== Per-row index maintenance =====

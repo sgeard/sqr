@@ -18,10 +18,11 @@ submodule (sql:sql_base) sql_executor
     implicit none
 
     !! Gathering context for a `db_scan` (and reused by the cursor path): the
-    !! table being read, the WHERE clause to apply, and the growing set of
-    !! matching rows (ids + record buffers).
+    !! table's column metadata (a `db_describe` snapshot — valid for the
+    !! statement, since no DDL can interleave), the WHERE clause to apply,
+    !! and the growing set of matching rows (ids + record buffers).
     type :: row_match_ctx_t
-        type(table_t), pointer :: t => null()
+        type(column_t), allocatable :: cols(:)
         logical :: has_where = .false.
         type(sql_cond_group_t), allocatable :: groups(:)
         integer :: reclen = 0
@@ -211,8 +212,9 @@ contains
         integer,            intent(out),  optional :: stat
         character(len=*),   intent(inout), optional :: errmsg
 
-        integer :: ti, rs, r, c, nrows, ncols, ci
+        integer :: ti, rs, r, c, nrows, ncols, ci, reclen
         integer, allocatable :: target(:)        ! value-column k -> table column index
+        type(column_t), allocatable :: cols(:)
         character(len=:), allocatable :: buf
         integer(int32) :: rid
         logical :: own
@@ -220,38 +222,37 @@ contains
 
         ti = require_table(db, stmt%table, stat, errmsg)
         if (ti == 0) return
+        call db_describe(db, trim(stmt%table), cols)
         nrows = size(stmt%values, 1)
         ncols = size(stmt%values, 2)
 
         ! Map each VALUES position to a table column.
         allocate(target(ncols))
-        associate (t => db%tables(ti))
-            if (stmt%insert_named) then
-                do c = 1, ncols
-                    ci = col_index(t, trim(stmt%names(c)))
-                    if (ci == 0) then
-                        call set_err(stat, errmsg, SQR_INVALID, 'no such column: ' // trim(stmt%names(c)))
-                        return
-                    end if
-                    ! A column named twice would silently take the later
-                    ! value — reject rather than guess intent.
-                    if (any(target(1:c-1) == ci)) then
-                        call set_err(stat, errmsg, SQR_INVALID, 'duplicate column: ' // trim(stmt%names(c)))
-                        return
-                    end if
-                    target(c) = ci
-                end do
-            else
-                if (ncols /= t%ncols) then
-                    call set_err(stat, errmsg, SQR_INVALID, &
-                        'expected ' // itoa(t%ncols) // ' values per row, got ' // itoa(ncols))
+        if (stmt%insert_named) then
+            do c = 1, ncols
+                ci = col_index(cols, trim(stmt%names(c)))
+                if (ci == 0) then
+                    call set_err(stat, errmsg, SQR_INVALID, 'no such column: ' // trim(stmt%names(c)))
                     return
                 end if
-                target = [(c, c = 1, ncols)]
+                ! A column named twice would silently take the later
+                ! value — reject rather than guess intent.
+                if (any(target(1:c-1) == ci)) then
+                    call set_err(stat, errmsg, SQR_INVALID, 'duplicate column: ' // trim(stmt%names(c)))
+                    return
+                end if
+                target(c) = ci
+            end do
+        else
+            if (ncols /= size(cols)) then
+                call set_err(stat, errmsg, SQR_INVALID, &
+                    'expected ' // itoa(size(cols)) // ' values per row, got ' // itoa(ncols))
+                return
             end if
-        end associate
+            target = [(c, c = 1, ncols)]
+        end if
 
-        own = .not. db%jrnl%active           ! own the txn unless inside an explicit one
+        own = .not. db_in_txn(db)            ! own the txn unless inside an explicit one
         if (own) then
             call db_begin(db, rs)
             if (rs /= SQR_OK) then
@@ -260,23 +261,22 @@ contains
             end if
         end if
 
+        reclen = db_record_size(db, trim(stmt%table))
         rows: do r = 1, nrows
-            associate (t => db%tables(ti))
-                call row_alloc(buf, t%record_size)
-                ! Columns not named default to NULL.
-                do c = 1, t%ncols
-                    call row_set_null(buf, t%cols(c))
-                end do
-                do c = 1, ncols
-                    em = ''
-                    call put_lit(buf, db%tables(ti)%cols(target(c)), stmt%values(r, c), rs, em)
-                    if (rs /= SQR_OK) then
-                        call fail_txn(db, own)
-                        call set_err(stat, errmsg, rs, trim(em))
-                        return
-                    end if
-                end do
-            end associate
+            call row_alloc(buf, reclen)
+            ! Columns not named default to NULL.
+            do c = 1, size(cols)
+                call row_set_null(buf, cols(c))
+            end do
+            do c = 1, ncols
+                em = ''
+                call put_lit(buf, cols(target(c)), stmt%values(r, c), rs, em)
+                if (rs /= SQR_OK) then
+                    call fail_txn(db, own)
+                    call set_err(stat, errmsg, rs, trim(em))
+                    return
+                end if
+            end do
             call db_insert(db, trim(stmt%table), buf, rid, rs)
             if (rs /= SQR_OK) then
                 call fail_txn(db, own)
@@ -285,10 +285,10 @@ contains
             end if
             ! Write any TEXT column values now that the row exists.
             do c = 1, ncols
-                if (db%tables(ti)%cols(target(c))%dtype /= DT_TEXT) cycle
+                if (cols(target(c))%dtype /= DT_TEXT) cycle
                 if (stmt%values(r, c)%ltype == LIT_NULL) cycle
                 call db_set_text(db, trim(stmt%table), rid, &
-                    trim(db%tables(ti)%cols(target(c))%name), stmt%values(r, c)%sval, rs)
+                    trim(cols(target(c))%name), stmt%values(r, c)%sval, rs)
                 if (rs /= SQR_OK) then
                     call fail_txn(db, own)
                     call set_err(stat, errmsg, rs, 'failed to write text value')
@@ -317,16 +317,18 @@ contains
         character(len=*),   intent(inout), optional :: errmsg
         type(row_match_ctx_t) :: g
         integer :: ti, rs, k
+        type(column_t), allocatable :: cols(:)
         logical :: own
         ti = require_table(db, stmt%table, stat, errmsg)
         if (ti == 0) return
-        if (.not. validate_where(db%tables(ti), stmt, stat, errmsg)) return
-        call gather(db, ti, stmt, g, rs, errmsg)
+        call db_describe(db, trim(stmt%table), cols)
+        if (.not. validate_where(cols, stmt, stat, errmsg)) return
+        call gather(db, stmt, g, rs, errmsg)
         if (rs /= SQR_OK) then
             if (present(stat)) stat = rs
             return
         end if
-        own = .not. db%jrnl%active
+        own = .not. db_in_txn(db)
         if (own) then
             call db_begin(db, rs)
             if (rs /= SQR_OK) then; call set_err(stat, errmsg, rs, 'cannot begin transaction'); return; end if
@@ -357,31 +359,31 @@ contains
         type(row_match_ctx_t) :: g
         integer :: ti, rs, k, s, ci
         integer, allocatable :: setcol(:)
+        type(column_t), allocatable :: cols(:)
         character(len=:), allocatable :: buf
         logical :: own
         character(len=160) :: em
 
         ti = require_table(db, stmt%table, stat, errmsg)
         if (ti == 0) return
-        if (.not. validate_where(db%tables(ti), stmt, stat, errmsg)) return
+        call db_describe(db, trim(stmt%table), cols)
+        if (.not. validate_where(cols, stmt, stat, errmsg)) return
 
         ! Resolve SET target columns.
         allocate(setcol(size(stmt%set_cols)))
-        associate (t => db%tables(ti))
-            do s = 1, size(stmt%set_cols)
-                ci = col_index(t, trim(stmt%set_cols(s)))
-                if (ci == 0) then
-                    call set_err(stat, errmsg, SQR_INVALID, 'no such column: ' // trim(stmt%set_cols(s)))
-                    return
-                end if
-                setcol(s) = ci
-            end do
-        end associate
+        do s = 1, size(stmt%set_cols)
+            ci = col_index(cols, trim(stmt%set_cols(s)))
+            if (ci == 0) then
+                call set_err(stat, errmsg, SQR_INVALID, 'no such column: ' // trim(stmt%set_cols(s)))
+                return
+            end if
+            setcol(s) = ci
+        end do
 
-        call gather(db, ti, stmt, g, rs, errmsg)
+        call gather(db, stmt, g, rs, errmsg)
         if (rs /= SQR_OK) then; if (present(stat)) stat = rs; return; end if
 
-        own = .not. db%jrnl%active
+        own = .not. db_in_txn(db)
         if (own) then
             call db_begin(db, rs)
             if (rs /= SQR_OK) then; call set_err(stat, errmsg, rs, 'cannot begin transaction'); return; end if
@@ -390,12 +392,12 @@ contains
         ! row's image in g%bufs, so reuse it (same length every iteration —
         ! the allocatable assignment keeps the allocation) instead of a
         ! per-row row_alloc + db_get round-trip.
-        call row_alloc(buf, db%tables(ti)%record_size)
+        call row_alloc(buf, db_record_size(db, trim(stmt%table)))
         rows: do k = 1, g%n
             buf = g%bufs(k)
             do s = 1, size(setcol)
                 em = ''
-                call put_lit(buf, db%tables(ti)%cols(setcol(s)), stmt%set_vals(s), rs, em)
+                call put_lit(buf, cols(setcol(s)), stmt%set_vals(s), rs, em)
                 if (rs /= SQR_OK) then
                     call fail_txn(db, own); call set_err(stat, errmsg, rs, trim(em)); return
                 end if
@@ -414,10 +416,10 @@ contains
             end if
             ! TEXT columns in the SET list.
             do s = 1, size(setcol)
-                if (db%tables(ti)%cols(setcol(s))%dtype /= DT_TEXT) cycle
+                if (cols(setcol(s))%dtype /= DT_TEXT) cycle
                 if (stmt%set_vals(s)%ltype == LIT_NULL) cycle
                 call db_set_text(db, trim(stmt%table), g%rids(k), &
-                    trim(db%tables(ti)%cols(setcol(s))%name), stmt%set_vals(s)%sval, rs)
+                    trim(cols(setcol(s))%name), stmt%set_vals(s)%sval, rs)
                 if (rs /= SQR_OK) then
                     call fail_txn(db, own); call set_err(stat, errmsg, rs, 'failed to write text value'); return
                 end if
@@ -441,28 +443,30 @@ contains
         type(row_match_ctx_t) :: g
         integer :: ti, rs, nproj, j, i, oc, nout
         integer, allocatable :: proj(:), perm(:)
+        type(column_t), allocatable :: cols(:)
 
         ti = require_table(db, stmt%table, stat, errmsg)
         if (ti == 0) return
-        if (.not. validate_where(db%tables(ti), stmt, stat, errmsg)) return
-        if (.not. validate_projection(db%tables(ti), stmt, proj, stat, errmsg)) return
+        call db_describe(db, trim(stmt%table), cols)
+        if (.not. validate_where(cols, stmt, stat, errmsg)) return
+        if (.not. validate_projection(cols, stmt, proj, stat, errmsg)) return
         nproj = size(proj)
 
         ! ORDER BY column (must exist and be sortable).
         oc = 0
         if (stmt%has_order) then
-            oc = col_index(db%tables(ti), trim(stmt%order_col))
+            oc = col_index(cols, trim(stmt%order_col))
             if (oc == 0) then
                 call set_err(stat, errmsg, SQR_INVALID, 'no such column: ' // trim(stmt%order_col))
                 return
             end if
-            if (db%tables(ti)%cols(oc)%dtype == DT_TEXT) then
+            if (cols(oc)%dtype == DT_TEXT) then
                 call set_err(stat, errmsg, SQR_INVALID, 'cannot ORDER BY a TEXT column')
                 return
             end if
         end if
 
-        call gather(db, ti, stmt, g, rs, errmsg)
+        call gather(db, stmt, g, rs, errmsg)
         if (rs /= SQR_OK) then; if (present(stat)) stat = rs; return; end if
 
         ! Order the gathered rows.
@@ -480,12 +484,13 @@ contains
         res%ncols = nproj
         allocate(res%colnames(nproj))
         do j = 1, nproj
-            res%colnames(j) = db%tables(ti)%cols(proj(j))%name
+            res%colnames(j) = cols(proj(j))%name
         end do
         allocate(res%cells(nout, nproj))
         do i = 1, nout
             do j = 1, nproj
-                call render_cell(db, ti, g%rids(perm(i)), g%bufs(perm(i)), proj(j), res%cells(i, j))
+                call render_cell(db, trim(stmt%table), cols(proj(j)), &
+                                 g%rids(perm(i)), g%bufs(perm(i)), res%cells(i, j))
             end do
         end do
     end subroutine
@@ -495,9 +500,8 @@ contains
     ! Gather every live row matching `stmt`'s WHERE into `g`.  Uses an index
     ! cursor when the WHERE is a single equality on an indexed column,
     ! otherwise a full scan; the full predicate is re-applied either way.
-    subroutine gather(db, ti, stmt, g, rs, errmsg)
+    subroutine gather(db, stmt, g, rs, errmsg)
         type(db_t),            intent(inout), target :: db
-        integer,               intent(in)    :: ti
         type(sql_stmt_t),      intent(in)    :: stmt
         type(row_match_ctx_t), intent(out)   :: g
         integer,               intent(out)   :: rs
@@ -505,8 +509,8 @@ contains
         logical :: used_index
 
         rs = SQR_OK
-        g%t => db%tables(ti)
-        g%reclen = db%tables(ti)%record_size
+        call db_describe(db, trim(stmt%table), g%cols)
+        g%reclen = db_record_size(db, trim(stmt%table))
         g%has_where = stmt%has_where
         if (stmt%has_where) then
             g%groups = stmt%where_groups
@@ -519,7 +523,7 @@ contains
                 do gi = 1, size(g%groups)
                     do ci = 1, size(g%groups(gi)%conds)
                         associate (c => g%groups(gi)%conds(ci))
-                            c%col_ord = col_index(db%tables(ti), trim(c%col))
+                            c%col_ord = col_index(g%cols, trim(c%col))
                         end associate
                     end do
                 end do
@@ -528,7 +532,7 @@ contains
         g%n = 0
 
         used_index = .false.
-        if (stmt%has_where) call try_index_gather(db, ti, stmt, g, used_index, rs, errmsg)
+        if (stmt%has_where) call try_index_gather(db, stmt, g, used_index, rs, errmsg)
         if (rs /= SQR_OK) return
         if (used_index) return
 
@@ -544,9 +548,8 @@ contains
     ! Any other shape — multi-condition, OR groups, `<>`, IS [NOT] NULL,
     ! un-indexed or literal/column type mismatch — leaves used_index
     ! .false. (caller falls back to a scan).
-    subroutine try_index_gather(db, ti, stmt, g, used_index, rs, errmsg)
+    subroutine try_index_gather(db, stmt, g, used_index, rs, errmsg)
         type(db_t),            intent(inout), target :: db
-        integer,               intent(in)    :: ti
         type(sql_stmt_t),      intent(in)    :: stmt
         type(row_match_ctx_t), intent(inout) :: g
         logical,               intent(out)   :: used_index
@@ -570,11 +573,11 @@ contains
         case default
             return                          ! <>, IS [NOT] NULL: scan
         end select
-        ci = col_index(db%tables(ti), trim(c%col))
+        ci = col_index(g%cols, trim(c%col))
         if (ci == 0) return
 
         ! Open the band on the column's type.
-        associate (col => db%tables(ti)%cols(ci))
+        associate (col => g%cols(ci))
             select case (col%dtype)
             case (DT_INT)
                 ! cond_true compares in real64 space, so a REAL literal can match
@@ -663,7 +666,7 @@ contains
                 return
             end if
             if (.not. ok) exit pull
-            if (row_matches(g%t, g%groups, buf)) call ctx_append(g, rid, buf)
+            if (row_matches(g%cols, g%groups, buf)) call ctx_append(g, rid, buf)
         end do pull
         used_index = .true.
     end subroutine
@@ -680,7 +683,7 @@ contains
         type is (row_match_ctx_t)
             if (.not. ctx%has_where) then
                 call ctx_append(ctx, row_id, buf)
-            else if (row_matches(ctx%t, ctx%groups, buf)) then
+            else if (row_matches(ctx%cols, ctx%groups, buf)) then
                 call ctx_append(ctx, row_id, buf)
             end if
         end select
@@ -710,8 +713,8 @@ contains
     ! ===================== WHERE evaluation =====================
 
     ! Does a row buffer satisfy the WHERE clause (OR of AND-groups)?
-    function row_matches(t, groups, buf) result(yes)
-        type(table_t),          intent(in) :: t
+    function row_matches(cols, groups, buf) result(yes)
+        type(column_t),         intent(in) :: cols(:)
         type(sql_cond_group_t), intent(in) :: groups(:)
         character(len=*),       intent(in) :: buf
         logical :: yes
@@ -721,7 +724,7 @@ contains
         do gi = 1, size(groups)
             grp = .true.
             do ci = 1, size(groups(gi)%conds)
-                if (.not. cond_true(t, groups(gi)%conds(ci), buf)) then
+                if (.not. cond_true(cols, groups(gi)%conds(ci), buf)) then
                     grp = .false.
                     exit
                 end if
@@ -756,8 +759,8 @@ contains
     ! Evaluate one validated condition against a row.  A NULL column value
     ! makes any comparison / BETWEEN false (SQL three-valued logic collapsed to
     ! "not matched"); IS NULL / IS NOT NULL test the null bit directly.
-    function cond_true(t, c, buf) result(yes)
-        type(table_t),    intent(in) :: t
+    function cond_true(cols, c, buf) result(yes)
+        type(column_t),   intent(in) :: cols(:)
         type(sql_cond_t), intent(in) :: c
         character(len=*), intent(in) :: buf
         logical :: yes
@@ -766,9 +769,9 @@ contains
         real(real64) :: v
         yes = .false.
         ci = c%col_ord                       ! resolved once in gather
-        if (ci == 0) ci = col_index(t, trim(c%col))   ! unresolved caller: look up
+        if (ci == 0) ci = col_index(cols, trim(c%col))   ! unresolved caller: look up
         if (ci == 0) return
-        associate (col => t%cols(ci))
+        associate (col => cols(ci))
             isnull = row_is_null(buf, col)
             select case (c%op)
             case (OP_ISNULL);    yes = isnull;        return
@@ -814,8 +817,8 @@ contains
     ! operators match the column type, literals are compatible, and TEXT
     ! columns are only null-tested.  Doing this once up front keeps per-row
     ! evaluation branch-free of error handling.
-    function validate_where(t, stmt, stat, errmsg) result(ok)
-        type(table_t),    intent(in) :: t
+    function validate_where(cols, stmt, stat, errmsg) result(ok)
+        type(column_t),   intent(in) :: cols(:)
         type(sql_stmt_t), intent(in) :: stmt
         integer,          intent(out),  optional :: stat
         character(len=*), intent(inout), optional :: errmsg
@@ -825,7 +828,7 @@ contains
         if (.not. stmt%has_where) return
         do gi = 1, size(stmt%where_groups)
             do ci = 1, size(stmt%where_groups(gi)%conds)
-                if (.not. validate_cond(t, stmt%where_groups(gi)%conds(ci), stat, errmsg)) then
+                if (.not. validate_cond(cols, stmt%where_groups(gi)%conds(ci), stat, errmsg)) then
                     ok = .false.
                     return
                 end if
@@ -833,15 +836,15 @@ contains
         end do
     end function
 
-    function validate_cond(t, c, stat, errmsg) result(ok)
-        type(table_t),    intent(in) :: t
+    function validate_cond(cols, c, stat, errmsg) result(ok)
+        type(column_t),   intent(in) :: cols(:)
         type(sql_cond_t), intent(in) :: c
         integer,          intent(out),  optional :: stat
         character(len=*), intent(inout), optional :: errmsg
         logical :: ok
         integer :: ci
         ok = .false.
-        ci = col_index(t, trim(c%col))
+        ci = col_index(cols, trim(c%col))
         if (ci == 0) then
             call set_err(stat, errmsg, SQR_INVALID, 'no such column: ' // trim(c%col))
             return
@@ -851,7 +854,7 @@ contains
             ok = .true.
             return
         end select
-        associate (col => t%cols(ci))
+        associate (col => cols(ci))
             if (col%dtype == DT_TEXT) then
                 call set_err(stat, errmsg, SQR_INVALID, &
                     'cannot compare TEXT column "' // trim(c%col) // '" (only IS [NOT] NULL)')
@@ -896,8 +899,8 @@ contains
         ok = .true.
     end function
 
-    function validate_projection(t, stmt, proj, stat, errmsg) result(ok)
-        type(table_t),       intent(in)  :: t
+    function validate_projection(cols, stmt, proj, stat, errmsg) result(ok)
+        type(column_t),      intent(in)  :: cols(:)
         type(sql_stmt_t),    intent(in)  :: stmt
         integer, allocatable, intent(out) :: proj(:)
         integer,             intent(out),  optional :: stat
@@ -906,13 +909,13 @@ contains
         integer :: j, ci
         ok = .false.
         if (stmt%select_star) then
-            proj = [(j, j = 1, t%ncols)]
+            proj = [(j, j = 1, size(cols))]
             ok = .true.
             return
         end if
         allocate(proj(size(stmt%names)))
         do j = 1, size(stmt%names)
-            ci = col_index(t, trim(stmt%names(j)))
+            ci = col_index(cols, trim(stmt%names(j)))
             if (ci == 0) then
                 call set_err(stat, errmsg, SQR_INVALID, 'no such column: ' // trim(stmt%names(j)))
                 return
@@ -935,13 +938,13 @@ contains
         if (ti == 0) call set_err(stat, errmsg, SQR_NOT_FOUND, 'no such table: ' // trim(name))
     end function
 
-    pure function col_index(t, name) result(ci)
-        type(table_t),    intent(in) :: t
+    pure function col_index(cols, name) result(ci)
+        type(column_t),   intent(in) :: cols(:)
         character(len=*), intent(in) :: name
         integer :: ci, j
         ci = 0
-        do j = 1, t%ncols
-            if (trim(t%cols(j)%name) == trim(name)) then
+        do j = 1, size(cols)
+            if (trim(cols(j)%name) == trim(name)) then
                 ci = j
                 return
             end if
@@ -1011,35 +1014,33 @@ contains
     end subroutine
 
     ! Render one column of a row into an output cell.
-    subroutine render_cell(db, ti, rid, buf, ci, cell)
+    subroutine render_cell(db, tname, col, rid, buf, cell)
         type(db_t),       intent(inout) :: db
-        integer,          intent(in)    :: ti
+        character(len=*), intent(in)    :: tname
+        type(column_t),   intent(in)    :: col
         integer(int32),   intent(in)    :: rid
         character(len=*), intent(in)    :: buf
-        integer,          intent(in)    :: ci
         type(sql_cell_t), intent(out)   :: cell
         character(len=32) :: nb
         integer :: rs
-        associate (col => db%tables(ti)%cols(ci))
-            if (row_is_null(buf, col)) then
-                cell%is_null = .true.
-                cell%text = 'NULL'
-                return
-            end if
-            select case (col%dtype)
-            case (DT_INT)
-                write(nb, '(i0)') row_get_int(buf, col)
-                cell%text = trim(nb)
-            case (DT_REAL)
-                write(nb, '(es15.8)') row_get_real(buf, col)
-                cell%text = trim(adjustl(nb))
-            case (DT_CHAR)
-                cell%text = trim(row_get_char(buf, col))
-            case (DT_TEXT)
-                call db_get_text(db, trim(db%tables(ti)%name), rid, trim(col%name), cell%text, rs)
-                if (rs /= SQR_OK .or. .not. allocated(cell%text)) cell%text = ''
-            end select
-        end associate
+        if (row_is_null(buf, col)) then
+            cell%is_null = .true.
+            cell%text = 'NULL'
+            return
+        end if
+        select case (col%dtype)
+        case (DT_INT)
+            write(nb, '(i0)') row_get_int(buf, col)
+            cell%text = trim(nb)
+        case (DT_REAL)
+            write(nb, '(es15.8)') row_get_real(buf, col)
+            cell%text = trim(adjustl(nb))
+        case (DT_CHAR)
+            cell%text = trim(row_get_char(buf, col))
+        case (DT_TEXT)
+            call db_get_text(db, tname, rid, trim(col%name), cell%text, rs)
+            if (rs /= SQR_OK .or. .not. allocated(cell%text)) cell%text = ''
+        end select
     end subroutine
 
     ! Stable bottom-up merge sort of the row permutation: O(n log n) where
@@ -1112,7 +1113,7 @@ contains
         integer :: cmp, ca, cb
         logical :: na, nb
         real(real64) :: va, vb
-        associate (col => g%t%cols(oc))
+        associate (col => g%cols(oc))
             na = row_is_null(g%bufs(a), col)
             nb = row_is_null(g%bufs(b), col)
             if (na .or. nb) then

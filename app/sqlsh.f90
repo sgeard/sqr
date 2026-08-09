@@ -194,10 +194,12 @@ contains
             return
         end if
         do i = 1, size(names)
-            associate (t => db%tables(i))
+            block
+                type(column_t), allocatable :: cols(:)
+                call db_describe(db, trim(names(i)), cols)
                 write(output_unit,'(3a,2(i0,a))') trim(names(i)), &
-                    '  (', t%live_count, ' rows, ', t%ncols, ' cols)'
-            end associate
+                    '  (', db_row_count(db, trim(names(i))), ' rows, ', size(cols), ' cols)'
+            end block
         end do
     end subroutine
 
@@ -218,21 +220,20 @@ contains
 
     subroutine schema_one(name)
         character(len=*), intent(in) :: name
-        integer :: ti, i
-        ti = db_table_index(db, name)
-        if (ti == 0) then
+        type(column_t), allocatable :: cols(:)
+        integer :: rs, i
+        call db_describe(db, name, cols, rs)
+        if (rs /= SQR_OK) then
             write(error_unit,'(2a)') 'no such table: ', name
             return
         end if
-        associate (t => db%tables(ti))
-            write(output_unit,'(2a)') 'CREATE TABLE ', name
-            do i = 1, t%ncols
-                associate (c => t%cols(i))
-                    write(output_unit,'(4a,a)') '    ', trim(c%name), ' ', &
-                        type_text(c%dtype, c%csize), merge(',', ' ', i < t%ncols)
-                end associate
-            end do
-        end associate
+        write(output_unit,'(2a)') 'CREATE TABLE ', name
+        do i = 1, size(cols)
+            associate (c => cols(i))
+                write(output_unit,'(4a,a)') '    ', trim(c%name), ' ', &
+                    type_text(c%dtype, c%csize), merge(',', ' ', i < size(cols))
+            end associate
+        end do
     end subroutine
 
     pure function type_text(dtype, csize) result(s)

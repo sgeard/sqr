@@ -89,6 +89,8 @@ program utest_sqr
     call test_txn_structural_block()
     call test_locking()
     call test_set_readonly()
+    call test_accessors()
+    call test_last_error()
 
     call cleanup_dir()
 
@@ -4629,6 +4631,116 @@ contains
         call check(rs == SQR_INVALID, 'setro: rejected on a closed handle')
 
         ios = c_rmtree(SDIR)
+    end subroutine
+
+    ! The procedural metadata surface: db_describe / db_row_count / db_in_txn.
+    subroutine test_accessors()
+        character(len=*), parameter :: ADIR = 'utest_sqr_acc_db'
+        type(db_t) :: a
+        type(column_t) :: cols(2)
+        type(column_t), allocatable :: got(:)
+        character(len=:), allocatable :: buf
+        integer :: rs
+        integer(int32) :: rid
+        integer :: ios
+        ios = c_rmtree(ADIR)
+        cols(1)%name = 'id';   cols(1)%dtype = DT_INT;  cols(1)%csize = 4
+        cols(2)%name = 'name'; cols(2)%dtype = DT_CHAR; cols(2)%csize = 8
+
+        call db_open(a, ADIR, stat=rs)
+        call db_create_table(a, 't', cols, rs)
+        call check(rs == SQR_OK, 'acc: open + table')
+
+        call db_describe(a, 't', got, rs)
+        call check(rs == SQR_OK .and. size(got) == 2, 'acc: describe returns 2 columns')
+        call check(trim(got(1)%name) == 'id' .and. got(1)%dtype == DT_INT, &
+                   'acc: describe column 1 metadata')
+        call check(trim(got(2)%name) == 'name' .and. got(2)%csize == 8, &
+                   'acc: describe column 2 metadata')
+        call db_describe(a, 'zzz', got, rs)
+        call check(rs == SQR_NOT_FOUND .and. size(got) == 0, 'acc: describe missing table')
+
+        call check(db_row_count(a, 't') == 0, 'acc: row_count empty table')
+        call db_describe(a, 't', got)               ! re-fetch: got was left zero-length above
+        call row_alloc(buf, db_record_size(a, 't'))
+        call row_set_int(buf, got(1), 7_int32)      ! described columns carry the layout
+        call row_set_char(buf, got(2), 'seven')
+        call db_insert(a, 't', buf, rid, rs)
+        call check(db_row_count(a, 't') == 1, 'acc: row_count after insert')
+        call db_delete(a, 't', rid, rs)
+        call check(db_row_count(a, 't') == 0, 'acc: row_count after delete')
+        call check(db_row_count(a, 'zzz') == 0, 'acc: row_count missing table')
+
+        call check(.not. db_in_txn(a), 'acc: in_txn false outside txn')
+        call db_begin(a, rs)
+        call check(db_in_txn(a), 'acc: in_txn true after begin')
+        call db_commit(a, rs)
+        call check(.not. a%in_txn(), 'acc: in_txn false after commit (OO spelling)')
+
+        call db_close(a)
+        ios = c_rmtree(ADIR)
+    end subroutine
+
+    ! Sticky error state (db_last_error) and the uniform errmsg argument.
+    subroutine test_last_error()
+        character(len=*), parameter :: EDIR = 'utest_sqr_lerr_db'
+        type(db_t) :: a
+        type(column_t) :: cols(1)
+        type(column_t), allocatable :: laid(:)
+        character(len=:), allocatable :: buf, msg
+        character(len=96) :: em
+        integer :: rs, code
+        integer(int32) :: rid
+        integer :: ios
+        ios = c_rmtree(EDIR)
+        cols(1)%name = 'id'; cols(1)%dtype = DT_INT; cols(1)%csize = 4
+
+        call db_open(a, EDIR, stat=rs)
+        call db_create_table(a, 't', cols, rs)
+        call db_create_index(a, 't', 'id', rs, unique=.true.)
+        call check(rs == SQR_OK, 'lerr: open + table + unique index')
+        call db_describe(a, 't', laid)              ! layout-carrying columns
+
+        ! A failure records code + detail; the errmsg argument gets the same.
+        em = ''
+        call row_alloc(buf, db_record_size(a, 't'))
+        call row_set_int(buf, laid(1), 1_int32)
+        call db_insert(a, 'zzz', buf, rid, rs, em)
+        call check(rs == SQR_NOT_FOUND, 'lerr: insert into missing table fails')
+        call check(index(em, 'zzz') > 0, 'lerr: errmsg carries the table name')
+        call a%last_error(code, msg)
+        call check(code == SQR_NOT_FOUND, 'lerr: last_error code')
+        call check(index(msg, 'no such table: zzz') > 0, 'lerr: last_error detail')
+
+        ! Success clears the sticky state.
+        call db_insert(a, 't', buf, rid, rs)
+        call db_last_error(a, code, msg)
+        call check(rs == SQR_OK .and. code == SQR_OK .and. len(msg) == 0, &
+                   'lerr: success clears sticky state')
+
+        ! A duplicate key names the violated index.
+        call db_insert(a, 't', buf, rid, rs)
+        call db_last_error(a, code, msg)
+        call check(rs == SQR_DUP .and. code == SQR_DUP, 'lerr: duplicate key code')
+        call check(index(msg, 'unique-key') > 0 .and. index(msg, 'id') > 0, &
+                   'lerr: duplicate-key detail names the index')
+
+        ! With no site-recorded detail the canonical text is the fallback.
+        call db_undo(a, rs)
+        call db_last_error(a, code, msg)
+        call check(rs == SQR_NO_UNDO .and. msg == sqr_errstr(SQR_NO_UNDO), &
+                   'lerr: canonical fallback text')
+
+        ! Guard failures record too: a read-only handle refuses a write.
+        call db_set_readonly(a, rs)
+        em = ''
+        call db_insert(a, 't', buf, rid, rs, em)
+        call db_last_error(a, code)
+        call check(rs == SQR_READONLY .and. code == SQR_READONLY .and. &
+                   em == sqr_errstr(SQR_READONLY), 'lerr: readonly guard records')
+
+        call db_close(a)
+        ios = c_rmtree(EDIR)
     end subroutine
 
 end program utest_sqr

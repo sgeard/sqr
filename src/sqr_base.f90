@@ -46,7 +46,7 @@ submodule (sqr) sqr_base
     use :: clib_wrap, only: c_mkdir, c_path_exists, c_lock_release, &
                             c_rename, c_fsync_path, c_fsync_dir, c_remove
     use :: sqr_fault, only: io_check
-    use :: b_tree, only: btree_t, bt_open, bt_close, bt_reload, bt_sync, bt_insert, &
+    use :: b_tree, only: btree_t, bt_open, bt_close, bt_discard, bt_reload, bt_sync, bt_insert, &
                          bt_remove, bt_bulk_load, bt_seek, bt_first, bt_next, &
                          bt_cursor_t, bt_set_journal_hook, BT_OK, BT_VERSION, &
                          BT_CORRUPT
@@ -1120,10 +1120,7 @@ contains
                                 ! Abort path: drop the unit without
                                 ! flushing meta (the tree may be only
                                 ! half-initialised).
-                                if (ix%bt%unit /= -1) then
-                                    close(ix%bt%unit)
-                                    ix%bt%unit = -1
-                                end if
+                                call bt_discard(ix%bt)
                             end associate
                         end do idx_abandon
                     end if
@@ -1140,12 +1137,17 @@ contains
 
     ! Guard for write entry points. Returns .true. and sets stat=SQR_READONLY
     ! when the caller should refuse the request.
-    function readonly_block(db, stat) result(blocked)
-        type(db_t), intent(in)            :: db
-        integer,    intent(out), optional :: stat
+    function readonly_block(db, stat, errmsg) result(blocked)
+        type(db_t),       intent(inout)           :: db
+        integer,          intent(out),   optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         logical :: blocked
         blocked = db%readonly
-        if (blocked .and. present(stat)) stat = SQR_READONLY
+        if (blocked) then
+            call set_last_err(db, SQR_READONLY, sqr_errstr(SQR_READONLY))
+            if (present(stat))   stat   = SQR_READONLY
+            if (present(errmsg)) errmsg = sqr_errstr(SQR_READONLY)
+        end if
     end function
 
     ! Guard for structural / whole-table operations (create/drop table,
@@ -1157,12 +1159,17 @@ contains
     ! handle inconsistent. Returns .true. (and sets stat=SQR_INVALID) when a
     ! transaction is in flight, matching db_set_readonly's "refused while a
     ! transaction is live" contract.
-    function txn_block(db, stat) result(blocked)
-        type(db_t), intent(in)            :: db
-        integer,    intent(out), optional :: stat
+    function txn_block(db, stat, errmsg) result(blocked)
+        type(db_t),       intent(inout)           :: db
+        integer,          intent(out),   optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         logical :: blocked
         blocked = db%jrnl%active
-        if (blocked .and. present(stat)) stat = SQR_INVALID
+        if (blocked) then
+            call set_last_err(db, SQR_INVALID, 'refused: a transaction is in flight')
+            if (present(stat))   stat   = SQR_INVALID
+            if (present(errmsg)) errmsg = 'refused: a transaction is in flight'
+        end if
     end function
 
     ! ===== Auto-commit brackets =====
@@ -1214,6 +1221,92 @@ contains
     ! `msg` is optional: omit it when a callee (e.g. read_schema) has already
     ! written its own detailed text into `errmsg` — raise then only routes the
     ! code, and falls back to that errmsg for the no-stat stderr path.
+    ! ===== Sticky error state =====
+    ! Every fallible public façade brackets its body with clear_last_err on
+    ! entry and report on exit; failure sites in between may record detail
+    ! with set_last_err.  clear_last_err is on hot paths (db_get,
+    ! db_cursor_next) so it must stay a pair of integer stores.
+
+    subroutine clear_last_err(db)
+        class(db_t), intent(inout) :: db
+        db%last_stat   = SQR_OK
+        db%last_errlen = 0
+    end subroutine
+
+    ! Record failure detail at the point of detection (truncated to the
+    ! buffer).  The final code is stamped by report — a site may record
+    ! detail without knowing what the façade will ultimately return.
+    subroutine set_last_err(db, code, msg)
+        class(db_t),      intent(inout) :: db
+        integer,          intent(in)    :: code
+        character(len=*), intent(in)    :: msg
+        db%last_stat   = code
+        db%last_errlen = min(len_trim(msg), SQR_ERRMSG_LEN)
+        db%last_errmsg(1:db%last_errlen) = msg(1:db%last_errlen)
+    end subroutine
+
+    ! Façade exit: stamp the operation's final code on the sticky state
+    ! (with the canonical text when no site recorded detail) and route it
+    ! into the caller's optional stat/errmsg.
+    subroutine report(db, rs, stat, errmsg)
+        class(db_t),      intent(inout)           :: db
+        integer,          intent(in)              :: rs
+        integer,          intent(out),   optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
+        db%last_stat = rs
+        if (rs /= SQR_OK) then
+            if (db%last_errlen == 0) call set_last_err(db, rs, sqr_errstr(rs))
+            if (present(errmsg)) errmsg = db%last_errmsg(1:db%last_errlen)
+        end if
+        if (present(stat)) stat = rs
+    end subroutine
+
+    pure module subroutine db_last_error(db, code, msg)
+        class(db_t),      intent(in)             :: db
+        integer,          intent(out),  optional :: code
+        character(len=:), allocatable, intent(out), optional :: msg
+        if (present(code)) code = db%last_stat
+        if (present(msg))  msg  = db%last_errmsg(1:db%last_errlen)
+    end subroutine
+
+    pure module function sqr_errstr(code) result(s)
+        integer, intent(in)           :: code
+        character(len=:), allocatable :: s
+        select case (code)
+        case (SQR_OK);        s = 'ok'
+        case (SQR_NOT_FOUND); s = 'no such table, row, index or key'
+        case (SQR_DUP);       s = 'duplicate table or unique-key violation'
+        case (SQR_ERR);       s = 'I/O or filesystem failure'
+        case (SQR_VERSION);   s = 'unsupported on-disk format version'
+        case (SQR_INVALID);   s = 'bad argument or corrupt on-disk metadata'
+        case (SQR_READONLY);  s = 'write attempted on a read-only open'
+        case (SQR_LOCKED);    s = 'database held by another connection'
+        case (SQR_NO_UNDO);   s = 'nothing on the undo/redo history to apply'
+        case (SQR_FULL);      s = 'row-id space exhausted'
+        case default;         s = 'unknown status code'
+        end select
+    end function
+
+    ! raise + sticky record: the spelling used by façades with the handle in
+    ! scope, so the detail also lands in db_last_error.  With no `msg` the
+    ! callee has already written its detail into `errmsg` (when present) —
+    ! mirror that into the sticky state too.
+    subroutine raise_db(db, code, stat, errmsg, msg)
+        class(db_t),      intent(inout)            :: db
+        integer,          intent(in)               :: code
+        integer,          intent(out),   optional  :: stat
+        character(len=*), intent(inout), optional  :: errmsg
+        character(len=*), intent(in),    optional  :: msg
+        if (present(msg)) then
+            call set_last_err(db, code, msg)
+        else if (present(errmsg)) then
+            call set_last_err(db, code, trim(errmsg))
+        else
+            call set_last_err(db, code, sqr_errstr(code))
+        end if
+        call raise(code, stat, errmsg, msg)
+    end subroutine
+
     subroutine raise(code, stat, errmsg, msg)
         integer,          intent(in)               :: code
         integer,          intent(out),   optional  :: stat
@@ -1409,10 +1502,7 @@ contains
             ! belt-and-braces alongside the kc invalidation).
             if (allocated(ix%key_scratch))  deallocate(ix%key_scratch)
             if (allocated(ix%key_scratch2)) deallocate(ix%key_scratch2)
-            if (ix%bt%unit /= -1) then
-                close(ix%bt%unit)
-                ix%bt%unit = -1
-            end if
+            call bt_discard(ix%bt)
             ! Under an active transaction the truncating bt_open below would wipe
             ! the index file with no pre-image in the journal — and bt_open's
             ! intent(out) clears the page-write hook, so the bulk-load writes go

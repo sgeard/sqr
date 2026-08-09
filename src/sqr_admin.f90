@@ -16,45 +16,47 @@ contains
 
     ! ===== Drop index / batch insert / verify =====
 
-    module subroutine db_drop_index_1(db, table_name, col_name, stat)
+    module subroutine db_drop_index_1(db, table_name, col_name, stat, errmsg)
         class(db_t),       intent(inout)         :: db
         character(len=*), intent(in)            :: table_name
         character(len=*), intent(in)            :: col_name
         integer,          intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         character(len=len(col_name)) :: one(1)   ! named 1-elt array: no constructor temp
+        call clear_last_err(db)
         one(1) = col_name
-        call db_drop_index_m(db, table_name, one, stat)
+        call db_drop_index_m(db, table_name, one, stat, errmsg)
     end subroutine
 
-    module subroutine db_drop_index_m(db, table_name, col_names, stat)
+    module subroutine db_drop_index_m(db, table_name, col_names, stat, errmsg)
         class(db_t),       intent(inout)         :: db
         character(len=*), intent(in)            :: table_name
         character(len=*), intent(in)            :: col_names(:)
         integer,          intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         integer :: ti, j, rs
-        if (readonly_block(db, stat)) return
-        if (txn_block(db, stat)) return
+        call clear_last_err(db)
+        if (readonly_block(db, stat, errmsg)) return
+        if (txn_block(db, stat, errmsg)) return
         db%generation = db%generation + 1   ! structural change: invalidate cursors
         call db_reset_history(db)           ! index-set change ⇒ captured undo/redo steps can't replay
         ti = db_table_index(db, table_name)
         if (ti == 0) then
-            if (present(stat)) stat = SQR_NOT_FOUND
+            call set_last_err(db, SQR_NOT_FOUND, 'no such table: ' // trim(table_name))
+            call report(db, SQR_NOT_FOUND, stat, errmsg)
             return
         end if
         associate (t => db%tables(ti))
             j = index_for_columns(t, col_names)
             if (j == 0) then
-                if (present(stat)) stat = SQR_NOT_FOUND
+                call report(db, SQR_NOT_FOUND, stat, errmsg)
                 return
             end if
             ! Tombstone the slot (ncols = 0) rather than removing it: the
             ! __i<slot> file names of surviving indices stay valid and a later
             ! db_create_index simply appends a fresh slot. Close the tree first.
             associate (ix => t%indices(j))
-                if (ix%bt%unit /= -1) then
-                    close(ix%bt%unit)        ! file is deleted below — no meta flush
-                    ix%bt%unit = -1
-                end if
+                call bt_discard(ix%bt)       ! file is deleted below
                 ix%ncols    = 0
                 ix%key_size = 0
                 ix%nentries = 0
@@ -69,12 +71,12 @@ contains
             ! orphaned file the dead slot ignores, not a live slot with no file.
             call write_schema(db, t, rs)
             if (rs /= SQR_OK) then
-                if (present(stat)) stat = rs
+                call report(db, rs, stat, errmsg)
                 return
             end if
             call remove_file(index_path(db, t%name, j))
         end associate
-        if (present(stat)) stat = SQR_OK
+        call report(db, SQR_OK, stat, errmsg)
     end subroutine
 
     ! Auto-commit bracket: the whole batch is one implicit transaction, so a
@@ -83,19 +85,21 @@ contains
     ! written so far.  A no-op when an explicit transaction is already in flight
     ! (that scope's commit/rollback then decides) or on a read-only handle (the
     ! core reports SQR_READONLY).
-    module subroutine db_insert_many(db, table_name, bufs, row_ids, stat)
+    module subroutine db_insert_many(db, table_name, bufs, row_ids, stat, errmsg)
         class(db_t),      intent(inout)         :: db
         character(len=*), intent(in)            :: table_name
         character(len=*), intent(in)            :: bufs(:)
         integer(int32),   intent(out)           :: row_ids(:)
         integer,          intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
         integer :: rs
         logical :: owns
+        call clear_last_err(db)
         call ac_begin(db, owns, rs)
         if (rs == SQR_OK) call insert_many_core(db, table_name, bufs, row_ids, rs)
         call ac_end(db, owns, rs)
         if (rs /= SQR_OK) row_ids = 0   ! atomic: a rolled-back batch leaves no rows
-        if (present(stat)) stat = rs
+        call report(db, rs, stat, errmsg)
     end subroutine
 
     subroutine insert_many_core(db, table_name, bufs, row_ids, stat)
@@ -114,6 +118,7 @@ contains
         db%generation = db%generation + 1   ! write: invalidate cursors
         ti = db_table_index(db, table_name)
         if (ti == 0) then
+            call set_last_err(db, SQR_NOT_FOUND, 'no such table: ' // trim(table_name))
             stat = SQR_NOT_FOUND
             return
         end if
@@ -179,6 +184,8 @@ contains
                                     return
                                 end if
                                 if (viol) then
+                                    call set_last_err(db, SQR_DUP, 'unique-key violation on index over "' &
+                                        // trim(ix%columns(1)) // '"')
                                     stat = SQR_DUP
                                     return
                                 end if
@@ -186,6 +193,8 @@ contains
                                 batch_dup: do p = 1, k - 1
                                     if (bnull(p)) cycle batch_dup
                                     if (key_cmp_ix(t, ix, bkeys(p), bkeys(k)) == 0) then
+                                        call set_last_err(db, SQR_DUP, 'unique-key violation on index over "' &
+                                            // trim(ix%columns(1)) // '"')
                                         stat = SQR_DUP
                                         return
                                     end if
@@ -249,12 +258,13 @@ contains
         integer(int64) :: fsize
         character(len=:), allocatable :: rbuf
         character(len=128) :: detail
+        call clear_last_err(db)
         vrs = SQR_OK
         detail = ''
         ti = db_table_index(db, table_name)
         if (ti == 0) then
-            if (present(stat)) stat = SQR_NOT_FOUND
-            if (present(errmsg)) errmsg = 'no such table: ' // trim(table_name)
+            call set_last_err(db, SQR_NOT_FOUND, 'no such table: ' // trim(table_name))
+            call report(db, SQR_NOT_FOUND, stat, errmsg)
             return
         end if
         verify: block
@@ -300,8 +310,8 @@ contains
                 end do verify_idx
             end associate
         end block verify
-        if (present(stat))   stat = vrs
-        if (present(errmsg) .and. vrs /= SQR_OK) errmsg = trim(detail)
+        if (vrs /= SQR_OK) call set_last_err(db, vrs, trim(detail))
+        call report(db, vrs, stat, errmsg)
     end subroutine
 
     ! Check one index against the table data: walk the tree, and for every entry

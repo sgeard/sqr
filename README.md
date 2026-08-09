@@ -35,8 +35,12 @@ crash, even at the cost of an `fsync` per write.
 - **Single-writer / multi-reader locking:** an advisory lock taken on open
   admits one writer or many readers; contention is reported as `SQR_LOCKED`,
   and `db_set_readonly` demotes a writer to let readers in.
-- **No `error stop` in library code** — every entry point reports via optional
-  `stat` / `errmsg` arguments.
+- **No `error stop` in library code** — every fallible entry point reports via
+  optional `stat` / `errmsg` arguments, and the handle keeps sticky error
+  state: `db_last_error` returns the most recent operation's code and failure
+  detail, with `sqr_errstr` supplying the canonical text per code.
+- **Metadata accessors:** `db_describe` (column snapshot), `db_row_count` and
+  `db_in_txn`, so front-ends never need to walk the handle's internals.
 - **Procedural *and* object-oriented APIs:** call `db_insert(db, ...)` or
   `db%insert(...)`.
 - **Two front-ends:** `sqrsh`, a cmdgraph state-graph shell over the engine,
