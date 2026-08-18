@@ -19,6 +19,10 @@
  * noted, a function returns 0 on success and nonzero on failure. The lock
  * token is an opaque 64-bit value (a POSIX fd or a Win32 HANDLE); -1 means
  * "not held".
+ *
+ * The sqr_os_sock_* group is the TCP shim for the sqrd wire service
+ * (BSD sockets / Winsock). A socket travels as an opaque 64-bit token too
+ * (a POSIX fd or a Winsock SOCKET); -1 means "no socket".
  */
 
 /* Must precede every system header: on glibc it exposes nftw(3) and flock(2).
@@ -31,6 +35,14 @@
 
 #ifdef _WIN32
 /* ===== Windows (CRT + Win32 API) ===== */
+/* Lean-and-mean keeps windows.h from dragging in the legacy winsock.h, which
+   would collide with the winsock2.h the socket shim needs. Everything used
+   here (file, locking and Find* APIs) survives the trim. */
+#ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h> /* before windows.h so the v2 API wins */
+#include <ws2tcpip.h> /* inet_pton */
 #include <windows.h>
 #include <io.h>      /* _access, _open, _close, _commit, _chsize_s, _isatty, _chmod */
 #include <sys/stat.h>/* _S_IREAD, _S_IWRITE */
@@ -187,6 +199,110 @@ int sqr_os_isatty_stdin(void) {
     return _isatty(0) ? 1 : 0;
 }
 
+/* ---- TCP sockets (Winsock 2) ---- */
+
+/* Winsock needs a one-time WSAStartup before any socket call; do it lazily so
+   programs that never touch sockets pay nothing. Never torn down — the OS
+   reclaims at process exit. */
+static int wsa_ready = 0;
+static int ensure_wsa(void) {
+    WSADATA wd;
+    if (!wsa_ready) wsa_ready = (WSAStartup(MAKEWORD(2, 2), &wd) == 0);
+    return wsa_ready;
+}
+
+int64_t sqr_os_sock_listen(int port) {
+    SOCKET fd;
+    struct sockaddr_in a;
+    BOOL one = TRUE;
+    if (!ensure_wsa()) return -1;
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == INVALID_SOCKET) return -1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof one);
+    memset(&a, 0, sizeof a);
+    a.sin_family      = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   /* loopback only */
+    a.sin_port        = htons((unsigned short)port);
+    if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0 || listen(fd, 8) != 0) {
+        closesocket(fd);
+        return -1;
+    }
+    return (int64_t)fd;
+}
+
+int sqr_os_sock_port(int64_t s) {
+    struct sockaddr_in a;
+    int len = sizeof a;
+    if (getsockname((SOCKET)s, (struct sockaddr *)&a, &len) != 0) return -1;
+    return (int)ntohs(a.sin_port);
+}
+
+int64_t sqr_os_sock_accept(int64_t ls) {
+    SOCKET fd = accept((SOCKET)ls, NULL, NULL);
+    return fd == INVALID_SOCKET ? -1 : (int64_t)fd;
+}
+
+int64_t sqr_os_sock_connect(const char *host, int port) {
+    SOCKET fd;
+    struct sockaddr_in a;
+    if (!ensure_wsa()) return -1;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port   = htons((unsigned short)port);
+    if (inet_pton(AF_INET, host, &a.sin_addr) != 1) return -1;
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == INVALID_SOCKET) return -1;
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
+        closesocket(fd);
+        return -1;
+    }
+    return (int64_t)fd;
+}
+
+#define SQR_OS_POLL_MAX 64
+
+int sqr_os_sock_poll(const int64_t *socks, int n, int timeout_ms, int *ready) {
+    WSAPOLLFD pfd[SQR_OS_POLL_MAX];
+    int i, rc, cnt = 0;
+    if (n < 0 || n > SQR_OS_POLL_MAX) return -1;
+    for (i = 0; i < n; i++) {
+        pfd[i].fd      = (SOCKET)socks[i];
+        pfd[i].events  = POLLIN;
+        pfd[i].revents = 0;
+    }
+    rc = WSAPoll(pfd, (ULONG)n, timeout_ms);
+    if (rc == SOCKET_ERROR) return -1;
+    for (i = 0; i < n; i++) {
+        ready[i] = (pfd[i].revents & (POLLIN | POLLERR | POLLHUP)) ? 1 : 0;
+        cnt += ready[i];
+    }
+    return cnt;
+}
+
+int64_t sqr_os_sock_recv(int64_t s, char *buf, int64_t cap) {
+    /* Winsock lengths are int; a single clamped call is fine because the
+       caller loops until it has what it needs. */
+    int chunk = cap > 1 << 20 ? 1 << 20 : (int)cap;
+    int n = recv((SOCKET)s, buf, chunk, 0);
+    return n == SOCKET_ERROR ? -1 : (int64_t)n;
+}
+
+int64_t sqr_os_sock_send(int64_t s, const char *buf, int64_t len) {
+    int64_t done = 0;
+    while (done < len) {
+        int chunk = len - done > 1 << 20 ? 1 << 20 : (int)(len - done);
+        int n = send((SOCKET)s, buf + done, chunk, 0);
+        if (n == SOCKET_ERROR) return -1;
+        done += n;
+    }
+    return len;
+}
+
+void sqr_os_sock_close(int64_t *s) {
+    if (*s >= 0) closesocket((SOCKET)*s);
+    *s = -1;
+}
+
 #else
 /* ===== POSIX (Linux, macOS, Android) ===== */
 #include <stdio.h>          /* rename, remove */
@@ -196,6 +312,12 @@ int sqr_os_isatty_stdin(void) {
 #include <fcntl.h>          /* open, O_* */
 #include <ftw.h>            /* nftw */
 #include <sys/file.h>       /* flock */
+#include <sys/socket.h>     /* socket, bind, listen, accept, connect, recv, send */
+#include <netinet/in.h>     /* sockaddr_in, htons, INADDR_LOOPBACK */
+#include <arpa/inet.h>      /* inet_pton */
+#include <poll.h>           /* poll */
+#include <errno.h>          /* EINTR */
+#include <string.h>         /* memset */
 
 int sqr_os_rename(const char *oldp, const char *newp) {
     return rename(oldp, newp);          /* already atomic-replace on POSIX */
@@ -300,6 +422,106 @@ int sqr_os_lock_share(int64_t tok) {
 
 int sqr_os_isatty_stdin(void) {
     return isatty(0) ? 1 : 0;
+}
+
+/* ---- TCP sockets (BSD) ---- */
+
+int64_t sqr_os_sock_listen(int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a;
+    int one = 1;
+    if (fd < 0) return -1;
+    /* SO_REUSEADDR: rebind immediately after a restart instead of waiting
+       out TIME_WAIT on the previous instance's port. */
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    memset(&a, 0, sizeof a);
+    a.sin_family      = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   /* loopback only */
+    a.sin_port        = htons((unsigned short)port);
+    if (bind(fd, (struct sockaddr *)&a, sizeof a) != 0 || listen(fd, 8) != 0) {
+        close(fd);
+        return -1;
+    }
+    return (int64_t)fd;
+}
+
+int sqr_os_sock_port(int64_t s) {
+    /* The actual bound port — the useful case is a port-0 (ephemeral) bind. */
+    struct sockaddr_in a;
+    socklen_t len = sizeof a;
+    if (getsockname((int)s, (struct sockaddr *)&a, &len) != 0) return -1;
+    return (int)ntohs(a.sin_port);
+}
+
+int64_t sqr_os_sock_accept(int64_t ls) {
+    int fd;
+    do { fd = accept((int)ls, NULL, NULL); } while (fd < 0 && errno == EINTR);
+    return fd < 0 ? -1 : (int64_t)fd;
+}
+
+int64_t sqr_os_sock_connect(const char *host, int port) {
+    int fd, rc;
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port   = htons((unsigned short)port);
+    if (inet_pton(AF_INET, host, &a.sin_addr) != 1) return -1;  /* numeric IPv4 only */
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    do { rc = connect(fd, (struct sockaddr *)&a, sizeof a); } while (rc < 0 && errno == EINTR);
+    if (rc != 0) {
+        close(fd);
+        return -1;
+    }
+    return (int64_t)fd;
+}
+
+#define SQR_OS_POLL_MAX 64
+
+int sqr_os_sock_poll(const int64_t *socks, int n, int timeout_ms, int *ready) {
+    struct pollfd pfd[SQR_OS_POLL_MAX];
+    int i, rc, cnt = 0;
+    if (n < 0 || n > SQR_OS_POLL_MAX) return -1;
+    for (i = 0; i < n; i++) {
+        pfd[i].fd      = (int)socks[i];
+        pfd[i].events  = POLLIN;
+        pfd[i].revents = 0;
+    }
+    do { rc = poll(pfd, (nfds_t)n, timeout_ms); } while (rc < 0 && errno == EINTR);
+    if (rc < 0) return -1;
+    /* ERR/HUP count as readable: the next recv reports the condition. */
+    for (i = 0; i < n; i++) {
+        ready[i] = (pfd[i].revents & (POLLIN | POLLERR | POLLHUP)) ? 1 : 0;
+        cnt += ready[i];
+    }
+    return cnt;
+}
+
+int64_t sqr_os_sock_recv(int64_t s, char *buf, int64_t cap) {
+    ssize_t n;
+    do { n = recv((int)s, buf, (size_t)cap, 0); } while (n < 0 && errno == EINTR);
+    return n < 0 ? -1 : (int64_t)n;
+}
+
+int64_t sqr_os_sock_send(int64_t s, const char *buf, int64_t len) {
+    /* Send everything: short writes looped, EINTR retried. MSG_NOSIGNAL
+       turns a peer disconnect into an error return instead of SIGPIPE
+       killing the server. */
+    int64_t done = 0;
+    while (done < len) {
+        ssize_t n = send((int)s, buf + done, (size_t)(len - done), MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        done += n;
+    }
+    return len;
+}
+
+void sqr_os_sock_close(int64_t *s) {
+    if (*s >= 0) close((int)*s);
+    *s = -1;
 }
 
 #endif

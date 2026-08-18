@@ -1,4 +1,4 @@
-.PHONY: all clean veryclean distclean utest sqlttest faulttest run-faulttest proctest bench run-bench destruct run-destruct coverage coverage-gcov coverage-clean docs docs-clean help windows win-build sqrsh-regex test-regex
+.PHONY: all clean veryclean distclean utest sqlttest sqrdtest faulttest run-faulttest proctest bench run-bench destruct run-destruct coverage coverage-gcov coverage-clean docs docs-clean help windows win-build sqrsh-regex test-regex
 .SUFFIXES:
 .DEFAULT_GOAL := all
 
@@ -54,7 +54,7 @@ CFLAGS ?= -O2 -Wall -Wextra -D_FILE_OFFSET_BITS=64
 # cmdgraph + dlist are vendored from github.com/sgeard/cmdgraph (fortran/src) so
 # the shell builds out-of-the-box with no sibling checkout; they go into libsqr.a
 # alongside the engine (the linker pulls cmdgraph objects only into sqrsh).
-LIB_SRC := clib_wrap.f90 clib_wrap_sm.f90 b_tree.f90 b_tree_sm.f90 sqr_fault.f90 sqr.f90 sqr_base.f90 sqr_table.f90 sqr_record.f90 sqr_index.f90 sqr_admin.f90 sqr_rowbuf.f90 sqr_journal.f90 sqr_pack.f90 sql.f90 sql_base.f90 sql_parse.f90 sql_exec.f90 dlist.f90 dlist_sm.f90 cmdgraph.f90 cmdgraph_sm.f90
+LIB_SRC := clib_wrap.f90 clib_wrap_sm.f90 b_tree.f90 b_tree_sm.f90 sqr_fault.f90 sqr.f90 sqr_base.f90 sqr_table.f90 sqr_record.f90 sqr_index.f90 sqr_admin.f90 sqr_rowbuf.f90 sqr_journal.f90 sqr_pack.f90 sql.f90 sql_base.f90 sql_parse.f90 sql_exec.f90 sqr_net.f90 sqr_net_sm.f90 sqr_serve.f90 sqr_serve_sm.f90 dlist.f90 dlist_sm.f90 cmdgraph.f90 cmdgraph_sm.f90
 
 # Selected fault submodule: off -> $(SRC_DIR) (production, fpm-shared);
 # on -> $(FAULT_DIR) (Make-only coverage/faulttest, never seen by fpm).
@@ -87,8 +87,9 @@ BENCH_SRC := $(BENCH_DIR)/bench_sqr.f90
 BENCH_BIN := $(ODIR)/bench_sqr$(EXT)
 
 # Interactive shells: sqrsh (cmdgraph-driven engine shell) and sqlsh (the
-# SQL-subset REPL — depends only on the library, not cmdgraph).
-APP_SRC := $(wildcard $(APP_DIR)/sqrsh.f90 $(APP_DIR)/sqlsh.f90)
+# SQL-subset REPL — depends only on the library, not cmdgraph); sqrd is the
+# wire-protocol server (library only, like sqlsh).
+APP_SRC := $(wildcard $(APP_DIR)/sqrsh.f90 $(APP_DIR)/sqlsh.f90 $(APP_DIR)/sqrd.f90)
 APP_BIN := $(patsubst $(APP_DIR)/%.f90,$(ODIR)/%$(EXT),$(APP_SRC))
 
 all: $(OPTIONS_FNAME) $(LIB) $(TEST_BIN) $(APP_BIN)
@@ -180,6 +181,23 @@ $(ODIR)/sql_parse.o: $(SRC_DIR)/sql_parse.f90 $(ODIR)/sql.mod $(ODIR)/sql_base.o
 $(ODIR)/sql_exec.o: $(SRC_DIR)/sql_exec.f90 $(ODIR)/sql.mod $(ODIR)/sqr.mod $(ODIR)/sql_base.o | $(ODIR)
 	$(F) -c $(F_OPTS) -o $@ $<
 
+# --- Wire-service layer (sqrd): framing over the socket shim, then the
+# server core (sessions/dispatch/encoding) on top of sqr + sql. Both are
+# ordinary module + submodule pairs.
+$(ODIR)/sqr_net.o $(ODIR)/sqr_net.mod &: $(SRC_DIR)/sqr_net.f90 $(ODIR)/clib_wrap.mod | $(ODIR)
+	$(F) -c $(F_OPTS) -o $(ODIR)/sqr_net.o $<
+	@touch $(ODIR)/sqr_net.mod
+
+$(ODIR)/sqr_net_sm.o: $(SRC_DIR)/sqr_net_sm.f90 $(ODIR)/sqr_net.mod | $(ODIR)
+	$(F) -c $(F_OPTS) -o $@ $<
+
+$(ODIR)/sqr_serve.o $(ODIR)/sqr_serve.mod &: $(SRC_DIR)/sqr_serve.f90 $(ODIR)/sqr.mod $(ODIR)/sqr_net.mod | $(ODIR)
+	$(F) -c $(F_OPTS) -o $(ODIR)/sqr_serve.o $<
+	@touch $(ODIR)/sqr_serve.mod
+
+$(ODIR)/sqr_serve_sm.o: $(SRC_DIR)/sqr_serve_sm.f90 $(ODIR)/sqr_serve.mod $(ODIR)/sql.mod $(ODIR)/clib_wrap.mod | $(ODIR)
+	$(F) -c $(F_OPTS) -o $@ $<
+
 # --- Vendored cmdgraph engine (github.com/sgeard/cmdgraph). dlist is the
 # doubly-linked list cmdgraph uses; cmdgraph `use`s dlist, so dlist builds first.
 $(ODIR)/dlist.o $(ODIR)/dlist.mod &: $(SRC_DIR)/dlist.f90 | $(ODIR)
@@ -222,6 +240,11 @@ $(ODIR)/sqrsh$(EXT): $(APP_DIR)/sqrsh.f90 $(LIB) | $(ODIR)
 # SQL REPL — links the library only (the sql_* front-end is in libsqr); no
 # cmdgraph dependency.
 $(ODIR)/sqlsh$(EXT): $(APP_DIR)/sqlsh.f90 $(LIB) | $(ODIR)
+	$(F) $(F_OPTS) -o $@ $< $(LIB) $(LFLAGS)
+
+# Wire-protocol server — links the library only (sqr_net/sqr_serve are in
+# libsqr).
+$(ODIR)/sqrd$(EXT): $(APP_DIR)/sqrd.f90 $(LIB) | $(ODIR)
 	$(F) $(F_OPTS) -o $@ $< $(LIB) $(LFLAGS)
 
 # --- Optional regex-search shell (opt-in) ---------------------------------
@@ -267,6 +290,13 @@ SQLT_DIR    := sqlt
 SQLT_TESTS  := $(wildcard $(SQLT_DIR)/tests/*.test)
 sqlttest: $(ODIR)/sqlsh$(EXT)
 	tclsh $(SQLT_DIR)/run_sqlt.tcl $(ODIR)/sqlsh$(EXT) $(SQLT_TESTS)
+
+# Functional test of the sqrd wire service: a Tcl client (an independent
+# protocol implementation — see test/run_sqrd.tcl) drives a real spawned
+# sqrd over a loopback socket and verifies the session end to end,
+# including binary-cell exactness.
+sqrdtest: $(ODIR)/sqrd$(EXT)
+	tclsh $(TEST_DIR)/run_sqrd.tcl $(ODIR)/sqrd$(EXT)
 
 # Fault-injection sweep. Built only here (and by coverage), always with
 # FAULT=on, into a debug ODIR so the production release archive is never
@@ -409,9 +439,10 @@ WIN_AR     := x86_64-w64-mingw32-ar
 WIN_ODIR   := obj_mingw64
 WIN_FLAGS  := -O3
 WIN_CFLAGS := -O2 -Wall -Wextra
-WIN_LINK   := -static -Wl,-u,__strcpy_chk -lssp
+# -lws2_32: Winsock, pulled in by the socket shim now in osshim.c/clib_wrap.
+WIN_LINK   := -static -Wl,-u,__strcpy_chk -lssp -lws2_32
 # Module/submodule order matters (parents before submodules).
-WIN_SRC   := clib_wrap b_tree sqr_fault sqr clib_wrap_sm b_tree_sm sqr_fault_off_sm sqr_base sqr_table sqr_record sqr_index sqr_admin sqr_rowbuf sqr_journal sql sql_base sql_parse sql_exec
+WIN_SRC   := clib_wrap b_tree sqr_fault sqr clib_wrap_sm b_tree_sm sqr_fault_off_sm sqr_base sqr_table sqr_record sqr_index sqr_admin sqr_rowbuf sqr_journal sql sql_base sql_parse sql_exec sqr_net sqr_net_sm sqr_serve sqr_serve_sm
 WIN_TESTS := utest_btree utest_sqr utest_sql
 
 windows:
@@ -433,7 +464,7 @@ windows:
 	@for t in $(WIN_TESTS); do echo "    $(WIN_ODIR)/$$t.exe"; done
 
 help:
-	@echo "Targets : all, utest, sqlttest, faulttest, destruct, bench, clean, veryclean, distclean"
+	@echo "Targets : all, utest, sqlttest, sqrdtest, faulttest, destruct, bench, clean, veryclean, distclean"
 	@echo "          coverage, coverage-gcov, coverage-clean, docs, docs-clean, windows"
 	@echo "          sqrsh-regex, test-regex (opt-in DT_CHAR regex search via tcl_re)"
 	@echo "Options : F=gfortran|ifx|lfortran|flang (default ifx)  debug=1  valgrind=1 (ifx: AVX2 cap)"

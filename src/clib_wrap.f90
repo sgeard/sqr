@@ -31,6 +31,14 @@ module clib_wrap
     public :: c_lock_release!! release an advisory lock and close its handle
     public :: c_lock_share  !! downgrade an exclusive advisory lock to shared
     public :: c_isatty_stdin!! is standard input a terminal?
+    public :: c_sock_listen !! open a loopback TCP listening socket
+    public :: c_sock_port   !! actual bound port of a listening socket
+    public :: c_sock_accept !! accept one pending connection
+    public :: c_sock_connect!! connect to a numeric IPv4 host:port
+    public :: c_sock_poll   !! wait for sockets to become readable
+    public :: c_sock_recv   !! receive up to len(buf) bytes
+    public :: c_sock_send   !! send all bytes
+    public :: c_sock_close  !! close a socket
 
     ! ----- Private bind(c) interfaces to osshim.c -----
     ! Each takes a NUL-terminated c_char path (passed as an assumed-size array
@@ -120,6 +128,69 @@ module clib_wrap
             import :: c_int
             integer(c_int) :: r
         end function
+
+        ! ----- TCP sockets (sqrd wire service) -----
+        ! A socket is an opaque 64-bit token (POSIX fd or Winsock SOCKET),
+        ! -1 when there is none.
+
+        function sqr_os_sock_listen(port) bind(c, name='sqr_os_sock_listen') result(s)
+            import :: c_int, c_int64_t
+            integer(c_int), value :: port
+            integer(c_int64_t)    :: s
+        end function
+
+        function sqr_os_sock_port(s) bind(c, name='sqr_os_sock_port') result(port)
+            import :: c_int, c_int64_t
+            integer(c_int64_t), value :: s
+            integer(c_int)            :: port
+        end function
+
+        function sqr_os_sock_accept(ls) bind(c, name='sqr_os_sock_accept') result(s)
+            import :: c_int64_t
+            integer(c_int64_t), value :: ls
+            integer(c_int64_t)        :: s
+        end function
+
+        function sqr_os_sock_connect(host, port) bind(c, name='sqr_os_sock_connect') result(s)
+            import :: c_char, c_int, c_int64_t
+            character(kind=c_char), intent(in)    :: host(*)
+            integer(c_int),         value         :: port
+            integer(c_int64_t)                    :: s
+        end function
+
+        ! Returns the number of ready sockets (0 on timeout, -1 on error);
+        ! ready(i) is nonzero if socks(i) is readable (or errored/hung up).
+        function sqr_os_sock_poll(socks, n, timeout_ms, ready) bind(c, name='sqr_os_sock_poll') result(r)
+            import :: c_int, c_int64_t
+            integer(c_int64_t), intent(in)  :: socks(*)
+            integer(c_int),     value       :: n
+            integer(c_int),     value       :: timeout_ms
+            integer(c_int),     intent(out) :: ready(*)
+            integer(c_int)                  :: r
+        end function
+
+        ! Returns bytes received (0 = orderly close, -1 = error).
+        function sqr_os_sock_recv(s, buf, cap) bind(c, name='sqr_os_sock_recv') result(n)
+            import :: c_char, c_int64_t
+            integer(c_int64_t),     value       :: s
+            character(kind=c_char), intent(out) :: buf(*)
+            integer(c_int64_t),     value       :: cap
+            integer(c_int64_t)                  :: n
+        end function
+
+        ! Sends ALL nbytes (looping over short writes); returns nbytes or -1.
+        function sqr_os_sock_send(s, buf, nbytes) bind(c, name='sqr_os_sock_send') result(n)
+            import :: c_char, c_int64_t
+            integer(c_int64_t),     value      :: s
+            character(kind=c_char), intent(in) :: buf(*)
+            integer(c_int64_t),     value      :: nbytes
+            integer(c_int64_t)                 :: n
+        end function
+
+        subroutine sqr_os_sock_close(s) bind(c, name='sqr_os_sock_close')
+            import :: c_int64_t
+            integer(c_int64_t), intent(inout) :: s
+        end subroutine
     end interface
 
     ! ----- Public wrappers — Fortran-string fronts, bodies in the submodule -----
@@ -230,6 +301,71 @@ module clib_wrap
         module function c_isatty_stdin() result(yes)
             logical :: yes  !! `.true.` if stdin is a TTY
         end function
+
+        !! Open a TCP listening socket bound to loopback (127.0.0.1) on
+        !! `port` (0 asks the OS for an ephemeral port — read it back with
+        !! `c_sock_port`).  Returns the socket token, or -1 on failure.
+        module function c_sock_listen(port) result(sock)
+            integer, intent(in) :: port  !! Port to bind (0 = ephemeral)
+            integer(c_int64_t)  :: sock  !! Listening socket, or -1
+        end function
+
+        !! The actual bound port of a listening socket — the useful case is
+        !! reading back an ephemeral (port-0) bind.  Returns -1 on failure.
+        module function c_sock_port(sock) result(port)
+            integer(c_int64_t), intent(in) :: sock  !! Listening socket
+            integer                        :: port  !! Bound port, or -1
+        end function
+
+        !! Accept one pending connection on a listening socket (blocks;
+        !! poll first).  Returns the connection socket, or -1 on failure.
+        module function c_sock_accept(listen_sock) result(sock)
+            integer(c_int64_t), intent(in) :: listen_sock  !! Listening socket
+            integer(c_int64_t)             :: sock  !! Accepted connection, or -1
+        end function
+
+        !! Connect to `host`:`port`.  `host` is a numeric IPv4 address
+        !! (e.g. `'127.0.0.1'` — no name resolution).  Returns the connected
+        !! socket, or -1 on failure.
+        module function c_sock_connect(host, port) result(sock)
+            character(len=*), intent(in) :: host  !! Numeric IPv4 address
+            integer,          intent(in) :: port  !! Port to connect to
+            integer(c_int64_t)           :: sock  !! Connected socket, or -1
+        end function
+
+        !! Wait up to `timeout_ms` (0 = just check, negative = forever) for
+        !! any of `socks` to become readable — a hangup or error also counts
+        !! as readable, so the next `c_sock_recv` reports it.  `nready` is
+        !! the number of ready sockets (0 on timeout, -1 on error).
+        module subroutine c_sock_poll(socks, timeout_ms, ready, nready)
+            integer(c_int64_t), intent(in)  :: socks(:)    !! Sockets to watch
+            integer,            intent(in)  :: timeout_ms  !! Wait limit in ms
+            logical,            intent(out) :: ready(:)    !! Per-socket readable flag
+            integer,            intent(out) :: nready      !! Ready count, or -1
+        end subroutine
+
+        !! Receive up to `len(buf)` bytes into the front of `buf` (blocks;
+        !! poll first).  `nrecv` is the byte count, 0 on orderly close by the
+        !! peer, -1 on error.
+        module subroutine c_sock_recv(sock, buf, nrecv)
+            integer(c_int64_t), intent(in)    :: sock   !! Connected socket
+            character(len=*),   intent(inout) :: buf    !! Receive buffer (front-filled)
+            integer,            intent(out)   :: nrecv  !! Bytes received, 0 EOF, -1 error
+        end subroutine
+
+        !! Send ALL of `bytes` (short writes are looped internally).
+        !! Returns 0 on success, nonzero on failure.
+        module function c_sock_send(sock, bytes) result(ierr)
+            integer(c_int64_t), intent(in) :: sock   !! Connected socket
+            character(len=*),   intent(in) :: bytes  !! Bytes to send
+            integer                        :: ierr   !! 0 on success, nonzero on failure
+        end function
+
+        !! Close a socket.  A no-op for an unheld (-1) token; resets `sock`
+        !! to -1.
+        module subroutine c_sock_close(sock)
+            integer(c_int64_t), intent(inout) :: sock  !! Socket to close (set to -1)
+        end subroutine
     end interface
 
 end module clib_wrap

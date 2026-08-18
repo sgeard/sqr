@@ -120,4 +120,74 @@ contains
         yes = sqr_os_isatty_stdin() /= 0_c_int
     end function
 
+    module function c_sock_listen(port) result(sock)
+        integer, intent(in) :: port
+        integer(c_int64_t)  :: sock
+        sock = sqr_os_sock_listen(int(port, c_int))
+    end function
+
+    module function c_sock_port(sock) result(port)
+        integer(c_int64_t), intent(in) :: sock
+        integer                        :: port
+        port = int(sqr_os_sock_port(sock))
+    end function
+
+    module function c_sock_accept(listen_sock) result(sock)
+        integer(c_int64_t), intent(in) :: listen_sock
+        integer(c_int64_t)             :: sock
+        sock = sqr_os_sock_accept(listen_sock)
+    end function
+
+    module function c_sock_connect(host, port) result(sock)
+        character(len=*), intent(in) :: host
+        integer,          intent(in) :: port
+        integer(c_int64_t)           :: sock
+        character(kind=c_char) :: h(len_trim(host) + 1)
+        call to_cstr(host, h)
+        sock = sqr_os_sock_connect(h, int(port, c_int))
+    end function
+
+    module subroutine c_sock_poll(socks, timeout_ms, ready, nready)
+        integer(c_int64_t), intent(in)  :: socks(:)
+        integer,            intent(in)  :: timeout_ms
+        logical,            intent(out) :: ready(:)
+        integer,            intent(out) :: nready
+        integer(c_int) :: r(size(socks))
+        r = 0_c_int
+        nready = int(sqr_os_sock_poll(socks, int(size(socks), c_int), &
+                                      int(timeout_ms, c_int), r))
+        ready = r /= 0_c_int
+    end subroutine
+
+    module subroutine c_sock_recv(sock, buf, nrecv)
+        integer(c_int64_t), intent(in)    :: sock
+        character(len=*),   intent(inout) :: buf
+        integer,            intent(out)   :: nrecv
+        character(kind=c_char), allocatable :: tmp(:)
+        if (len(buf) == 0) then
+            nrecv = 0
+            return
+        end if
+        allocate(tmp(len(buf)))
+        nrecv = int(sqr_os_sock_recv(sock, tmp, int(len(buf), c_int64_t)))
+        if (nrecv > 0) buf(1:nrecv) = transfer(tmp(1:nrecv), buf(1:nrecv))
+    end subroutine
+
+    module function c_sock_send(sock, bytes) result(ierr)
+        integer(c_int64_t), intent(in) :: sock
+        character(len=*),   intent(in) :: bytes
+        integer                        :: ierr
+        character(kind=c_char), allocatable :: tmp(:)
+        ierr = 0
+        if (len(bytes) == 0) return
+        allocate(tmp(len(bytes)))
+        tmp = transfer(bytes, tmp)
+        if (sqr_os_sock_send(sock, tmp, int(len(bytes), c_int64_t)) /= len(bytes)) ierr = 1
+    end function
+
+    module subroutine c_sock_close(sock)
+        integer(c_int64_t), intent(inout) :: sock
+        call sqr_os_sock_close(sock)
+    end subroutine
+
 end submodule clib_wrap_impl
