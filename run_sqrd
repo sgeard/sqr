@@ -24,7 +24,7 @@ namespace eval daemon {
     variable name "sqrd"
     # Relative to the script, not to the caller: the database is an argument,
     # so this gets run from wherever that database happens to be.
-    variable loc [file join [file dirname [file normalize [info script]]] obj_intel_release]
+    variable loc [file dirname [file normalize [info script]]]
 
     # 0 = let the OS choose the port.  Pin a number only if something outside
     # must hard-code it (an ODBC DSN carrying an explicit PORT, say).
