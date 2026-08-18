@@ -18,6 +18,7 @@ program sqrd
     use, intrinsic :: iso_fortran_env, only: output_unit, error_unit
     use :: sqr
     use :: sqr_serve
+    use :: clib_wrap, only: c_exit
     implicit none
 
     type(db_t), target, save :: db
@@ -27,23 +28,27 @@ program sqrd
     character(len=256)  :: emsg
     integer :: rs, port, nev, ios
 
+    ! Fatal paths exit through c_exit, not `stop 1`: the diagnostic just
+    ! written is the whole message, and ifx would otherwise append its
+    ! rendering of the stop code — which a launcher reading this stream (see
+    ! run_sqrd) then has to filter out of the log.
     if (command_argument_count() /= 2) then
         write(error_unit, '(a)') 'usage: sqrd <db-dir> <port>   (port 0 = ephemeral)'
-        stop 1
+        call die()
     end if
     call get_command_argument(1, dirarg)
     call get_command_argument(2, portarg)
     read(portarg, *, iostat=ios) port
     if (ios /= 0 .or. port < 0 .or. port > 65535) then
         write(error_unit, '(2a)') 'sqrd: bad port: ', trim(portarg)
-        stop 1
+        call die()
     end if
 
     emsg = ''
     call db_open(db, trim(dirarg), rs, emsg)
     if (rs /= SQR_OK) then
         write(error_unit, '(4a)') 'sqrd: cannot open "', trim(dirarg), '": ', trim(emsg)
-        stop 1
+        call die()
     end if
 
     emsg = ''
@@ -51,7 +56,7 @@ program sqrd
     if (rs /= SQR_OK) then
         write(error_unit, '(2a)') 'sqrd: ', trim(emsg)
         call db_close(db)
-        stop 1
+        call die()
     end if
 
     write(output_unit, '(a,i0)') 'LISTENING ', srv%port
@@ -65,5 +70,15 @@ program sqrd
     serve: do
         call serve_step(srv, 1000, nev)
     end do serve
+
+contains
+
+    !! Exit non-zero after the caller has written its diagnostic.  Flushes
+    !! stderr first: c_exit is the C library's exit, which knows nothing of
+    !! Fortran's buffers.
+    subroutine die()
+        flush(error_unit)
+        call c_exit(1)
+    end subroutine
 
 end program sqrd

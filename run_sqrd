@@ -124,8 +124,10 @@ if {$argc != 1} {
     usage
     exit 0
 }
+# Against the advertised verbs, not against every proc in the namespace:
+# find and announced are internals, not commands to hand a user.
 set arg [lindex $argv 0]
-if {[llength [info commands "::daemon::$arg"]] != 1} {
+if {$arg ni $valid_commands} {
     puts "Command $arg not found"
     usage
     exit 0
