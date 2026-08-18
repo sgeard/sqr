@@ -29,6 +29,9 @@ module clib_wrap
     public :: c_truncate    !! set a file's length (shrink or grow)
     public :: c_realpath    !! canonical absolute path of an existing path
     public :: c_abspath     !! absolute path, final component need not exist
+    public :: c_joincwd     !! absolute path with symlinks and `..` left intact
+    public :: c_getcwd      !! the current working directory
+    public :: c_getpid      !! this process's id
     public :: c_exit        !! end the process with an exit status, silently
     public :: c_lock_try    !! try (non-blocking) to take an advisory lock
     public :: c_lock_release!! release an advisory lock and close its handle
@@ -110,6 +113,19 @@ module clib_wrap
             import :: c_int
             integer(c_int), value :: code
         end subroutine
+
+        ! Fills buf with the NUL-terminated working directory; 0 ok / 1 fail.
+        function sqr_os_getcwd(buf, cap) bind(c, name='sqr_os_getcwd') result(r)
+            import :: c_char, c_int
+            character(kind=c_char), intent(out) :: buf(*)
+            integer(c_int),         value       :: cap
+            integer(c_int)                      :: r
+        end function
+
+        function sqr_os_getpid() bind(c, name='sqr_os_getpid') result(r)
+            import :: c_int
+            integer(c_int) :: r
+        end function
 
         ! Fills buf with the NUL-terminated canonical absolute path.
         ! Returns 0 ok / 1 cannot resolve / 2 buffer too small.
@@ -303,6 +319,32 @@ module clib_wrap
         module function c_abspath(path) result(abspath)
             character(len=*), intent(in)  :: path  !! Path to make absolute
             character(len=:), allocatable :: abspath  !! Absolute path, or `''` on failure
+        end function
+
+        !! Make `path` absolute WITHOUT resolving anything: an already-absolute
+        !! path is returned unchanged, a relative one is joined to the working
+        !! directory.  Symbolic links and `..` components survive verbatim.
+        !!
+        !! This is the counterpart to `c_realpath`, not a lesser version of
+        !! it.  A symlink is often the name that matters — `db/current`
+        !! pointing at a dated directory — and resolving it discards the
+        !! caller's intent.  Note that `..` CANNOT be folded away here:
+        !! `a/link/..` is not `a` when `link` is a symlink, so the components
+        !! are left for the kernel to resolve as it always would.
+        !! Returns `''` only if the working directory cannot be read.
+        module function c_joincwd(path) result(abspath)
+            character(len=*), intent(in)  :: path  !! Path to anchor
+            character(len=:), allocatable :: abspath  !! Absolute path, unresolved
+        end function
+
+        !! The current working directory, or `''` if it cannot be read.
+        module function c_getcwd() result(dir)
+            character(len=:), allocatable :: dir  !! Working directory
+        end function
+
+        !! This process's id — for a daemon advertising itself in a file.
+        module function c_getpid() result(pid)
+            integer :: pid  !! Process id
         end function
 
         !! End the process with `code` as its exit status and no message of

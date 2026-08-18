@@ -1,39 +1,67 @@
 #!/usr/bin/env tclsh
-
-proc usage {} {
-    global valid_commands
-    puts "Usage:  [file tail [info script]] <[join $valid_commands |]>"
-}
+#
+# run_sqrd -- start, stop and inspect a sqrd daemon serving one database.
+#
+# Every verb names the database it acts on; there is no default, because a
+# launcher that guesses which database you meant is the thing this whole
+# arrangement exists to avoid.  Ports are not named at all: sqrd binds an
+# ephemeral one and records it in <db-dir>/_sqrd, and the clients read it
+# from there, so any number of databases can be served at once with nothing
+# to allocate and nothing to collide.
 
 namespace eval daemon {
+    # The user-facing verbs.  An ensemble dispatches to exactly these, so a
+    # proc that is not exported cannot be reached from the command line and
+    # there is no separate list of valid commands to keep in step with the
+    # implementation.  Unambiguous prefixes work: `run_sqrd stat <db>`.
+    # The ensemble is named for the script rather than the namespace, so
+    # Tcl's own "wrong # args" and "unknown subcommand" messages name the
+    # command the user typed instead of leaking an internal name.
+    namespace export start stop restart status help
+    namespace ensemble create -command ::run_sqrd
+
+    variable prog [file tail [info script]]
     variable name "sqrd"
-    variable loc "./obj_intel_release"
-    variable port_no 7477
-    variable db "profile_01"
-    variable id 0
-    variable log "sqrd.log"
+    # Relative to the script, not to the caller: the database is an argument,
+    # so this gets run from wherever that database happens to be.
+    variable loc [file join [file dirname [file normalize [info script]]] obj_intel_release]
+
+    # 0 = let the OS choose the port.  Pin a number only if something outside
+    # must hard-code it (an ODBC DSN carrying an explicit PORT, say).
+    variable bind_port 0
+    # Filled in from the LISTENING line: what was actually bound.  This and
+    # the two below are the start/announced handshake's shared state.
+    variable port_no 0
     variable chan ""
     variable ready 0
 
+    # ---- verbs ----------------------------------------------------------
+
+    #! Print how to use this and stop.
+    proc help {} {
+        usage stdout
+        exit 0
+    }
+
+    #! Start a daemon on `db` unless one is already serving it.
+    #
     # sqrd prints "LISTENING <port>" on stdout as soon as it is bound, and
     # everything else (including the absolute path of the database it is
     # serving) on stderr.  So keep stdout on a pipe and wait for that one
     # line rather than firing and hoping: it says whether the daemon really
-    # came up, hands back the pid, and reports the port actually bound —
-    # which is the only way to use port 0 (ephemeral) here.  stderr goes
-    # straight to the log so the banner is kept without crossing the pipe.
-    proc start {} {
+    # came up, hands back the pid, and reports the port actually bound --
+    # which is what makes an ephemeral port usable.  stderr goes straight to
+    # the log so the banner is kept without crossing the pipe.
+    proc start {db} {
         variable name
         variable loc
-        variable id
-        variable db
+        variable bind_port
         variable port_no
-        variable log
         variable chan
         variable ready
-        find
+        set id [find $db]
         if {$id != 0} {
-            puts "$name already running: pid = $id"
+            puts "$name already running on $db: pid = $id"
             return
         }
         set dobj [file join $loc $name]
@@ -43,15 +71,119 @@ namespace eval daemon {
         if {! [file isdirectory $db]} {
             error "$db is not a directory"
         }
+        set log   [logfile $db]
         set ready 0
-        set chan [open [list | $dobj $db $port_no 2>> $log] r]
+        set chan  [open [list | $dobj $db $bind_port 2>> $log] r]
         fileevent $chan readable [namespace code [list announced]]
         vwait [namespace current]::ready
         if {$ready < 0} {
-            error "$name failed to start -- see $log"
+            error "$name failed to start on $db -- see $log"
         }
-        set id [lindex [pid $chan] 0]
-        puts "$name serving $db on port $port_no: pid = $id"
+        puts "$name serving $db on port $port_no: pid = [lindex [pid $chan] 0]"
+    }
+
+    #! Stop the daemon serving `db`, if there is one.
+    #
+    # SIGKILL deliberately: sqrd has no shutdown command by design (a kill
+    # mid-write is the crash case its rollback journal already covers), and
+    # the ifx runtime prints a traceback on SIGTERM.
+    proc stop {db} {
+        variable name
+        set id [find $db]
+        if {$id == 0} {
+            puts "$name not running on $db"
+            return
+        }
+        puts "stopping pid = $id"
+        exec kill -9 $id
+    }
+
+    #! Stop and start again.
+    proc restart {db} {
+        stop $db
+        start $db
+    }
+
+    #! Report what is serving `db`, verified rather than assumed.
+    #
+    # Ask the database, not this script's configuration: sqrbak reads the
+    # port sqrd advertised in <db>/_sqrd, connects, and checks that the
+    # daemon it reached really is serving this directory.  So the answer is
+    # right whoever started the daemon, and right about the port even when
+    # the OS chose it.
+    proc status {db} {
+        variable name
+        variable loc
+        set bak [file join $loc sqrbak]
+        if {! [file executable $bak]} {
+            error "$bak is no executable"
+        }
+        # The pid first: a daemon that is running but unreachable (an older
+        # build, a wedged process) is a different story from nothing running
+        # at all, and saying so beats silence.
+        set id [find $db]
+        if {$id != 0} {
+            puts "pid = $id"
+        }
+        if {[catch {exec $bak info $db} out]} {
+            if {$id == 0} {
+                puts "$name not running on $db"
+            }
+            puts $out
+            return
+        }
+        puts $out
+    }
+
+    # ---- internals ------------------------------------------------------
+
+    # Built from the export list, so a new verb needs no second edit.
+    proc usage {chan} {
+        variable prog
+        set verbs [namespace eval [namespace current] {namespace export}]
+        set verbs [lsort [lsearch -all -inline -not -exact $verbs help]]
+        puts $chan "Usage:  $prog <[join $verbs |]> <db-dir>"
+        puts $chan "        $prog help"
+    }
+
+    # The log belongs with the database, not with whoever started the daemon:
+    # scoped by the directory it describes, so several daemons cannot
+    # interleave into one file and running this from two places does not
+    # scatter logs behind you.  The leading underscore follows the engine's
+    # convention for files that are not tables (_catalog.dat, _lock,
+    # _journal.dat, _sqrd), and db_pack enumerates a fixed file list, so this
+    # never finds its way into a backup container.
+    proc logfile {db} {
+        return [file join $db _sqrd.log]
+    }
+
+    # The pid of the daemon serving `db`, or 0.
+    #
+    # Identify it by the database it is serving, not by name: several sqrd
+    # instances can be running, one per database, and killing the wrong one
+    # is silent.  Each candidate's argument is resolved against ITS OWN
+    # working directory, so any spelling finds the same daemon rather than
+    # only the one matching the words used to start it.
+    #
+    # A ps line is arbitrary text, never a Tcl list (other processes' command
+    # lines contain quotes and braces that make list commands throw), so the
+    # pid is split off by hand.  ps joins argv with single spaces, so this
+    # assumes no argument contains one.
+    proc find {db} {
+        variable name
+        foreach p [split [exec -ignorestderr -- ps -u $::env(USER) -o pid=,args=] \n] {
+            set p [string trim $p]
+            set sp [string first " " $p]
+            if {$sp < 0} {continue}
+            set pid   [string range $p 0 $sp-1]
+            set words [split [string range $p $sp+1 end] " "]
+            if {[llength $words] != 3} {continue}
+            if {[file tail [lindex $words 0]] ne $name} {continue}
+            if {[same_dir $db [served_dir $pid [lindex $words 1]]]} {
+                return $pid
+            }
+        }
+        return 0
     }
 
     # fileevent handler for the pipe opened by start: consume the one
@@ -75,68 +207,47 @@ namespace eval daemon {
             set ready -1
         }
     }
-    
-    proc stop {} {
-        variable name
-        variable id
-        find
-        if {$id == 0} {return}
-        puts "stopping pid = $id"
-        eval exec kill -9 $id
-        set id 0
-    }
-    
-    proc restart {} {
-        variable name
-        variable id
-        find
-        stop
-        start
-    }
-    
-    # Identify OUR daemon by its full command line, not by name: several
-    # sqrd instances can be running, one per database, and killing the wrong
-    # one is silent.  A ps line is arbitrary text, never a Tcl list — other
-    # processes' command lines contain quotes and braces that make list
-    # commands throw — so split the pid off by hand and compare the rest as
-    # a plain string.  (ps joins argv with single spaces, so this assumes no
-    # argument contains one.)
-    proc find {} {
-        variable id; variable db; variable port_no; variable loc; variable name
-        if {$id != 0} {return}
-        set want "[file join $loc $name] $db $port_no"
-        foreach p [split [exec -ignorestderr -- ps -u $::env(USER) -o pid=,args=] \n] {
-            set p [string trim $p]
-            set sp [string first " " $p]
-            if {$sp < 0} {continue}
-            if {[string range $p $sp+1 end] eq $want} {
-                set id [string range $p 0 $sp-1]
-                break
-            }
+
+    # The directory a running daemon is actually serving: its argument, made
+    # absolute against its own cwd.  /proc is Linux-only, which this launcher
+    # is; an unreadable cwd (the process just died) simply fails to match.
+    proc served_dir {pid dir} {
+        if {[file pathtype $dir] eq "absolute"} {
+            return $dir
         }
+        if {[catch {file readlink /proc/$pid/cwd} cwd]} {
+            return ""
+        }
+        return [file join $cwd $dir]
+    }
+
+    # Do two paths name the same directory?  Device and inode rather than
+    # text: `file normalize` does not resolve symbolic links, so comparing
+    # strings would miss a daemon started through a different spelling of the
+    # same database -- and a stop that silently matches nothing is exactly
+    # the failure this launcher exists to avoid.
+    proc same_dir {a b} {
+        if {[catch {file stat $a sa}]} {return 0}
+        if {[catch {file stat $b sb}]} {return 0}
+        return [expr {$sa(dev) == $sb(dev) && $sa(ino) == $sb(ino)}]
     }
 }
 
 #------------------------------------------------------------------------------
-set valid_commands [list start stop restart]
-
-if {$argc != 1} {
-    usage
-    exit 0
-}
-# Against the advertised verbs, not against every proc in the namespace:
-# find and announced are internals, not commands to hand a user.
-set arg [lindex $argv 0]
-if {$arg ni $valid_commands} {
-    puts "Command $arg not found"
-    usage
-    exit 0
-}
-
-if {[catch {daemon::$arg} emsg]} {
-    puts "***Error: $emsg"
+# A misuse -- unknown verb, or the wrong number of arguments -- is reported
+# with the usage and a non-zero status; anything else is a real failure and
+# says so without the lecture.  Tcl distinguishes the two for us: the
+# ensemble raises TCL LOOKUP SUBCOMMAND, a proc's arity raises TCL WRONGARGS,
+# and `error` in a verb leaves the code NONE.
+if {[catch {run_sqrd {*}$argv} emsg opts]} {
+    set code [dict get $opts -errorcode]
+    if {[lindex $code 0] eq "TCL" && [lindex $code 1] in {LOOKUP WRONGARGS}} {
+        puts stderr $emsg
+        daemon::usage stderr
+        exit 1
+    }
+    puts stderr "***Error: $emsg"
     exit 1
 }
 
 exit 0
-

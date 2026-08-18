@@ -20,6 +20,20 @@ contains
         buf(size(buf)) = c_null_char
     end subroutine
 
+    ! A path that needs no working directory to interpret: POSIX '/...', or
+    ! a Windows drive ('c:\...') or UNC ('\\host\share') prefix.
+    pure function is_rooted(path) result(yes)
+        character(len=*), intent(in) :: path
+        logical :: yes
+        yes = .false.
+        if (len(path) == 0) return
+        if (index(SEPARATORS, path(1:1)) > 0) then
+            yes = .true.
+        else if (len(path) >= 3) then
+            yes = path(2:2) == ':' .and. index(SEPARATORS, path(3:3)) > 0
+        end if
+    end function
+
     ! The Fortran string held in a NUL-terminated c_char buffer (everything
     ! before the first NUL; the whole buffer if there is none).
     pure function from_cstr(buf) result(s)
@@ -152,6 +166,41 @@ contains
             abspath = parent // leaf
         else
             abspath = parent // '/' // leaf
+        end if
+    end function
+
+    module function c_getcwd() result(dir)
+        character(len=:), allocatable :: dir
+        integer, parameter :: CAP = 4096
+        character(kind=c_char) :: buf(CAP)
+        dir = ''
+        if (sqr_os_getcwd(buf, int(CAP, c_int)) /= 0_c_int) return
+        dir = from_cstr(buf)
+    end function
+
+    module function c_getpid() result(pid)
+        integer :: pid
+        pid = int(sqr_os_getpid())
+    end function
+
+    module function c_joincwd(path) result(abspath)
+        character(len=*), intent(in)  :: path
+        character(len=:), allocatable :: abspath
+        character(len=:), allocatable :: cwd
+        integer :: e
+        abspath = ''
+        e = len_trim(path)
+        if (e == 0) return
+        if (is_rooted(path(1:e))) then
+            abspath = path(1:e)
+            return
+        end if
+        cwd = c_getcwd()
+        if (len(cwd) == 0) return
+        if (index(SEPARATORS, cwd(len(cwd):len(cwd))) > 0) then
+            abspath = cwd // path(1:e)            ! cwd is the root itself
+        else
+            abspath = cwd // '/' // path(1:e)
         end if
     end function
 

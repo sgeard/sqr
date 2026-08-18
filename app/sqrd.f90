@@ -18,7 +18,7 @@ program sqrd
     use, intrinsic :: iso_fortran_env, only: output_unit, error_unit
     use :: sqr
     use :: sqr_serve
-    use :: clib_wrap, only: c_exit
+    use :: clib_wrap, only: c_exit, c_getpid
     implicit none
 
     type(db_t), target, save :: db
@@ -59,6 +59,8 @@ program sqrd
         call die()
     end if
 
+    call advertise()
+
     write(output_unit, '(a,i0)') 'LISTENING ', srv%port
     flush(output_unit)
     ! The absolute path, not the argument: whoever has to back this database
@@ -72,6 +74,41 @@ program sqrd
     end do serve
 
 contains
+
+    !! Record where this daemon can be reached, in the one place a client
+    !! that knows the database is certain to look: the database directory
+    !! itself.  A client then names the database — which is what it cares
+    !! about, and which works through symlinks for free — instead of a port
+    !! number that means nothing on its own.
+    !!
+    !! The file is a HINT, never a fact.  sqrd has no orderly shutdown (it
+    !! is killed, and the journal covers that), so nothing removes it: a
+    !! stale `_sqrd` outlives every daemon that ever served this directory,
+    !! and start-up simply overwrites it.  Every reader must therefore
+    !! verify — connect, ask `INFO`, and check the directory it reports.
+    !! That one test also catches a reused pid and a recycled port, which
+    !! is why no liveness is attempted here.
+    !!
+    !! A failure to write is not fatal: the daemon serves perfectly well
+    !! without the file, and clients given an explicit port never read it.
+    subroutine advertise()
+        character(len=:), allocatable :: path
+        integer :: u, ios
+        path = trim(dirarg)
+        if (len(path) > 0) then
+            if (path(len(path):len(path)) /= '/') path = path // '/'
+        end if
+        path = path // '_sqrd'
+        open(newunit=u, file=path, status='replace', action='write', iostat=ios)
+        if (ios /= 0) then
+            write(error_unit, '(2a)') 'sqrd: cannot advertise in ', path
+            return
+        end if
+        write(u, '(a,i0)') 'pid = ',  c_getpid()
+        write(u, '(a,i0)') 'port = ', srv%port
+        write(u, '(a)')    'host = 127.0.0.1'
+        close(u)
+    end subroutine
 
     !! Exit non-zero after the caller has written its diagnostic.  Flushes
     !! stderr first: c_exit is the C library's exit, which knows nothing of

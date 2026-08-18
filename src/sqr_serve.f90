@@ -48,7 +48,15 @@ module sqr_serve
         type(session_t)     :: sessions(SQRD_MAX_SESSIONS)  !! Session slots
         integer             :: txn_owner = 0  !! Session slot holding the open transaction (0 = none)
         character(len=:), allocatable :: dbname  !! Name advertised in `OK` (db dir basename)
-        character(len=:), allocatable :: dbpath  !! Absolute directory path, reported by `INFO`
+        !! The database directory as the caller named it, made absolute but
+        !! NOT resolved — a symlink here is usually the name that matters
+        !! (`db/current` pointing at a dated directory), and resolving it
+        !! would report something the caller never chose.  `INFO`'s `dir`.
+        character(len=:), allocatable :: dbpath
+        !! The same directory with every symlink resolved: identity rather
+        !! than name, for anything that must decide whether two paths are the
+        !! same database.  `INFO`'s `realdir`, reported only when it differs.
+        character(len=:), allocatable :: dbreal
     end type
 
     public :: serve_open   !! bind the loopback listener for a database

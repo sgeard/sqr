@@ -11,7 +11,7 @@ submodule (sqr_serve) sqr_serve_impl
     use :: sqr_net, only: net_attach, net_close, net_send_line, net_send_payload, &
                           net_recv_line, net_recv_payload, NET_OK
     use :: clib_wrap, only: c_sock_listen, c_sock_port, c_sock_accept, c_sock_poll, c_sock_close, &
-                            c_realpath
+                            c_realpath, c_joincwd
     implicit none
 
     character(len=*), parameter :: LF = achar(10)
@@ -50,10 +50,13 @@ contains
         srv%dbname = basename(db%dir)
         ! The physical location is what a backup needs, and the argument sqrd
         ! was started with is usually relative to a cwd the client cannot see.
-        ! Resolve it once, here, and fall back to the literal argument if the
-        ! platform cannot (the database is open, so this should not happen).
-        srv%dbpath = c_realpath(db%dir)
+        ! Anchor it once, here.  Two forms, because they answer two different
+        ! questions: dbpath is the caller's own name for the directory made
+        ! absolute (symlinks intact), dbreal is its resolved identity.
+        srv%dbpath = c_joincwd(db%dir)
         if (len(srv%dbpath) == 0) srv%dbpath = db%dir
+        srv%dbreal = c_realpath(db%dir)
+        if (len(srv%dbreal) == 0) srv%dbreal = srv%dbpath
         stat = SQR_OK
     end subroutine
 
@@ -351,6 +354,10 @@ contains
         type(buf_t) :: b
         call buf_add(b, 'name = '     // srv%dbname // LF)
         call buf_add(b, 'dir = '      // srv%dbpath // LF)
+        ! Only when it differs: a client comparing paths needs to know that
+        ! two spellings are the same database, but saying so for every plain
+        ! directory would be noise.
+        if (srv%dbreal /= srv%dbpath) call buf_add(b, 'realdir = ' // srv%dbreal // LF)
         call buf_add(b, 'server = sqrd ' // SQRD_VERSION // LF)
         call buf_add(b, 'protocol = ' // itoa(SQRD_PROTOCOL) // LF)
         call buf_add(b, 'readonly = ' // yesno(srv%db%readonly) // LF)
@@ -391,8 +398,11 @@ contains
         ! Refuse to write into the database being packed: the container and its
         ! .tmp sibling would sit among the files a later reader enumerates.
         ! The separator matters — a sibling named "<db>-backup.sqr" shares the
-        ! directory's prefix without being inside it.
-        if (is_within(file, srv%dbpath)) then
+        ! directory's prefix without being inside it.  Both spellings are
+        ! checked, since either can name the directory; a destination reached
+        ! through some third symlink still slips past, which is the caller's
+        ! business, not something to resolve every path in the system over.
+        if (is_within(file, srv%dbpath) .or. is_within(file, srv%dbreal)) then
             call send_err(srv%sessions(i), SQR_INVALID, &
                 'PACK destination is inside the database directory')
             return

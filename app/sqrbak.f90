@@ -2,8 +2,18 @@
 !! a backup container (reports/DESIGN-wire-protocol.md).
 !!
 !! Usage:
-!!   `sqrbak info   [<host>:]<port>`          report the served database
-!!   `sqrbak backup [<host>:]<port> <file>`   write a `.sqr` container
+!!   `sqrbak info   <db-dir>|[<host>:]<port>`          report the database
+!!   `sqrbak backup <db-dir>|[<host>:]<port> <file>`   write a `.sqr` container
+!!
+!! The endpoint is a **database directory** unless it looks like a port (all
+!! digits, optionally after `<host>:`).  Naming the directory is the better
+!! habit: it is what you actually care about, it survives a daemon restarting
+!! on a different port, and it works through symbolic links for free.  sqrd
+!! records its port in `<db-dir>/_sqrd`, which is where the directory form
+!! reads it from — and because that file is only a hint (nothing removes it
+!! when a daemon dies), the connection is then VERIFIED by asking `INFO`
+!! which directory it is really serving.  That one check also catches a
+!! recycled port and a reused pid.
 !!
 !! `<host>` defaults to 127.0.0.1 and must be a numeric IPv4 address (the
 !! socket shim does no name resolution).
@@ -26,33 +36,34 @@ program sqrbak
     use, intrinsic :: iso_fortran_env, only: output_unit, error_unit
     use, intrinsic :: iso_c_binding,   only: c_int64_t
     use :: sqr_net
-    use :: clib_wrap, only: c_sock_connect, c_sock_close, c_abspath, c_exit
+    use :: clib_wrap, only: c_sock_connect, c_sock_close, c_abspath, c_exit, &
+                            c_joincwd, c_realpath, c_path_exists
     implicit none
 
     character(len=*), parameter :: DEFAULT_HOST = '127.0.0.1'
 
     type(net_conn_t) :: conn
     character(len=4096) :: arg
-    character(len=:), allocatable :: cmd, host, file, payload
+    character(len=:), allocatable :: cmd, host, file, payload, endpoint, wanted_dir, info_text
     integer(c_int64_t) :: sock
     integer :: port, nargs
 
     nargs = command_argument_count()
-    if (nargs < 2) call die('usage: sqrbak info   [<host>:]<port>' // new_line('a') // &
-                            '       sqrbak backup [<host>:]<port> <file>')
+    if (nargs < 2) call die('usage: sqrbak info   <db-dir>|[<host>:]<port>' // new_line('a') // &
+                            '       sqrbak backup <db-dir>|[<host>:]<port> <file>')
     call get_command_argument(1, arg)
     cmd = trim(arg)
     call get_command_argument(2, arg)
-    call parse_endpoint(trim(arg), host, port)
+    endpoint = trim(arg)
+    call resolve_endpoint(endpoint, host, port, wanted_dir)
 
     select case (cmd)
     case ('info')
-        if (nargs /= 2) call die('usage: sqrbak info [<host>:]<port>')
+        if (nargs /= 2) call die('usage: sqrbak info <db-dir>|[<host>:]<port>')
         call connect_and_greet(host, port)
-        call request('INFO', '', payload)
-        write(output_unit, '(a)', advance='no') payload
+        write(output_unit, '(a)', advance='no') info_text
     case ('backup')
-        if (nargs /= 3) call die('usage: sqrbak backup [<host>:]<port> <file>')
+        if (nargs /= 3) call die('usage: sqrbak backup <db-dir>|[<host>:]<port> <file>')
         call get_command_argument(3, arg)
         ! Resolve against OUR working directory: the server refuses a relative
         ! path precisely because it would mean something different there.
@@ -80,24 +91,140 @@ contains
         call c_exit(1)
     end subroutine
 
-    !! Split `[<host>:]<port>`, defaulting the host.  A bad port is fatal.
-    subroutine parse_endpoint(spec, host, port)
+    !! Work out where to connect.  An endpoint that looks like a port (all
+    !! digits, optionally after `<host>:`) is taken as one; anything else is
+    !! a database directory, whose `_sqrd` file is read for the port.  In the
+    !! directory case `wanted_dir` comes back non-empty, and the greeting
+    !! verifies that the daemon really is serving it.
+    subroutine resolve_endpoint(spec, host, port, wanted_dir)
         character(len=*),              intent(in)  :: spec
         character(len=:), allocatable, intent(out) :: host
         integer,                       intent(out) :: port
+        character(len=:), allocatable, intent(out) :: wanted_dir
+        character(len=:), allocatable :: portpart
         integer :: c, ios
+        wanted_dir = ''
         c = index(spec, ':', back=.true.)
         if (c == 0) then
-            host = DEFAULT_HOST
-            read(spec, *, iostat=ios) port
+            host     = DEFAULT_HOST
+            portpart = spec
         else
-            host = spec(1:c - 1)
+            host     = spec(1:c - 1)
+            portpart = spec(c + 1:)
             if (len(host) == 0) host = DEFAULT_HOST
-            read(spec(c + 1:), *, iostat=ios) port
         end if
-        if (ios /= 0 .or. port <= 0 .or. port > 65535) &
-            call die('sqrbak: bad endpoint "' // spec // '" (want [<host>:]<port>)')
+        if (len_trim(portpart) > 0 .and. verify(trim(portpart), '0123456789') == 0) then
+            read(portpart, *, iostat=ios) port
+            if (ios /= 0 .or. port <= 0 .or. port > 65535) &
+                call die('sqrbak: bad port in "' // spec // '"')
+            return
+        end if
+        host       = DEFAULT_HOST      ! a path may legitimately contain ':'
+        wanted_dir = spec
+        call read_advert(spec, host, port)
     end subroutine
+
+    !! Read `<dir>/_sqrd`, the file sqrd writes to say where it is listening.
+    !! Absent means nothing has served this directory (or the directory is
+    !! wrong); present means only that something once did — the caller still
+    !! has to verify.
+    subroutine read_advert(dir, host, port)
+        character(len=*),              intent(in)    :: dir
+        character(len=:), allocatable, intent(inout) :: host
+        integer,                       intent(out)   :: port
+        character(len=:), allocatable :: path, key, val
+        character(len=1024) :: line
+        integer :: u, ios, eq
+        port = 0
+        path = dir
+        if (len(path) > 0) then
+            if (path(len(path):len(path)) /= '/') path = path // '/'
+        end if
+        path = path // '_sqrd'
+        if (.not. c_path_exists(path)) then
+            if (.not. c_path_exists(dir)) call die('sqrbak: no such database directory: ' // dir)
+            call die('sqrbak: no ' // path // ' — is sqrd running on that database?' &
+                // new_line('a') // '       (start it, or give an explicit port)')
+        end if
+        open(newunit=u, file=path, status='old', action='read', iostat=ios)
+        if (ios /= 0) call die('sqrbak: cannot read ' // path)
+        read_keys: do
+            read(u, '(a)', iostat=ios) line
+            if (ios /= 0) exit read_keys
+            eq = index(line, ' = ')
+            if (eq == 0) cycle read_keys
+            key = trim(adjustl(line(1:eq - 1)))
+            val = trim(adjustl(line(eq + 3:)))
+            select case (key)
+            case ('port')
+                read(val, *, iostat=ios) port
+                if (ios /= 0) port = 0
+            case ('host')
+                if (len(val) > 0) host = val
+            end select
+        end do read_keys
+        close(u)
+        if (port <= 0 .or. port > 65535) call die('sqrbak: no usable port in ' // path)
+    end subroutine
+
+    !! Confirm the daemon we reached is serving the directory we asked for.
+    !! The `_sqrd` file is a hint that nothing cleans up, so a stale one can
+    !! point at a port some other daemon has since taken.  Any spelling of
+    !! the directory will do — as given, anchored, or fully resolved, against
+    !! either `dir` or `realdir` — because a symlink is a legitimate name for
+    !! a database, not an error to be corrected.
+    subroutine verify_dir(wanted)
+        character(len=*), intent(in) :: wanted
+        character(len=:), allocatable :: got_dir, got_real, resolved
+        got_dir  = info_value('dir')
+        got_real = info_value('realdir')
+        if (len(got_real) == 0) got_real = got_dir
+        if (same_dir(wanted, got_dir, got_real))             return
+        if (same_dir(c_joincwd(wanted), got_dir, got_real))  return
+        resolved = c_realpath(wanted)
+        if (same_dir(resolved, got_dir, got_real))           return
+        call die('sqrbak: ' // host // ':' // itoa(port) // ' is serving ' // got_dir &
+            // new_line('a') // '       not ' // wanted &
+            // new_line('a') // '       (a stale _sqrd file, or the daemon was restarted elsewhere)')
+    end subroutine
+
+    !! Does candidate `p` name the same directory as either form the server
+    !! reported?  An empty candidate never matches (c_realpath returns '' for
+    !! a path it cannot resolve).
+    pure function same_dir(p, as_named, resolved) result(yes)
+        character(len=*), intent(in) :: p, as_named, resolved
+        logical :: yes
+        yes = .false.
+        if (len(p) == 0) return
+        yes = p == as_named .or. p == resolved
+    end function
+
+    !! The value of one `key = value` line of the cached INFO payload, or ''.
+    !! Walks whole lines rather than searching the text, so `dir` cannot
+    !! match inside `realdir`.
+    function info_value(key) result(val)
+        character(len=*), intent(in)  :: key
+        character(len=:), allocatable :: val, line
+        integer :: p, e, eq
+        val = ''
+        p = 1
+        scan_lines: do while (p <= len(info_text))
+            e = index(info_text(p:), new_line('a'))
+            if (e == 0) then
+                line = info_text(p:)
+                p    = len(info_text) + 1
+            else
+                line = info_text(p:p + e - 2)
+                p    = p + e
+            end if
+            eq = index(line, ' = ')
+            if (eq == 0) cycle scan_lines
+            if (line(1:eq - 1) == key) then
+                val = line(eq + 3:)
+                exit scan_lines
+            end if
+        end do scan_lines
+    end function
 
     !! Connect and complete the HELLO exchange, or die trying.  The
     !! connection and its socket are the program's, reached by host
@@ -115,6 +242,10 @@ contains
         call net_recv_line(conn, line, ne)
         if (ne /= NET_OK) call die('sqrbak: no greeting from the server')
         if (line(1:min(3, len(line))) /= 'OK ') call die('sqrbak: server refused: ' // line)
+        ! INFO always, not just for `info`: it is one round trip on loopback,
+        ! and it is what turns a port read out of a file into a checked fact.
+        call request('INFO', '', info_text)
+        if (len(wanted_dir) > 0) call verify_dir(wanted_dir)
     end subroutine
 
     !! Send one request — with `body` as its counted payload when non-empty —

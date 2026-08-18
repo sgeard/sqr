@@ -225,12 +225,29 @@ the database it is serving. That matters more than it looks: a client picks a
 host and a port, so without it there is nothing to tell you *which* database on
 disk you have reached — or which of several `sqrd` instances is which.
 
+On startup it also records where it is listening in `<db-dir>/_sqrd`, so
+clients can name the **database** rather than a port:
+
+```
+pid = 1459619
+port = 7477
+host = 127.0.0.1
+```
+
+That file is a hint, not a fact — nothing removes it when a daemon dies — so
+every reader connects and checks which directory is really being served
+before believing it. That one check also catches a reused pid and a recycled
+port.
+
 `sqrbak` asks a running server exactly that, and takes backups:
 
 ```
-sqrbak info   [<host>:]<port>            # name, absolute dir, version, txn state
-sqrbak backup [<host>:]<port> <file>     # write a .sqr container
+sqrbak info   <db-dir>|[<host>:]<port>            # name, dir, version, txn state
+sqrbak backup <db-dir>|[<host>:]<port> <file>     # write a .sqr container
 ```
+
+The endpoint is a database directory unless it looks like a port (all digits,
+optionally after `<host>:`).
 
 The backup is taken **without closing the database**: the server flushes and
 releases its file units, reads the snapshot, and reopens them, all while
@@ -240,17 +257,25 @@ open — a directory mid-gesture is not a state worth archiving. Restore with
 `sqlsh`'s `.unpack`, which is the same container format as `db_pack`.
 
 ```
-$ sqrbak info 7477
-name = profile_01
-dir = /home/simon/development/projects/sqr/profile_01
+$ sqrbak info ~/db/current
+name = current
+dir = /home/simon/db/current
+realdir = /home/simon/db/accounts-2026
 server = sqrd 1.0.0
 protocol = 1
 readonly = no
 txn = no
 tables = 12
-$ sqrbak backup 7477 profile_01-$(date +%F).sqr
-packed /home/simon/development/projects/sqr/profile_01 -> /home/simon/backups/profile_01-2026-08-15.sqr
+$ sqrbak backup ~/db/current accounts-$(date +%F).sqr
+packed /home/simon/db/current -> /home/simon/backups/accounts-2026-08-16.sqr
 ```
+
+Symbolic links are kept, not corrected: `dir` is the directory as the daemon
+was told to open it, and `realdir` (shown only when it differs) is the
+resolved identity. A link like `db/current` is usually the name that matters,
+so resolving it away would report something you never chose — but anything
+that needs to know whether two paths are the same database still has an
+answer. Every client matches permissively against both.
 
 Relative destinations are resolved against `sqrbak`'s working directory, not
 the server's — the server itself insists on an absolute path, precisely so a

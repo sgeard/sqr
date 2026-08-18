@@ -46,7 +46,8 @@
 #include <windows.h>
 #include <io.h>      /* _access, _open, _close, _commit, _chsize_s, _isatty, _chmod */
 #include <sys/stat.h>/* _S_IREAD, _S_IWRITE */
-#include <direct.h>  /* _mkdir */
+#include <direct.h>  /* _mkdir, _getcwd */
+#include <process.h> /* _getpid */
 #include <fcntl.h>   /* _O_RDWR */
 #include <stdio.h>   /* remove, snprintf */
 #include <string.h>  /* strcmp, memset */
@@ -145,6 +146,16 @@ int sqr_os_truncate(const char *p, int64_t length) {
 
 void sqr_os_exit(int code) {
     exit(code);
+}
+
+int sqr_os_getcwd(char *buf, int cap) {
+    if (cap <= 0) return 1;
+    buf[0] = '\0';
+    return _getcwd(buf, cap) == NULL ? 1 : 0;
+}
+
+int sqr_os_getpid(void) {
+    return (int)_getpid();
 }
 
 int sqr_os_realpath(const char *p, char *buf, int cap) {
@@ -402,6 +413,16 @@ int sqr_os_truncate(const char *p, int64_t length) {
 
 void sqr_os_exit(int code) {
     exit(code);
+}
+
+int sqr_os_getcwd(char *buf, int cap) {
+    if (cap <= 0) return 1;
+    buf[0] = '\0';
+    return getcwd(buf, (size_t)cap) == NULL ? 1 : 0;
+}
+
+int sqr_os_getpid(void) {
+    return (int)getpid();
 }
 
 int sqr_os_realpath(const char *p, char *buf, int cap) {

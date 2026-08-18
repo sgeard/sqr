@@ -15,7 +15,14 @@ if {$::argc != 1} {
 }
 set exe [lindex $::argv 0]
 set dbdir sqrd_func_db
-file delete -force $dbdir
+# A second database reached through a symlink, for the dir/realdir checks.
+# Absolute names captured BEFORE the link exists, so they are plain strings:
+# comparing against them is what proves the daemon reports the name it was
+# given rather than the one it resolved to.
+set realdir2 [file normalize sqrd_func_db2]
+set linkdir  [file normalize sqrd_func_link]
+file delete -force $dbdir $realdir2 $linkdir
+file mkdir $realdir2
 
 set npass 0
 set nfail 0
@@ -228,6 +235,54 @@ if {[file executable $bakexe]} {
     puts "  SKIP sqrbak tests ($bakexe not built)"
 }
 
+# _sqrd — the daemon advertises its port in the database directory, so a
+# client can name the database instead of a port number.
+set advert [file join $dbdir _sqrd]
+check {[file exists $advert]} "sqrd advertises itself in <db>/_sqrd"
+set adv {}
+set fh [open $advert r]
+foreach l [split [string trim [read $fh]] "\n"] {
+    set eq [string first " = " $l]
+    if {$eq >= 0} { dict set adv [string range $l 0 $eq-1] [string range $l $eq+3 end] }
+}
+close $fh
+check {[dict get $adv port] == $port} "_sqrd records the bound port"
+check {[dict get $adv pid] > 0} "_sqrd records the pid"
+
+# A symlink is a legitimate name for a database: INFO reports the name the
+# daemon was given as `dir`, and its resolved identity as `realdir`.
+if {[catch {file link -symbolic $linkdir $realdir2}] == 0} {
+    file delete -force $realdir2/_sqrd
+    set srv2 [open [list | $exe $linkdir 0] r]
+    fconfigure $srv2 -blocking 1
+    set line2 [gets $srv2]
+    set port2 [lindex $line2 1]
+    check {[lindex $line2 0] eq "LISTENING"} "second server started through a symlink"
+    set c3 [dial $port2]
+    sendline $c3 "HELLO 1 linktest"
+    gets $c3
+    lassign [reply [sendline $c3 "INFO"]] hdr payload
+    set info2 {}
+    foreach l [split [string trimright $payload "\n"] "\n"] {
+        set eq [string first " = " $l]
+        if {$eq >= 0} { dict set info2 [string range $l 0 $eq-1] [string range $l $eq+3 end] }
+    }
+    check {[dict get $info2 dir] eq $linkdir} \
+        "INFO dir keeps the symlink the daemon was given"
+    check {[dict exists $info2 realdir] && [dict get $info2 realdir] eq $realdir2} \
+        "INFO realdir resolves it"
+    check {[file exists [file join $realdir2 _sqrd]]} "_sqrd lands in the real directory"
+    sendline $c3 "QUIT"
+    reply $c3
+    close $c3
+    if {[file executable $bakexe]} {
+        check {![catch {exec $bakexe info $linkdir} out2]} "sqrbak accepts the symlinked directory"
+        check {![catch {exec $bakexe info $realdir2} out3]} "sqrbak accepts the real directory"
+    }
+    exec kill [pid $srv2]
+    catch {close $srv2}
+}
+
 # errors and liveness
 lassign [reply [sendsql $c "SELEC oops"]] hdr payload
 check {[lindex $hdr 0] eq "ERR" && [string length $payload] > 0} "bad SQL -> ERR + message"
@@ -257,7 +312,7 @@ close $c
 # ---- shut down ----
 exec kill [pid $srv]
 catch {close $srv}
-file delete -force $dbdir
+file delete -force $dbdir $realdir2 $linkdir
 file delete -force sqrd_func_backup.sqr
 
 puts "sqrd functional: $npass passed, $nfail failed"
