@@ -15,6 +15,9 @@ ford_docs/
 # coverage artefacts
 *.gcov
 
+# python bytecode (calc/tclcalc.py)
+__pycache__/
+
 # editor / tooling artefacts
 tags/
 *~

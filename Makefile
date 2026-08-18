@@ -1,4 +1,4 @@
-.PHONY: all clean veryclean distclean utest sqlttest sqrdtest faulttest run-faulttest proctest bench run-bench destruct run-destruct coverage coverage-gcov coverage-clean docs docs-clean help windows win-build sqrsh-regex test-regex
+.PHONY: all clean veryclean distclean utest sqlttest sqrdtest calctest install-calc faulttest run-faulttest proctest bench run-bench destruct run-destruct coverage coverage-gcov coverage-clean docs docs-clean help windows win-build sqrsh-regex test-regex
 .SUFFIXES:
 .DEFAULT_GOAL := all
 
@@ -298,6 +298,22 @@ sqlttest: $(ODIR)/sqlsh$(EXT)
 sqrdtest: $(ODIR)/sqrd$(EXT)
 	tclsh $(TEST_DIR)/run_sqrd.tcl $(ODIR)/sqrd$(EXT)
 
+# --- LibreOffice Calc client (calc/) ---------------------------------------
+# calc/tclcalc.py is the generic pyuno macro host; calc/sqr_calc.tcl is the
+# sqr director it embeds (tkinter.Tcl).  calctest runs the real director
+# against a mock servant and a real spawned sqrd — everything except the
+# pyuno lines, which get a manual smoke test in Calc (calc/README.md).
+CALC_DIR     := calc
+LO_SCRIPTS   := $(HOME)/.config/libreoffice/4/user/Scripts/python
+
+calctest: $(ODIR)/sqrd$(EXT)
+	tclsh $(CALC_DIR)/test_calc.tcl $(ODIR)/sqrd$(EXT)
+
+install-calc:
+	mkdir -p $(LO_SCRIPTS)
+	install -m 644 $(CALC_DIR)/tclcalc.py $(CALC_DIR)/sqr_calc.tcl $(LO_SCRIPTS)/
+	@echo "Installed tclcalc.py + sqr_calc.tcl to $(LO_SCRIPTS)"
+
 # Fault-injection sweep. Built only here (and by coverage), always with
 # FAULT=on, into a debug ODIR so the production release archive is never
 # overwritten with the on submodule.
@@ -464,7 +480,8 @@ windows:
 	@for t in $(WIN_TESTS); do echo "    $(WIN_ODIR)/$$t.exe"; done
 
 help:
-	@echo "Targets : all, utest, sqlttest, sqrdtest, faulttest, destruct, bench, clean, veryclean, distclean"
+	@echo "Targets : all, utest, sqlttest, sqrdtest, calctest, install-calc, faulttest, destruct, bench"
+	@echo "          clean, veryclean, distclean"
 	@echo "          coverage, coverage-gcov, coverage-clean, docs, docs-clean, windows"
 	@echo "          sqrsh-regex, test-regex (opt-in DT_CHAR regex search via tcl_re)"
 	@echo "Options : F=gfortran|ifx|lfortran|flang (default ifx)  debug=1  valgrind=1 (ifx: AVX2 cap)"
