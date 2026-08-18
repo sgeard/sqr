@@ -210,6 +210,56 @@ the engine has no constraint store.
 
 ---
 
+## Serving and backing up over the wire (`sqrd`, `sqrbak`)
+
+`sqrd` serves one database over a loopback socket so out-of-process clients —
+the LibreOffice Calc macro in `calc/`, the ODBC driver in the sibling
+`sqr_odbc` project — can reach it:
+
+```
+sqrd <db-dir> <port>          # port 0 asks the OS for an ephemeral one
+```
+
+It prints `LISTENING <port>` on stdout and, on stderr, the **absolute path** of
+the database it is serving. That matters more than it looks: a client picks a
+host and a port, so without it there is nothing to tell you *which* database on
+disk you have reached — or which of several `sqrd` instances is which.
+
+`sqrbak` asks a running server exactly that, and takes backups:
+
+```
+sqrbak info   [<host>:]<port>            # name, absolute dir, version, txn state
+sqrbak backup [<host>:]<port> <file>     # write a .sqr container
+```
+
+The backup is taken **without closing the database**: the server flushes and
+releases its file units, reads the snapshot, and reopens them, all while
+holding its own advisory lock, so no client is disconnected and no other
+process can take the database meanwhile. It is refused while a transaction is
+open — a directory mid-gesture is not a state worth archiving. Restore with
+`sqlsh`'s `.unpack`, which is the same container format as `db_pack`.
+
+```
+$ sqrbak info 7477
+name = profile_01
+dir = /home/simon/development/projects/sqr/profile_01
+server = sqrd 1.0.0
+protocol = 1
+readonly = no
+txn = no
+tables = 12
+$ sqrbak backup 7477 profile_01-$(date +%F).sqr
+packed /home/simon/development/projects/sqr/profile_01 -> /home/simon/backups/profile_01-2026-08-15.sqr
+```
+
+Relative destinations are resolved against `sqrbak`'s working directory, not
+the server's — the server itself insists on an absolute path, precisely so a
+name can never quietly mean a different place at each end.
+
+See `reports/DESIGN-wire-protocol.md` for the protocol itself.
+
+---
+
 ## On-disk layout
 
 A database is a directory containing:

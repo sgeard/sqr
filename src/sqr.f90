@@ -278,6 +278,7 @@ module sqr
         integer                       :: ntables  = 0  !! Number of open tables
         logical                       :: opened   = .false.  !! `.true.` between `db_open` and `db_close`
         logical                       :: readonly = .false.  !! `.true.` if opened read-only
+        logical                       :: quiesced = .false.  !! `.true.` between `db_quiesce` and `db_resume` (units closed)
         integer                       :: generation = 0  !! Bumped by every mutating call; cursors snapshot it
         integer(c_int64_t)            :: lock_tok = -1  !! Advisory-lock token held while open (-1 = none)
         type(journal_t)               :: jrnl  !! Rollback journal state
@@ -298,6 +299,9 @@ module sqr
         !! `db` argument is `class(db_t)` throughout).
         procedure :: open         => db_open
         procedure :: close        => db_close
+        procedure :: quiesce      => db_quiesce
+        procedure :: resume       => db_resume
+        procedure :: pack_live    => db_pack_live
         procedure :: set_readonly => db_set_readonly
         procedure :: create_table => db_create_table
         procedure :: drop_table   => db_drop_table
@@ -390,8 +394,9 @@ module sqr
 
     ! --- Public API ---
     public :: db_open, db_close, db_set_readonly
+    public :: db_quiesce, db_resume
     public :: db_create_table, db_drop_table, db_compact
-    public :: db_pack, db_unpack
+    public :: db_pack, db_pack_live, db_unpack
     public :: db_add_column, db_drop_column
     public :: db_list_tables, db_table_index, db_record_size, db_describe, db_row_count, db_in_txn, idx_live
     public :: db_last_error, sqr_errstr
@@ -505,6 +510,36 @@ module sqr
             character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
+        !! Persist everything that lives only in memory (catalog and the
+        !! per-table schema counters) and close every data, blob and index
+        !! unit, leaving the handle open and its advisory lock held.  The
+        !! database directory is then a complete, consistent snapshot that
+        !! another reader — `db_pack`, a copy tool — may read through its own
+        !! units, which the Fortran one-file-one-unit rule forbids while the
+        !! engine holds them.
+        !!
+        !! CONTRACT: between `db_quiesce` and `db_resume` the handle answers
+        !! no queries and accepts no writes — every table's units are -1.  It
+        !! is refused (`SQR_INVALID`) on a closed or already-quiesced handle
+        !! and while a transaction is live; `db_close` on a quiesced handle
+        !! is safe (the units are already gone).
+        module subroutine db_quiesce(db, stat, errmsg)
+            class(db_t), intent(inout)               :: db  !! Database handle
+            integer,    intent(out),       optional :: stat  !! First flush/close failure, else `SQR_OK`
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
+        end subroutine
+
+        !! Reopen the units `db_quiesce` closed, from the same on-disk state.
+        !! Refused (`SQR_INVALID`) on a handle that is not quiesced.  A
+        !! failure leaves the handle wedged exactly as a failed `db_compact`
+        !! reopen does: the on-disk database is intact, but this handle must
+        !! be closed and reopened before further use.
+        module subroutine db_resume(db, stat, errmsg)
+            class(db_t), intent(inout)               :: db  !! Quiesced database handle
+            integer,    intent(out),       optional :: stat  !! `SQR_OK` or the first reopen failure
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
+        end subroutine
+
         !! Demote an open read-write handle to read-only: subsequent writes
         !! return `SQR_READONLY`, and the exclusive lock is downgraded to a
         !! shared one so other read-only connections may attach.  Refused
@@ -575,6 +610,23 @@ module sqr
             character(len=*), intent(in)            :: dir   !! Database directory to pack
             character(len=*), intent(in)            :: file  !! Container file to write
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Failure detail
+        end subroutine
+
+        !! Pack the database an OPEN handle is serving, without closing it —
+        !! the hot-backup entry point behind sqrd's `PACK` request.  Equivalent
+        !! to `db_pack` on the same directory, except that exclusion comes from
+        !! the handle's own exclusive lock rather than a fresh shared one:
+        !! `db_quiesce` flushes and drops the file units, the snapshot is read,
+        !! and `db_resume` reopens them.  No other process can take the lock in
+        !! between, so the archive is a snapshot of a database that stayed open
+        !! throughout.  Refused (`SQR_INVALID`) on a closed handle or while a
+        !! transaction is live — an in-flight transaction's base images are in
+        !! the journal, so the directory is not a committed state.
+        module subroutine db_pack_live(db, file, stat, errmsg)
+            class(db_t),      intent(inout)           :: db    !! Open database handle
+            character(len=*), intent(in)              :: file  !! Container file to write
+            integer,          intent(out),   optional :: stat  !! `SQR_OK` or an error code
             character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 

@@ -1,6 +1,11 @@
 submodule (clib_wrap) clib_wrap_impl
     implicit none
 
+    ! Path separators accepted when splitting a path: POSIX uses '/' only,
+    ! Windows accepts either, and a POSIX name containing a backslash is
+    ! pathological enough that treating it as a separator costs nothing.
+    character(len=*), parameter :: SEPARATORS = '/' // achar(92)
+
 contains
 
     ! Copy a Fortran string into a NUL-terminated c_char target buffer sized
@@ -14,6 +19,21 @@ contains
         end do
         buf(size(buf)) = c_null_char
     end subroutine
+
+    ! The Fortran string held in a NUL-terminated c_char buffer (everything
+    ! before the first NUL; the whole buffer if there is none).
+    pure function from_cstr(buf) result(s)
+        character(kind=c_char), intent(in) :: buf(:)
+        character(len=:), allocatable :: s
+        integer :: i
+        do i = 1, size(buf)
+            if (buf(i) == c_null_char) exit
+        end do
+        allocate(character(len=i - 1) :: s)
+        do i = 1, len(s)
+            s(i:i) = buf(i)
+        end do
+    end function
 
     module function c_rename(oldpath, newpath) result(ierr)
         character(len=*), intent(in) :: oldpath, newpath
@@ -90,6 +110,55 @@ contains
         call to_cstr(path, p)
         ierr = int(sqr_os_truncate(p, length))
     end function
+
+    module function c_realpath(path) result(abspath)
+        character(len=*), intent(in)  :: path
+        character(len=:), allocatable :: abspath
+        integer, parameter :: CAP = 4096          ! > PATH_MAX on every target
+        character(kind=c_char) :: p(len_trim(path) + 1)
+        character(kind=c_char) :: buf(CAP)
+        abspath = ''
+        if (len_trim(path) == 0) return
+        call to_cstr(path, p)
+        if (sqr_os_realpath(p, buf, int(CAP, c_int)) /= 0_c_int) return
+        abspath = from_cstr(buf)
+    end function
+
+    module function c_abspath(path) result(abspath)
+        character(len=*), intent(in)  :: path
+        character(len=:), allocatable :: abspath
+        character(len=:), allocatable :: parent, leaf
+        integer :: e, s
+        abspath = c_realpath(path)
+        if (len(abspath) > 0) return              ! it exists: already canonical
+        e = len_trim(path)
+        if (e == 0) return
+        ! Split off the final component; a trailing separator means there is
+        ! no leaf to append and the path simply does not resolve.
+        s = scan(path(1:e), SEPARATORS, back=.true.)
+        if (s == e) return
+        leaf = path(s + 1:e)
+        if (s == 0) then
+            parent = '.'                          ! bare name: relative to the cwd
+        else if (s == 1) then
+            parent = path(1:1)                    ! at the root
+        else
+            parent = path(1:s - 1)
+        end if
+        parent = c_realpath(parent)
+        if (len(parent) == 0) return              ! unresolvable parent
+        if (parent(len(parent):len(parent)) == '/' .or. &
+            parent(len(parent):len(parent)) == achar(92)) then
+            abspath = parent // leaf
+        else
+            abspath = parent // '/' // leaf
+        end if
+    end function
+
+    module subroutine c_exit(code)
+        integer, intent(in) :: code
+        call sqr_os_exit(int(code, c_int))
+    end subroutine
 
     module subroutine c_lock_try(path, exclusive, tok, ierr)
         character(len=*),   intent(in)  :: path

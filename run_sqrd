@@ -1,0 +1,140 @@
+#!/usr/bin/env tclsh
+
+proc usage {} {
+    global valid_commands
+    puts "Usage:  [file tail [info script]] <[join $valid_commands |]>"
+}
+
+namespace eval daemon {
+    variable name "sqrd"
+    variable loc "./obj_intel_release"
+    variable port_no 7477
+    variable db "profile_01"
+    variable id 0
+    variable log "sqrd.log"
+    variable chan ""
+    variable ready 0
+
+    # sqrd prints "LISTENING <port>" on stdout as soon as it is bound, and
+    # everything else (including the absolute path of the database it is
+    # serving) on stderr.  So keep stdout on a pipe and wait for that one
+    # line rather than firing and hoping: it says whether the daemon really
+    # came up, hands back the pid, and reports the port actually bound —
+    # which is the only way to use port 0 (ephemeral) here.  stderr goes
+    # straight to the log so the banner is kept without crossing the pipe.
+    proc start {} {
+        variable name
+        variable loc
+        variable id
+        variable db
+        variable port_no
+        variable log
+        variable chan
+        variable ready
+        find
+        if {$id != 0} {
+            puts "$name already running: pid = $id"
+            return
+        }
+        set dobj [file join $loc $name]
+        if {! [file executable $dobj]} {
+            error "$dobj is no executable"
+        }
+        if {! [file isdirectory $db]} {
+            error "$db is not a directory"
+        }
+        set ready 0
+        set chan [open [list | $dobj $db $port_no 2>> $log] r]
+        fileevent $chan readable [namespace code [list announced]]
+        vwait [namespace current]::ready
+        if {$ready < 0} {
+            error "$name failed to start -- see $log"
+        }
+        set id [lindex [pid $chan] 0]
+        puts "$name serving $db on port $port_no: pid = $id"
+    }
+
+    # fileevent handler for the pipe opened by start: consume the one
+    # machine-readable line, then stand down.  EOF before it arrives means
+    # the daemon died on the way up (bad port, locked database).
+    proc announced {} {
+        variable chan
+        variable port_no
+        variable ready
+        if {[gets $chan line] < 0} {
+            if {[eof $chan]} {
+                set ready -1
+            }
+            return
+        }
+        fileevent $chan readable {}
+        if {[lindex $line 0] eq "LISTENING"} {
+            set port_no [lindex $line 1]
+            set ready 1
+        } else {
+            set ready -1
+        }
+    }
+    
+    proc stop {} {
+        variable name
+        variable id
+        find
+        if {$id == 0} {return}
+        puts "stopping pid = $id"
+        eval exec kill -9 $id
+        set id 0
+    }
+    
+    proc restart {} {
+        variable name
+        variable id
+        find
+        stop
+        start
+    }
+    
+    # Identify OUR daemon by its full command line, not by name: several
+    # sqrd instances can be running, one per database, and killing the wrong
+    # one is silent.  A ps line is arbitrary text, never a Tcl list — other
+    # processes' command lines contain quotes and braces that make list
+    # commands throw — so split the pid off by hand and compare the rest as
+    # a plain string.  (ps joins argv with single spaces, so this assumes no
+    # argument contains one.)
+    proc find {} {
+        variable id; variable db; variable port_no; variable loc; variable name
+        if {$id != 0} {return}
+        set want "[file join $loc $name] $db $port_no"
+        foreach p [split [exec -ignorestderr -- ps -u $::env(USER) -o pid=,args=] \n] {
+            set p [string trim $p]
+            set sp [string first " " $p]
+            if {$sp < 0} {continue}
+            if {[string range $p $sp+1 end] eq $want} {
+                set id [string range $p 0 $sp-1]
+                break
+            }
+        }
+    }
+}
+
+#------------------------------------------------------------------------------
+set valid_commands [list start stop restart]
+
+if {$argc != 1} {
+    usage
+    exit 0
+}
+set arg [lindex $argv 0]
+if {[llength [info commands "::daemon::$arg"]] != 1} {
+    puts "Command $arg not found"
+    usage
+    exit 0
+}
+
+if {[catch {daemon::$arg} emsg]} {
+    puts "***Error: $emsg"
+    exit 1
+}
+
+exit 0
+

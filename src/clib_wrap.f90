@@ -27,6 +27,9 @@ module clib_wrap
     public :: c_fsync_path  !! flush a file's data to stable storage
     public :: c_fsync_dir   !! flush a directory's entries to stable storage
     public :: c_truncate    !! set a file's length (shrink or grow)
+    public :: c_realpath    !! canonical absolute path of an existing path
+    public :: c_abspath     !! absolute path, final component need not exist
+    public :: c_exit        !! end the process with an exit status, silently
     public :: c_lock_try    !! try (non-blocking) to take an advisory lock
     public :: c_lock_release!! release an advisory lock and close its handle
     public :: c_lock_share  !! downgrade an exclusive advisory lock to shared
@@ -101,6 +104,21 @@ module clib_wrap
             character(kind=c_char), intent(in) :: p(*)
             integer(c_int64_t),     value      :: length
             integer(c_int)                     :: r
+        end function
+
+        subroutine sqr_os_exit(code) bind(c, name='sqr_os_exit')
+            import :: c_int
+            integer(c_int), value :: code
+        end subroutine
+
+        ! Fills buf with the NUL-terminated canonical absolute path.
+        ! Returns 0 ok / 1 cannot resolve / 2 buffer too small.
+        function sqr_os_realpath(p, buf, cap) bind(c, name='sqr_os_realpath') result(r)
+            import :: c_char, c_int
+            character(kind=c_char), intent(in)  :: p(*)
+            character(kind=c_char), intent(out) :: buf(*)
+            integer(c_int),         value       :: cap
+            integer(c_int)                      :: r
         end function
 
         ! Returns 0 ok / 1 contended / 2 error; sets tok on success.
@@ -266,6 +284,35 @@ module clib_wrap
             integer(c_int64_t), intent(in) :: length  !! New length in bytes
             integer                        :: ierr  !! 0 on success, nonzero on failure
         end function
+
+        !! Canonical absolute path of `path` — `.`/`..` folded away and,
+        !! on POSIX, symbolic links resolved (`realpath` / `_fullpath`).
+        !! Every component must exist: the result is a zero-length string
+        !! if it cannot be resolved, so callers can test with `len`.  Use
+        !! `c_abspath` when the last component may not exist yet.
+        module function c_realpath(path) result(abspath)
+            character(len=*), intent(in)  :: path  !! Path to canonicalise
+            character(len=:), allocatable :: abspath  !! Absolute path, or `''` on failure
+        end function
+
+        !! Absolute path of `path` when the final component need not exist —
+        !! the case for a file about to be created.  An existing path is
+        !! canonicalised exactly as `c_realpath` does; otherwise the parent
+        !! directory is canonicalised and the final component appended
+        !! verbatim (so an unresolvable parent still yields `''`).
+        module function c_abspath(path) result(abspath)
+            character(len=*), intent(in)  :: path  !! Path to make absolute
+            character(len=:), allocatable :: abspath  !! Absolute path, or `''` on failure
+        end function
+
+        !! End the process with `code` as its exit status and no message of
+        !! any kind — what a command-line tool wants after printing its own
+        !! diagnostic, where `stop <n>` would add the compiler's rendering of
+        !! the stop code to stderr.  Buffered Fortran output is NOT flushed:
+        !! `flush` any unit that matters first.  Never returns.
+        module subroutine c_exit(code)
+            integer, intent(in) :: code  !! Process exit status
+        end subroutine
 
         !! Try (non-blocking) to take an advisory lock on `path`, which is
         !! created if absent.  `exclusive` selects a write lock; otherwise a

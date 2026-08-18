@@ -45,16 +45,9 @@ contains
         character(len=*), intent(in)            :: dir, file
         integer,          intent(out), optional :: stat
         character(len=*), intent(inout), optional :: errmsg
-        type(db_t)     :: sdb                 ! only %dir / %lock_tok are used
-        type(table_t), allocatable :: tbls(:)
-        type(pfile_t), allocatable :: pf(:)
-        character(len=SQR_NAME_LEN), allocatable :: names(:)
-        character(len=:), allocatable :: payload
-        integer(int64), allocatable   :: offs(:)
-        integer(int64) :: total
-        integer :: n, nf, i, j, k, rs, lerr, cks
+        type(db_t) :: sdb                     ! only %dir / %lock_tok are used
+        integer    :: rs, lerr
 
-        rs = SQR_OK
         sdb%dir = trim(dir)
         if (.not. file_exists(catalog_path(sdb))) then
             call pk_report(SQR_NOT_FOUND, stat, errmsg)
@@ -71,6 +64,78 @@ contains
             call pk_report(SQR_ERR, stat, errmsg)
             return
         end if
+        call pack_snapshot(sdb, file, rs)
+        call c_lock_release(sdb%lock_tok)       ! snapshot read; drop the shared lock
+        call pk_report(rs, stat, errmsg)
+    end subroutine
+
+    module subroutine db_pack_live(db, file, stat, errmsg)
+        class(db_t),      intent(inout)           :: db
+        character(len=*), intent(in)              :: file
+        integer,          intent(out),   optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
+        type(db_t) :: sdb                     ! snapshot view: only %dir is used
+        character(len=:), allocatable :: detail
+        integer    :: rs, qs
+        call clear_last_err(db)
+        if (.not. db%opened) then
+            call raise_db(db, SQR_INVALID, stat, errmsg, 'database is not open')
+            return
+        end if
+        ! An in-flight transaction has uncommitted base images in the journal:
+        ! packing it would capture a state no COMMIT ever produced.  The caller
+        ! ends the transaction and retries.
+        if (db%jrnl%active) then
+            call raise_db(db, SQR_INVALID, stat, errmsg, &
+                'cannot pack while a transaction is open')
+            return
+        end if
+        ! Drop the file units for the duration: the pack reads the same files
+        ! through fresh stream units, and a file may be connected to only one
+        ! unit at a time.  The handle, its catalogue and the exclusive lock all
+        ! stay — no other process can slip in while the snapshot is taken.
+        call db_quiesce(db, qs)
+        if (qs /= SQR_OK) then
+            call report(db, qs, stat, errmsg)   ! quiesce's own detail is the useful one
+            return
+        end if
+        sdb%dir = db%dir
+        call pack_snapshot(sdb, file, rs)
+        call db_resume(db, qs)
+        ! A failed resume leaves the handle wedged (units = -1) and outranks a
+        ! pack error: the archive may be perfectly good, but the caller must
+        ! reopen before using this handle again.  Copy the detail out before
+        ! raise_db overwrites the buffer it would otherwise be read from.
+        if (qs /= SQR_OK) then
+            detail = db%last_errmsg(1:db%last_errlen)
+            call raise_db(db, qs, stat, errmsg, &
+                'packed, but the database could not be reopened: ' // detail)
+            return
+        end if
+        if (rs /= SQR_OK) then
+            call raise_db(db, rs, stat, errmsg, 'pack failed: ' // sqr_errstr(rs))
+            return
+        end if
+        call report(db, SQR_OK, stat, errmsg)
+    end subroutine
+
+    ! Read every file of the database directory `sdb%dir` and write them out as
+    ! one container at `file`.  The caller guarantees exclusion — either by
+    ! holding the shared snapshot lock (offline `db_pack`) or by owning the
+    ! exclusive lock of an open, quiesced handle (`db_pack_live`).
+    subroutine pack_snapshot(sdb, file, stat)
+        type(db_t),       intent(inout) :: sdb
+        character(len=*), intent(in)    :: file
+        integer,          intent(out)   :: stat
+        type(table_t), allocatable :: tbls(:)
+        type(pfile_t), allocatable :: pf(:)
+        character(len=SQR_NAME_LEN), allocatable :: names(:)
+        character(len=:), allocatable :: payload
+        integer(int64), allocatable   :: offs(:)
+        integer(int64) :: total
+        integer :: n, nf, i, j, k, rs, cks
+
+        rs = SQR_OK
         pack_body: block
             if (jrnl_hot(sdb)) then
                 rs = SQR_READONLY               ! needs recovery: reopen read-write first
@@ -130,8 +195,7 @@ contains
 
             call write_container(file, pf, offs, cks, rs)
         end block pack_body
-        call c_lock_release(sdb%lock_tok)       ! snapshot read; drop the shared lock
-        call pk_report(rs, stat, errmsg)
+        stat = rs
     end subroutine
 
     ! Write the container to `file` atomically: build a temp sibling, fsync it,

@@ -3,13 +3,15 @@ submodule (sqr_serve) sqr_serve_impl
     use :: sqr, only: SQR_OK, SQR_ERR, SQR_INVALID, SQR_NOT_FOUND, &
                       SQR_NAME_LEN, SQR_ERRMSG_LEN, &
                       DT_INT, DT_REAL, DT_CHAR, DT_TEXT, column_t, &
-                      db_in_txn, db_rollback, db_list_tables, db_table_index, db_describe
+                      db_in_txn, db_rollback, db_list_tables, db_table_index, db_describe, &
+                      db_pack_live
     use :: sql, only: sql_parse, sql_exec, sql_stmt_t, sql_result_t, sql_cell_t, &
                       SQLRES_ROWS, SQLRES_COUNT, SQLRES_MSG, &
                       ST_SELECT, ST_BEGIN, ST_COMMIT, ST_ROLLBACK
     use :: sqr_net, only: net_attach, net_close, net_send_line, net_send_payload, &
                           net_recv_line, net_recv_payload, NET_OK
-    use :: clib_wrap, only: c_sock_listen, c_sock_port, c_sock_accept, c_sock_poll, c_sock_close
+    use :: clib_wrap, only: c_sock_listen, c_sock_port, c_sock_accept, c_sock_poll, c_sock_close, &
+                            c_realpath
     implicit none
 
     character(len=*), parameter :: LF = achar(10)
@@ -46,6 +48,12 @@ contains
         srv%db => db
         srv%port   = c_sock_port(srv%lsock)
         srv%dbname = basename(db%dir)
+        ! The physical location is what a backup needs, and the argument sqrd
+        ! was started with is usually relative to a cwd the client cannot see.
+        ! Resolve it once, here, and fall back to the literal argument if the
+        ! platform cannot (the database is open, so this should not happen).
+        srv%dbpath = c_realpath(db%dir)
+        if (len(srv%dbpath) == 0) srv%dbpath = db%dir
         stat = SQR_OK
     end subroutine
 
@@ -137,6 +145,10 @@ contains
             call do_tables(srv, i)
         case ('COLUMNS')
             call do_columns(srv, i, rest)
+        case ('INFO')
+            call do_info(srv, i)
+        case ('PACK')
+            call do_pack(srv, i, rest)
         case ('PING')
             ne = net_send_line(srv%sessions(i)%conn, 'NONE')
             if (ne /= NET_OK) call drop_session(srv, i)
@@ -327,6 +339,81 @@ contains
         if (ne /= NET_OK) call drop_session(srv, i)
     end subroutine
 
+    ! Where this server's database physically is, and what state it is in.
+    ! One `key = value` line per fact so a client can grow new keys without a
+    ! protocol change, and a human can read the payload straight off a telnet
+    ! session.  `dir` is the one that matters: it is what a backup, an archive
+    ! or a "which database am I actually connected to?" question needs, and
+    ! nothing else on the wire carries it.
+    subroutine do_info(srv, i)
+        type(server_t), intent(inout) :: srv
+        integer,        intent(in)    :: i
+        type(buf_t) :: b
+        call buf_add(b, 'name = '     // srv%dbname // LF)
+        call buf_add(b, 'dir = '      // srv%dbpath // LF)
+        call buf_add(b, 'server = sqrd ' // SQRD_VERSION // LF)
+        call buf_add(b, 'protocol = ' // itoa(SQRD_PROTOCOL) // LF)
+        call buf_add(b, 'readonly = ' // yesno(srv%db%readonly) // LF)
+        call buf_add(b, 'txn = '      // yesno(db_in_txn(srv%db)) // LF)
+        call buf_add(b, 'tables = '   // itoa(srv%db%ntables) // LF)
+        call send_msg(srv%sessions(i), b%s(1:b%n))
+    end subroutine
+
+    ! Write a consistent snapshot of the served database to a container file,
+    ! without closing the database (see db_pack_live).  The destination is a
+    ! counted payload, not a header token, so paths with spaces need no
+    ! quoting; it must be absolute, because a relative path would resolve
+    ! against sqrd's working directory, which no client can see.
+    subroutine do_pack(srv, i, rest)
+        type(server_t),   intent(inout) :: srv
+        integer,          intent(in)    :: i
+        character(len=*), intent(in)    :: rest
+        character(len=:), allocatable :: file
+        character(len=SQR_ERRMSG_LEN) :: emsg
+        integer :: nb, rs, ne
+        logical :: ok
+        call parse_uint(rest, nb, ok)
+        if (.not. ok) then                   ! malformed frame: cannot resync
+            call drop_session(srv, i)
+            return
+        end if
+        call net_recv_payload(srv%sessions(i)%conn, nb, file, ne)
+        if (ne /= NET_OK) then
+            call drop_session(srv, i)
+            return
+        end if
+        file = trim(file)
+        if (len(file) == 0 .or. .not. is_absolute(file)) then
+            call send_err(srv%sessions(i), SQR_INVALID, &
+                'PACK needs an absolute destination path (sqrd''s working directory is not yours)')
+            return
+        end if
+        ! Refuse to write into the database being packed: the container and its
+        ! .tmp sibling would sit among the files a later reader enumerates.
+        ! The separator matters — a sibling named "<db>-backup.sqr" shares the
+        ! directory's prefix without being inside it.
+        if (is_within(file, srv%dbpath)) then
+            call send_err(srv%sessions(i), SQR_INVALID, &
+                'PACK destination is inside the database directory')
+            return
+        end if
+        ! An open transaction belongs to another connection's in-flight work;
+        ! the on-disk state is mid-gesture, so there is nothing worth archiving
+        ! until it ends.  Same stat code as a refused write, for the same reason.
+        if (srv%txn_owner /= 0 .and. db_in_txn(srv%db)) then
+            call send_err(srv%sessions(i), SQRD_STAT_BUSY, &
+                'busy: a transaction is open on another connection')
+            return
+        end if
+        emsg = ''
+        call db_pack_live(srv%db, file, rs, emsg)
+        if (rs /= SQR_OK) then
+            call send_err(srv%sessions(i), rs, trim(emsg))
+            return
+        end if
+        call send_msg(srv%sessions(i), 'packed ' // srv%dbpath // ' -> ' // file)
+    end subroutine
+
     ! ---- responses ----
 
     subroutine send_err(sess, stat, msg)
@@ -335,6 +422,14 @@ contains
         character(len=*), intent(in)    :: msg
         integer :: ne
         ne = net_send_line(sess%conn, 'ERR ' // itoa(stat) // ' ' // itoa(len(msg)))
+        if (ne == NET_OK .and. len(msg) > 0) ne = net_send_payload(sess%conn, msg)
+    end subroutine
+
+    subroutine send_msg(sess, msg)
+        type(session_t),  intent(inout) :: sess
+        character(len=*), intent(in)    :: msg
+        integer :: ne
+        ne = net_send_line(sess%conn, 'MSG ' // itoa(len(msg)))
         if (ne == NET_OK .and. len(msg) > 0) ne = net_send_payload(sess%conn, msg)
     end subroutine
 
@@ -424,6 +519,45 @@ contains
         character(len=12) :: tmp
         write(tmp, '(i0)') v
         s = trim(tmp)
+    end function
+
+    pure function yesno(flag) result(s)
+        logical, intent(in) :: flag
+        character(len=:), allocatable :: s
+        if (flag) then
+            s = 'yes'
+        else
+            s = 'no'
+        end if
+    end function
+
+    ! A rooted path: POSIX '/...', or a Windows drive ('c:\...') or UNC
+    ! ('\\host\share') prefix.  Anything else would resolve against sqrd's
+    ! working directory rather than the client's.
+    pure function is_absolute(path) result(yes)
+        character(len=*), intent(in) :: path
+        logical :: yes
+        yes = .false.
+        if (len(path) == 0) return
+        if (path(1:1) == '/' .or. path(1:1) == achar(92)) then
+            yes = .true.
+        else if (len(path) >= 3) then
+            yes = path(2:2) == ':' .and. (path(3:3) == achar(92) .or. path(3:3) == '/')
+        end if
+    end function
+
+    ! Is `path` under directory `dir`?  A prefix match alone would also catch
+    ! siblings whose names merely start with the directory's, so the next
+    ! character must be a separator.
+    pure function is_within(path, dir) result(yes)
+        character(len=*), intent(in) :: path, dir
+        logical :: yes
+        integer :: n
+        n = len(dir)
+        yes = .false.
+        if (n == 0 .or. len(path) <= n) return
+        if (path(1:n) /= dir) return
+        yes = path(n + 1:n + 1) == '/' .or. path(n + 1:n + 1) == achar(92)
     end function
 
     pure function type_token(dtype) result(tok)

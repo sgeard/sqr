@@ -51,8 +51,12 @@ proc sendline {s line} {
     return $s
 }
 proc sendsql {s sql} {
-    sendline $s "SQL [string length $sql]"
-    puts -nonewline $s $sql
+    sendbody $s SQL $sql
+}
+# Any request whose argument travels as a counted payload (SQL, PACK).
+proc sendbody {s verb body} {
+    sendline $s "$verb [string length $body]"
+    puts -nonewline $s $body
     flush $s
     return $s
 }
@@ -167,6 +171,63 @@ check {[cell $r 0 0] eq "id" && [cell $r 0 1] eq "INT" && [cint [cell $r 0 4]] =
     "id is the key (ordinal 1)"
 check {[cint [cell $r 1 4]] == 0} "temp is not part of the key"
 
+# INFO — the only place on the wire that says where the database physically
+# is.  A DSN is a host and a port; this is what turns that into a directory a
+# backup can protect.
+sendline $c "INFO"
+lassign [reply $c] hdr payload
+check {[lindex $hdr 0] eq "MSG"} "INFO -> MSG"
+set info {}
+foreach l [split [string trimright $payload "\n"] "\n"] {
+    set eq [string first " = " $l]
+    if {$eq < 0} continue
+    dict set info [string range $l 0 $eq-1] [string range $l $eq+3 end]
+}
+check {[dict get $info name] eq $dbdir} "INFO names the database"
+check {[dict get $info dir] eq [file normalize $dbdir]} "INFO gives the absolute directory"
+check {[dict get $info txn] eq "no"} "INFO reports no transaction in flight"
+check {[dict get $info tables] == 1} "INFO counts the tables"
+
+# PACK — a backup taken while the database stays open.
+set bak [file normalize sqrd_func_backup.sqr]
+file delete -force $bak
+lassign [reply [sendbody $c PACK $bak]] hdr payload
+check {[lindex $hdr 0] eq "MSG" && [string match "packed*" $payload]} "PACK -> MSG"
+check {[file exists $bak] && [file size $bak] > 0} "PACK wrote the container"
+lassign [reply [sendbody $c PACK "relative.sqr"]] hdr payload
+check {[lindex $hdr 0] eq "ERR" && [string match "*absolute*" $payload]} \
+    "PACK refuses a relative destination"
+lassign [reply [sendbody $c PACK [file join [file normalize $dbdir] inside.sqr]]] hdr payload
+check {[lindex $hdr 0] eq "ERR" && [string match "*inside*" $payload]} \
+    "PACK refuses a destination inside the database"
+# the database is still open and serving, not closed and reopened
+sendsql $c "SELECT id FROM readings"
+set r [rows $c]
+check {[lindex $r 0] == 5} "database still serves reads after PACK"
+lassign [reply [sendsql $c "INSERT INTO readings VALUES (6, 6.0, 'six', 'vi')"]] hdr payload
+check {$hdr eq "COUNT 1"} "database still accepts writes after PACK"
+lassign [reply [sendsql $c "DELETE FROM readings WHERE id = 6"]] hdr payload
+
+# sqrbak — the same two operations as a command-line tool, which is how a
+# backup script uses them.  It resolves a relative destination against ITS
+# working directory before sending, so the server's absolute-only rule never
+# reaches the user.
+set bakexe [file join [file dirname $exe] sqrbak[file extension $exe]]
+if {[file executable $bakexe]} {
+    set out [exec $bakexe info $port]
+    check {[string match "*dir = [file normalize $dbdir]*" $out]} "sqrbak info reports the directory"
+    file delete -force sqrd_func_sqrbak.sqr
+    set out [exec $bakexe backup $port sqrd_func_sqrbak.sqr]
+    check {[string match "packed*" $out]} "sqrbak backup reports what it wrote"
+    check {[file exists [file normalize sqrd_func_sqrbak.sqr]]} \
+        "sqrbak backup resolved the relative name against its own cwd"
+    check {[catch {exec $bakexe backup $port /proc/nonexistent/x.sqr} err]} \
+        "sqrbak backup fails non-zero on a bad destination"
+    file delete -force sqrd_func_sqrbak.sqr
+} else {
+    puts "  SKIP sqrbak tests ($bakexe not built)"
+}
+
 # errors and liveness
 lassign [reply [sendsql $c "SELEC oops"]] hdr payload
 check {[lindex $hdr 0] eq "ERR" && [string length $payload] > 0} "bad SQL -> ERR + message"
@@ -197,6 +258,7 @@ close $c
 exec kill [pid $srv]
 catch {close $srv}
 file delete -force $dbdir
+file delete -force sqrd_func_backup.sqr
 
 puts "sqrd functional: $npass passed, $nfail failed"
 exit [expr {$nfail > 0}]

@@ -13,7 +13,7 @@ program utest_serve
     use :: sqr
     use :: sqr_net
     use :: sqr_serve
-    use :: clib_wrap, only: c_sock_connect, c_rmtree
+    use :: clib_wrap, only: c_sock_connect, c_rmtree, c_remove, c_realpath, c_abspath
     implicit none
 
     integer :: pass = 0, fail = 0
@@ -33,6 +33,8 @@ program utest_serve
     call t_sql_basics()
     call t_rows_binary()
     call t_catalogue()
+    call t_info()
+    call t_pack()
     call t_errors()
     call t_busy()
     call t_rollback_on_drop()
@@ -98,6 +100,19 @@ contains
         write(nb, '(i0)') len(text)
         ne = net_send_line(cli, 'SQL ' // trim(nb))
         ne = net_send_payload(cli, text)
+        call pump()
+    end subroutine
+
+    ! Send any request whose argument travels as a counted payload (PACK), and
+    ! pump the server; the caller reads the reply.
+    subroutine send_req(cli, verb, body)
+        type(net_conn_t), intent(inout) :: cli
+        character(len=*), intent(in)    :: verb, body
+        character(len=12) :: nb
+        integer :: ne
+        write(nb, '(i0)') len(body)
+        ne = net_send_line(cli, verb // ' ' // trim(nb))
+        ne = net_send_payload(cli, body)
         call pump()
     end subroutine
 
@@ -264,6 +279,78 @@ contains
         call check(trim(cells(4, 2)) == 'TEXT', 'catalogue: TEXT column type token')
     end subroutine
 
+    ! INFO carries the facts nothing else on the wire does — above all the
+    ! absolute directory, which is what a backup or a "which database is this
+    ! really?" question needs.
+    subroutine t_info()
+        character(len=:), allocatable :: hdr, payload
+        integer :: ne
+        ne = net_send_line(cli1, 'INFO')
+        call pump()
+        call read_reply(cli1, hdr, payload)
+        call check(hdr(1:min(4, len(hdr))) == 'MSG ', 'info: answered with MSG')
+        call check(index(payload, 'name = utest_serve_db') > 0, 'info: reports the database name')
+        call check(index(payload, 'dir = ' // c_realpath(TEST_DIR)) > 0, &
+                   'info: dir is the absolute path, not the argument')
+        call check(index(payload, 'readonly = no') > 0, 'info: reports the read-write open')
+        call check(index(payload, 'txn = no') > 0, 'info: reports no transaction in flight')
+        call check(index(payload, 'tables = 1') > 0, 'info: reports the table count')
+    end subroutine
+
+    ! PACK writes a container without closing the database: the archive must
+    ! be a real, openable database, and the server must keep working — reads
+    ! AND writes, since resume reopens data, blob and index units alike.
+    subroutine t_pack()
+        character(len=:), allocatable :: hdr, payload, dest
+        character(len=64), allocatable :: collines(:), cells(:,:)
+        logical,           allocatable :: isnull(:,:)
+        type(db_t) :: restored
+        integer :: nr, nc, rs2
+        logical :: ok
+        dest = c_abspath(TEST_DIR // '.sqr')
+        call check(len(dest) > 0 .and. dest(1:1) == '/', 'pack: destination resolves to an absolute path')
+
+        call send_req(cli1, 'PACK', TEST_DIR // '.sqr')
+        call read_reply(cli1, hdr, payload)
+        call check(hdr(1:min(4, len(hdr))) == 'ERR ' .and. index(payload, 'absolute') > 0, &
+                   'pack: a relative destination is refused')
+
+        call send_req(cli1, 'PACK', c_realpath(TEST_DIR) // '/inside.sqr')
+        call read_reply(cli1, hdr, payload)
+        call check(hdr(1:min(4, len(hdr))) == 'ERR ' .and. index(payload, 'inside') > 0, &
+                   'pack: a destination inside the database is refused')
+
+        call send_req(cli1, 'PACK', dest)
+        call read_reply(cli1, hdr, payload)
+        call check(hdr(1:min(4, len(hdr))) == 'MSG ' .and. index(payload, 'packed') > 0, &
+                   'pack: absolute destination accepted')
+
+        ! The container is a database, not just a file.
+        rs2 = c_rmtree(TEST_DIR // '_restored')
+        call db_unpack(dest, TEST_DIR // '_restored', rs2)
+        call check(rs2 == SQR_OK, 'pack: the container unpacks')
+        if (rs2 == SQR_OK) then
+            call db_open(restored, TEST_DIR // '_restored', rs2)
+            call check(rs2 == SQR_OK .and. db_row_count(restored, 't') == 3, &
+                       'pack: the archive holds the rows that were live at pack time')
+            call db_close(restored)
+        end if
+        rs2 = c_rmtree(TEST_DIR // '_restored')
+        rs2 = c_remove(dest)
+
+        ! The handle survived the quiesce/resume cycle.
+        call send_sql(cli1, 'SELECT id FROM t ORDER BY id')
+        call read_rows(cli1, nr, nc, collines, isnull, cells, ok)
+        call check(ok .and. nr == 3, 'pack: the served database still reads afterwards')
+        call send_sql(cli1, "INSERT INTO t VALUES (5, 5.0, 'Eve', 'e')")
+        call read_reply(cli1, hdr, payload)
+        call check(hdr == 'COUNT 1', 'pack: the served database still writes afterwards')
+        call send_sql(cli1, 'SELECT id FROM t WHERE id = 5')
+        call read_rows(cli1, nr, nc, collines, isnull, cells, ok)
+        call check(ok .and. nr == 1 .and. cell_int(cells(1, 1)) == 5_int32, &
+                   'pack: the reopened index finds the new row')
+    end subroutine
+
     subroutine t_errors()
         character(len=:), allocatable :: hdr, payload
         integer :: ne
@@ -304,6 +391,11 @@ contains
         call send_sql(cli2, 'SELECT id FROM t WHERE id = 1')
         call read_rows(cli2, nr, nc, collines, isnull, cells, ok)
         call check(ok .and. nr == 1, 'busy: read from client 2 still allowed')
+        ! A pack during someone else's transaction would archive a mid-gesture
+        ! directory: refused with the same stat code as a refused write.
+        call send_req(cli2, 'PACK', c_abspath(TEST_DIR // '_busy.sqr'))
+        call read_reply(cli2, hdr, payload)
+        call check(hdr(1:min(8, len(hdr))) == 'ERR 100 ', 'busy: PACK refused while a transaction is open')
         call send_sql(cli1, "INSERT INTO t VALUES (4, 4.0, 'Dee', 'd')")
         call read_reply(cli1, hdr, payload)
         call check(hdr == 'COUNT 1', 'busy: owner keeps writing inside its transaction')

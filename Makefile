@@ -88,8 +88,9 @@ BENCH_BIN := $(ODIR)/bench_sqr$(EXT)
 
 # Interactive shells: sqrsh (cmdgraph-driven engine shell) and sqlsh (the
 # SQL-subset REPL — depends only on the library, not cmdgraph); sqrd is the
-# wire-protocol server (library only, like sqlsh).
-APP_SRC := $(wildcard $(APP_DIR)/sqrsh.f90 $(APP_DIR)/sqlsh.f90 $(APP_DIR)/sqrd.f90)
+# wire-protocol server and sqrbak its backup client (library only, like sqlsh).
+APP_SRC := $(wildcard $(APP_DIR)/sqrsh.f90 $(APP_DIR)/sqlsh.f90 $(APP_DIR)/sqrd.f90 \
+                      $(APP_DIR)/sqrbak.f90)
 APP_BIN := $(patsubst $(APP_DIR)/%.f90,$(ODIR)/%$(EXT),$(APP_SRC))
 
 all: $(OPTIONS_FNAME) $(LIB) $(TEST_BIN) $(APP_BIN)
@@ -245,6 +246,11 @@ $(ODIR)/sqlsh$(EXT): $(APP_DIR)/sqlsh.f90 $(LIB) | $(ODIR)
 # Wire-protocol server — links the library only (sqr_net/sqr_serve are in
 # libsqr).
 $(ODIR)/sqrd$(EXT): $(APP_DIR)/sqrd.f90 $(LIB) | $(ODIR)
+	$(F) $(F_OPTS) -o $@ $< $(LIB) $(LFLAGS)
+
+# Backup/enquiry client for a running sqrd — INFO reports the served
+# directory, PACK writes a container without closing the database.
+$(ODIR)/sqrbak$(EXT): $(APP_DIR)/sqrbak.f90 $(LIB) | $(ODIR)
 	$(F) $(F_OPTS) -o $@ $< $(LIB) $(LFLAGS)
 
 # --- Optional regex-search shell (opt-in) ---------------------------------

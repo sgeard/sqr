@@ -50,6 +50,7 @@
 #include <fcntl.h>   /* _O_RDWR */
 #include <stdio.h>   /* remove, snprintf */
 #include <string.h>  /* strcmp, memset */
+#include <stdlib.h>  /* _fullpath */
 
 int sqr_os_rename(const char *oldp, const char *newp) {
     /* CRT rename() refuses an existing target; MoveFileEx with
@@ -140,6 +141,25 @@ int sqr_os_truncate(const char *p, int64_t length) {
     rc = _chsize_s(fd, length);
     if (_close(fd) != 0 && rc == 0) rc = 1;
     return rc;
+}
+
+void sqr_os_exit(int code) {
+    exit(code);
+}
+
+int sqr_os_realpath(const char *p, char *buf, int cap) {
+    /* _fullpath resolves against the cwd and normalises .././, but unlike
+       POSIX realpath it does not require the path to exist — the caller's
+       missing-path fallback is simply never needed here. */
+    char tmp[_MAX_PATH];
+    size_t n;
+    if (cap <= 0) return 1;
+    buf[0] = '\0';
+    if (_fullpath(tmp, p, sizeof tmp) == NULL) return 1;
+    n = strlen(tmp);
+    if (n + 1 > (size_t)cap) return 2;          /* caller's buffer too small */
+    memcpy(buf, tmp, n + 1);
+    return 0;
 }
 
 int sqr_os_lock_try(const char *p, int exclusive, int64_t *tok) {
@@ -318,6 +338,8 @@ void sqr_os_sock_close(int64_t *s) {
 #include <poll.h>           /* poll */
 #include <errno.h>          /* EINTR */
 #include <string.h>         /* memset */
+#include <stdlib.h>         /* realpath */
+#include <limits.h>         /* PATH_MAX */
 
 int sqr_os_rename(const char *oldp, const char *newp) {
     return rename(oldp, newp);          /* already atomic-replace on POSIX */
@@ -376,6 +398,25 @@ int sqr_os_fsync_dir(const char *p) {
 
 int sqr_os_truncate(const char *p, int64_t length) {
     return truncate(p, (off_t)length);
+}
+
+void sqr_os_exit(int code) {
+    exit(code);
+}
+
+int sqr_os_realpath(const char *p, char *buf, int cap) {
+    /* realpath() resolves symlinks and requires every component to exist;
+       the Fortran wrapper handles a not-yet-created final component by
+       resolving the parent instead. */
+    char tmp[PATH_MAX];
+    size_t n;
+    if (cap <= 0) return 1;
+    buf[0] = '\0';
+    if (realpath(p, tmp) == NULL) return 1;
+    n = strlen(tmp);
+    if (n + 1 > (size_t)cap) return 2;          /* caller's buffer too small */
+    memcpy(buf, tmp, n + 1);
+    return 0;
 }
 
 int sqr_os_lock_try(const char *p, int exclusive, int64_t *tok) {

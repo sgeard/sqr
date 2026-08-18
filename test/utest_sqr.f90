@@ -54,6 +54,7 @@ program utest_sqr
     call test_schema_next_id()
     call test_corrupt_index()
     call test_pack()
+    call test_quiesce()
     call test_natural_keys()
     call test_null_columns()
     call test_leading_column()
@@ -2842,6 +2843,101 @@ contains
         call row_set_char(buf, db%tables(ti)%cols(1), sku)
         call row_set_int (buf, db%tables(ti)%cols(2), reg)
         call row_set_int (buf, db%tables(ti)%cols(3), qty)
+    end subroutine
+
+    ! Step 7b: quiesce/resume and the live pack built on them.  Quiescing
+    ! flushes and drops the file units while the handle and its exclusive lock
+    ! stay held, so another reader — db_pack's stream units — can read the
+    ! directory without breaking the one-file-one-unit rule.
+    subroutine test_quiesce()
+        character(len=*), parameter :: QDIR  = 'utest_sqr_quiesce_db'
+        character(len=*), parameter :: QDIR2 = 'utest_sqr_quiesce_db2'
+        character(len=*), parameter :: QFILE = 'utest_sqr_quiesce.sqr'
+        type(db_t) :: db, restored
+        type(column_t) :: c(3)
+        integer :: rs, ios, ti, k
+        integer(int32) :: rid
+        character(len=:), allocatable :: buf, txt
+        character(len=16) :: body
+        character(len=128) :: emsg
+
+        ios = c_rmtree(QDIR); ios = c_rmtree(QDIR2); ios = c_remove(QFILE)
+        c(1)%name = 'id'  ; c(1)%dtype = DT_INT  ; c(1)%csize = 4
+        c(2)%name = 'tag' ; c(2)%dtype = DT_CHAR ; c(2)%csize = 4
+        c(3)%name = 'body'; c(3)%dtype = DT_TEXT ; c(3)%csize = SQR_TEXT_DESC
+        call db_open(db, QDIR, rs, emsg)
+        call db_create_table(db, 'items', c, rs, emsg)
+        ti = db_table_index(db, 'items')
+        do k = 1, 3
+            call row_alloc(buf, db%tables(ti)%record_size)
+            call row_set_int (buf, db%tables(ti)%cols(1), int(10*k, int32))
+            write(body, '(a1,i1)') 't', k
+            call row_set_char(buf, db%tables(ti)%cols(2), trim(body))
+            call db_insert(db, 'items', buf, rid, rs)
+            write(body, '(a5,i1)') 'body-', k
+            call db_set_text(db, 'items', rid, 'body', trim(body), rs)
+        end do
+        call db_create_index(db, 'items', 'id', rs)
+
+        ! ---- quiesce / resume as a pair ----
+        call db_quiesce(db, rs, emsg)
+        call check(rs == SQR_OK .and. db%quiesced, 'quiesce: succeeds and marks the handle')
+        ti = db_table_index(db, 'items')
+        call check(db%tables(ti)%unit == -1 .and. db%tables(ti)%blob_unit == -1, &
+                   'quiesce: data and blob units released')
+        call check(db%opened, 'quiesce: the handle stays open')
+        call db_quiesce(db, rs, emsg)
+        call check(rs == SQR_INVALID, 'quiesce: refused on an already-quiesced handle')
+        ! Why db_pack_live exists: flock treats a second open of the lock file
+        ! as an independent holder, so the offline packer is denied by this
+        ! handle's own exclusive lock even from inside the same process.
+        call db_pack(QDIR, QFILE, rs)
+        call check(rs == SQR_LOCKED, 'quiesce: offline db_pack is still locked out by this handle')
+
+        call db_resume(db, rs, emsg)
+        call check(rs == SQR_OK .and. .not. db%quiesced, 'resume: succeeds and clears the mark')
+        call db_resume(db, rs, emsg)
+        call check(rs == SQR_INVALID, 'resume: refused when not quiesced')
+        call db_find_by_int(db, 'items', 'id', 20_int32, rid, rs)
+        call check(rs == SQR_OK .and. rid == 2, 'resume: reopened index still resolves')
+        call db_get_text(db, 'items', 2_int32, 'body', txt, rs)
+        call check(rs == SQR_OK .and. txt == 'body-2', 'resume: reopened blob still reads')
+        call row_alloc(buf, db%tables(ti)%record_size)
+        call row_set_int (buf, db%tables(ti)%cols(1), 40_int32)
+        call row_set_char(buf, db%tables(ti)%cols(2), 't4')
+        call db_insert(db, 'items', buf, rid, rs)
+        call check(rs == SQR_OK, 'resume: reopened data file still accepts writes')
+
+        ! ---- the live pack ----
+        call db_pack_live(db, QFILE, rs, emsg)
+        call check(rs == SQR_OK, 'pack_live: packs an open database')
+        call check(c_path_exists(QFILE), 'pack_live: container created')
+        call db_unpack(QFILE, QDIR2, rs)
+        call check(rs == SQR_OK, 'pack_live: the container unpacks')
+        call db_open(restored, QDIR2, rs, emsg)
+        call check(rs == SQR_OK, 'pack_live: the unpacked database opens')
+        call check(db_row_count(restored, 'items') == 4, 'pack_live: every live row is in the archive')
+        call db_find_by_int(restored, 'items', 'id', 40_int32, rid, rs)
+        call check(rs == SQR_OK, 'pack_live: the archived index resolves the newest row')
+        call db_get_text(restored, 'items', 2_int32, 'body', txt, rs)
+        call check(rs == SQR_OK .and. txt == 'body-2', 'pack_live: TEXT/blob survives the live pack')
+        call db_verify(restored, 'items', rs, emsg)
+        call check(rs == SQR_OK, 'pack_live: db_verify clean on the archive')
+        call db_close(restored)
+        ! The source handle is still usable — that is the whole point.
+        call db_find_by_int(db, 'items', 'id', 30_int32, rid, rs)
+        call check(rs == SQR_OK .and. rid == 3, 'pack_live: the source handle survives')
+
+        ! A transaction in flight is not a committed state: refuse both.
+        call db_begin(db, rs)
+        call db_quiesce(db, rs, emsg)
+        call check(rs == SQR_INVALID, 'quiesce: refused while a transaction is open')
+        call db_pack_live(db, QFILE, rs, emsg)
+        call check(rs == SQR_INVALID, 'pack_live: refused while a transaction is open')
+        call db_rollback(db, rs)
+
+        call db_close(db)
+        ios = c_rmtree(QDIR); ios = c_rmtree(QDIR2); ios = c_remove(QFILE)
     end subroutine
 
     subroutine test_natural_keys()

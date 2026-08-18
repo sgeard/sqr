@@ -318,6 +318,109 @@ contains
         db%ntables  = 0
         db%opened   = .false.
         db%readonly = .false.
+        db%quiesced = .false.
+        call report(db, first, stat, errmsg)
+    end subroutine
+
+    module subroutine db_quiesce(db, stat, errmsg)
+        class(db_t), intent(inout)        :: db
+        integer,    intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
+        integer :: i, j, first, rs, cs
+        call clear_last_err(db)
+        if (.not. db%opened) then
+            call raise_db(db, SQR_INVALID, stat, errmsg, 'database is not open')
+            return
+        end if
+        if (db%quiesced) then
+            call raise_db(db, SQR_INVALID, stat, errmsg, 'database is already quiesced')
+            return
+        end if
+        ! Same rule as db_set_readonly: uncommitted state must not be stranded
+        ! behind closed units, and a hot journal is not a snapshot.
+        if (db%jrnl%active) then
+            call raise_db(db, SQR_INVALID, stat, errmsg, &
+                'cannot quiesce while a transaction is open')
+            return
+        end if
+        first = SQR_OK
+        ! Flush-and-close exactly what db_close does, minus the teardown: the
+        ! tables array, the directory and the advisory lock all stay, so
+        ! db_resume can reopen from the same in-memory schemas.
+        quiesce_tables: do i = 1, db%ntables
+            associate (t => db%tables(i))
+                if (.not. db%readonly) then
+                    call write_schema(db, t, rs)   ! next_id/live_count live only in memory
+                    if (rs /= SQR_OK .and. first == SQR_OK) first = rs
+                end if
+                if (t%unit /= -1) then
+                    close(t%unit, iostat=cs)
+                    if (cs /= 0 .and. first == SQR_OK) first = SQR_ERR
+                end if
+                t%unit = -1
+                if (t%blob_unit /= -1) then
+                    close(t%blob_unit, iostat=cs)
+                    if (cs /= 0 .and. first == SQR_OK) first = SQR_ERR
+                end if
+                t%blob_unit = -1
+                quiesce_indices: do j = 1, t%nindices
+                    if (.not. idx_live(t%indices(j))) cycle quiesce_indices
+                    call bt_close(t%indices(j)%bt, cs)  ! rewrites the tree meta
+                    if (cs /= BT_OK .and. first == SQR_OK) first = SQR_ERR
+                end do quiesce_indices
+            end associate
+        end do quiesce_tables
+        if (.not. db%readonly) then
+            call write_catalog(db, rs)
+            if (rs /= SQR_OK .and. first == SQR_OK) first = rs
+        end if
+        ! Quiesced even on a partial failure: some units are already closed, so
+        ! db_resume (or db_close) is the only safe continuation either way.
+        db%quiesced = .true.
+        call report(db, first, stat, errmsg)
+    end subroutine
+
+    module subroutine db_resume(db, stat, errmsg)
+        class(db_t), intent(inout)        :: db
+        integer,    intent(out), optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
+        integer :: i, j, first, rs
+        call clear_last_err(db)
+        if (.not. db%quiesced) then
+            call raise_db(db, SQR_INVALID, stat, errmsg, 'database is not quiesced')
+            return
+        end if
+        first = SQR_OK
+        ! Reopen from the on-disk state db_quiesce flushed.  Every failure is
+        ! recorded but the loop runs to the end: a handle with some units open
+        ! and some not is what db_close expects to tidy up.
+        resume_tables: do i = 1, db%ntables
+            associate (t => db%tables(i))
+                call open_data(db, t, 'old', rs)
+                if (rs /= SQR_OK .and. first == SQR_OK) then
+                    first = rs
+                    call set_last_err(db, rs, 'cannot reopen data file for ' // trim(t%name))
+                end if
+                if (table_has_text(t)) then
+                    call open_blob(db, t, 'old', rs)
+                    if (rs /= SQR_OK .and. first == SQR_OK) then
+                        first = rs
+                        call set_last_err(db, rs, 'cannot reopen blob file for ' // trim(t%name))
+                    end if
+                end if
+                resume_indices: do j = 1, t%nindices
+                    if (.not. idx_live(t%indices(j))) cycle resume_indices
+                    call open_index(db, t, t%indices(j), j, 'old', rs)
+                    if (rs /= SQR_OK .and. first == SQR_OK) then
+                        first = rs
+                        call set_last_err(db, rs, 'cannot reopen index file for ' // trim(t%name))
+                    end if
+                end do resume_indices
+            end associate
+        end do resume_tables
+        ! Only a clean reopen lifts the flag: a wedged handle stays quiesced so
+        ! a second db_resume is refused rather than opening units twice.
+        if (first == SQR_OK) db%quiesced = .false.
         call report(db, first, stat, errmsg)
     end subroutine
 

@@ -2,8 +2,8 @@
 !! response encoding for the wire protocol (reports/DESIGN-wire-protocol.md).
 !!
 !! `sqr_net` frames bytes; this module assigns them meaning: `HELLO` / `SQL`
-!! / `TABLES` / `COLUMNS` / `PING` / `QUIT` requests in, `NONE` / `COUNT` /
-!! `MSG` / `ERR` / `ROWS` responses out.  Statements execute serially
+!! / `TABLES` / `COLUMNS` / `INFO` / `PACK` / `PING` / `QUIT` requests in,
+!! `NONE` / `COUNT` / `MSG` / `ERR` / `ROWS` responses out.  Statements execute serially
 !! against one open database through `sql_exec` in binary-cell mode, so no
 !! engine locking is needed.  The `sqrd` program is only argument parsing
 !! around a `serve_step` loop; tests drive `serve_step` directly in-process
@@ -48,6 +48,7 @@ module sqr_serve
         type(session_t)     :: sessions(SQRD_MAX_SESSIONS)  !! Session slots
         integer             :: txn_owner = 0  !! Session slot holding the open transaction (0 = none)
         character(len=:), allocatable :: dbname  !! Name advertised in `OK` (db dir basename)
+        character(len=:), allocatable :: dbpath  !! Absolute directory path, reported by `INFO`
     end type
 
     public :: serve_open   !! bind the loopback listener for a database

@@ -7,7 +7,9 @@
 !! process is killed.
 !!
 !! Once ready it prints `LISTENING <port>` on stdout and everything else on
-!! stderr, so a launcher (the functional-test harness, a desktop file, an
+!! stderr — including the absolute path of the database being served, which
+!! is what a backup needs and what tells two instances apart — so a launcher
+!! (the functional-test harness, a desktop file, an
 !! ODBC setup script) can read the one machine-readable line back.  There
 !! is no shutdown command: sqrd runs until killed, and a kill mid-write is
 !! exactly the crash case sqr's rollback journal already covers — the next
@@ -54,7 +56,11 @@ program sqrd
 
     write(output_unit, '(a,i0)') 'LISTENING ', srv%port
     flush(output_unit)
-    write(error_unit, '(5a)') 'sqrd: serving "', srv%dbname, '" (', trim(dirarg), '), kill to stop'
+    ! The absolute path, not the argument: whoever has to back this database
+    ! up, or work out which of several sqrd instances is which, needs the
+    ! physical location, and the argument is usually relative to a working
+    ! directory that is not obvious from the process list.
+    write(error_unit, '(5a)') 'sqrd: serving "', srv%dbname, '" from ', srv%dbpath, ', kill to stop'
 
     serve: do
         call serve_step(srv, 1000, nev)
