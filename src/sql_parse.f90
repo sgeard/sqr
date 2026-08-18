@@ -60,8 +60,18 @@ contains
 
             ! quoted string
             if (ch == "'") then
-                call lex_string(text, n, i, start)
-                if (i < 0) return   ! lex_string flagged an error
+                call lex_quoted(text, n, i, start, "'", TK_STR, 'string')
+                if (i < 0) return   ! lex_quoted flagged an error
+                cycle scan
+            end if
+
+            ! delimited identifier: "..." with "" as an escaped quote.  Any
+            ! character is allowed in the body, and the result is never a
+            ! keyword — so names like "Rate %" or a table called "select"
+            ! are expressible.
+            if (ch == '"') then
+                call lex_quoted(text, n, i, start, '"', TK_QIDENT, 'quoted identifier')
+                if (i < 0) return   ! lex_quoted flagged an error
                 cycle scan
             end if
 
@@ -145,14 +155,19 @@ contains
             end if
         end subroutine
 
-        ! Lex a single-quoted string starting at the opening quote (i).  A
-        ! doubled '' is an escaped quote.  On an unterminated string set the
-        ! error and signal the caller by setting i = -1.
-        subroutine lex_string(s, slen, i, start)
+        ! Lex a quoted token starting at the opening quote (i): a
+        ! single-quoted string (TK_STR) or a double-quoted identifier
+        ! (TK_QIDENT).  A doubled quote is an escape.  On an unterminated
+        ! token (or an empty identifier) set the error and signal the caller
+        ! by setting i = -1.
+        subroutine lex_quoted(s, slen, i, start, qc, kind, what)
             character(len=*), intent(in)    :: s
             integer,          intent(in)    :: slen
             integer,          intent(inout) :: i
             integer,          intent(out)   :: start
+            character,        intent(in)    :: qc
+            integer,          intent(in)    :: kind
+            character(len=*), intent(in)    :: what
             character(len=:), allocatable :: body, grown
             integer :: n
             start = i
@@ -165,7 +180,7 @@ contains
             do
                 if (i > slen) then
                     call set_err(stat, errmsg, SQR_INVALID, &
-                        'col ' // itoa(start) // ': unterminated string')
+                        'col ' // itoa(start) // ': unterminated ' // what)
                     i = -1
                     return
                 end if
@@ -174,11 +189,11 @@ contains
                     grown(1:n) = body(1:n)
                     call move_alloc(grown, body)
                 end if
-                if (s(i:i) == "'") then
+                if (s(i:i) == qc) then
                     if (i < slen) then
-                        if (s(i+1:i+1) == "'") then   ! escaped quote
+                        if (s(i+1:i+1) == qc) then    ! escaped quote
                             n = n + 1
-                            body(n:n) = "'"
+                            body(n:n) = qc
                             i = i + 2
                             cycle
                         end if
@@ -190,8 +205,14 @@ contains
                 body(n:n) = s(i:i)
                 i = i + 1
             end do
+            if (kind == TK_QIDENT .and. n == 0) then
+                call set_err(stat, errmsg, SQR_INVALID, &
+                    'col ' // itoa(start) // ': empty quoted identifier')
+                i = -1
+                return
+            end if
             ntok = ntok + 1
-            toks(ntok)%kind = TK_STR
+            toks(ntok)%kind = kind
             toks(ntok)%text = body(1:n)
             toks(ntok)%col  = start
         end subroutine
@@ -345,12 +366,15 @@ contains
             end if
         end subroutine
 
-        ! Take an identifier into a fixed-width name, checking length.
+        ! Take an identifier into a fixed-width name, checking length.  A
+        ! plain word and a double-quoted identifier are interchangeable
+        ! wherever a name is expected; only the quoted form can carry
+        ! characters outside [A-Za-z0-9_] or collide with a keyword.
         subroutine take_name(name, what)
             character(len=SQR_NAME_LEN), intent(out) :: name
             character(len=*),            intent(in)  :: what
             name = ''
-            if (cur_kind() /= TK_IDENT) then
+            if (cur_kind() /= TK_IDENT .and. cur_kind() /= TK_QIDENT) then
                 call errf(cur_col(), 'expected ' // what)
                 return
             end if

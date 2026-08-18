@@ -231,9 +231,10 @@ proc sqr::pull {} {
             lappend order [lindex $cnames [lsearch -exact $keys $ord]]
         }
     }
-    set sql "SELECT * FROM $table"
+    set sql "SELECT * FROM [qid $table]"
     if {[llength $order]} {
-        append sql " ORDER BY [join $order {, }]"
+        set qorder [lmap o $order {qid $o}]
+        append sql " ORDER BY [join $qorder {, }]"
     }
     lassign [fetch $sql] names types nr nc cells
     hangup
@@ -280,10 +281,11 @@ proc sqr::push {} {
         lappend types [lindex $ctypes $at]
     }
     # full-replace inside one transaction: a failure rolls back to the old table
+    set qheaders [lmap h $headers {qid $h}]
     set npushed 0
     run BEGIN
     if {[catch {
-        run "DELETE FROM $table"
+        run "DELETE FROM [qid $table]"
         for {set base $nc} {$base < [llength $flat]} {incr base $nc} {
             set row [lrange $flat $base [expr {$base + $nc - 1}]]
             if {[empty_row $row]} continue
@@ -291,7 +293,7 @@ proc sqr::push {} {
             foreach cell $row type $types {
                 lappend lits [literal $cell $type]
             }
-            run "INSERT INTO $table ([join $headers {, }]) VALUES ([join $lits {, }])"
+            run "INSERT INTO [qid $table] ([join $qheaders {, }]) VALUES ([join $lits {, }])"
             incr npushed
         }
         run COMMIT
@@ -307,6 +309,13 @@ proc sqr::push {} {
 # ------------------------------------------------------------------- helpers
 
 # A row is empty (used-range slack) when every cell is N or a blank string.
+# A name -> a double-quoted (delimited) SQL identifier, so table and column
+# names with spaces or punctuation ("Rate %", "Account#") are always legal
+# in the statements this client builds.  Embedded quotes double.
+proc sqr::qid {name} {
+    return "\"[string map {\" \"\"} $name]\""
+}
+
 proc sqr::empty_row {row} {
     foreach cell $row {
         lassign $cell tag v

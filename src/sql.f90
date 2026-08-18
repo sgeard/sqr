@@ -30,6 +30,9 @@
 !! constraints such as `NOT NULL` (the engine has no constraint store — every
 !! column is nullable).  Keywords are case-insensitive; identifiers (table and
 !! column names) are case-sensitive, matching the engine's byte-exact names.
+!! A name may also be written as a standard delimited identifier — double
+!! quotes with `""` as the escape, e.g. `"Rate %"` — allowing any printable
+!! character and names that collide with keywords.
 
 module sql
     use, intrinsic :: iso_fortran_env, only: int32, int64, real64
@@ -44,10 +47,11 @@ module sql
     integer, parameter, public :: TK_REAL  = 3  !! Real literal
     integer, parameter, public :: TK_STR   = 4  !! Quoted string literal (already unescaped)
     integer, parameter, public :: TK_PUNCT = 5  !! Operator / punctuation (`=`, `<=`, `(`, `,`, `*`, …)
+    integer, parameter, public :: TK_QIDENT = 6 !! Double-quoted (delimited) identifier, already unescaped; never a keyword
 
     !! One lexical token.  `text` is the verbatim source slice (for `TK_STR`
-    !! it is the unescaped string body); `col` is the 1-based start column in
-    !! the source line, used for parse-error reporting.
+    !! and `TK_QIDENT` it is the unescaped body); `col` is the 1-based start
+    !! column in the source line, used for parse-error reporting.
     type, public :: sql_token_t
         integer :: kind = TK_EOF
         character(len=:), allocatable :: text

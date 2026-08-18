@@ -23,6 +23,7 @@ program utest_sql
     call test_parser()
     call test_parse_errors()
     call test_ddl_and_insert()
+    call test_quoted_names_exec()
     call test_ddl_drop_alter()
     call test_select_projection()
     call test_where_predicates()
@@ -130,6 +131,20 @@ contains
 
         call sql_lex("a ~ b", toks, ntok, rs)
         call check(rs == SQR_INVALID, 'lex: stray character flagged')
+
+        call sql_lex('SELECT "Rate %" FROM "the ""big"" table"', toks, ntok, rs)
+        call check(rs == SQR_OK, 'lex: quoted identifiers succeed')
+        call check(ntok == 4, 'lex: quoted identifier token count')
+        call check(toks(2)%kind == TK_QIDENT .and. toks(2)%text == 'Rate %', &
+                   'lex: quoted identifier body')
+        call check(toks(4)%kind == TK_QIDENT .and. toks(4)%text == 'the "big" table', &
+                   'lex: escaped quote in identifier')
+
+        call sql_lex('x = ""', toks, ntok, rs)
+        call check(rs == SQR_INVALID, 'lex: empty quoted identifier flagged')
+
+        call sql_lex('SELECT "oops FROM t', toks, ntok, rs)
+        call check(rs == SQR_INVALID, 'lex: unterminated quoted identifier flagged')
     end subroutine
 
     ! ===================== parser =====================
@@ -182,6 +197,20 @@ contains
         call check(rs == SQR_OK .and. st%kind == ST_NONE, 'parse: blank line is a no-op')
         call sql_parse("SELECT * FROM t;", st, rs)
         call check(rs == SQR_OK, 'parse: trailing semicolon allowed')
+
+        call sql_parse('CREATE TABLE accounts ("Account#" INTEGER, "Rate %" REAL)', st, rs)
+        call check(rs == SQR_OK, 'parse: quoted column names ok')
+        call check(trim(st%coldefs(1)%name) == 'Account#' .and. &
+                   trim(st%coldefs(2)%name) == 'Rate %', 'parse: quoted names stored verbatim')
+
+        call sql_parse('SELECT "Rate %" FROM "select" WHERE "Account#" = 1 ORDER BY "Rate %"', st, rs)
+        call check(rs == SQR_OK, 'parse: quoted names in select/where/order')
+        call check(trim(st%table) == 'select', 'parse: quoted keyword usable as table name')
+        call check(trim(st%where_groups(1)%conds(1)%col) == 'Account#', 'parse: quoted name in where')
+
+        call sql_parse('SELECT "from" FROM t', st, rs)
+        call check(rs == SQR_OK .and. trim(st%names(1)) == 'from', &
+                   'parse: quoted keyword usable as column name')
     end subroutine
 
     subroutine test_parse_errors()
@@ -226,6 +255,40 @@ contains
 
         call run(db, "SELECT * FROM t", res, rs)
         call check(rs == SQR_OK .and. res%nrows == 4, 'insert: four rows present')
+
+        call db_close(db)
+    end subroutine
+
+    ! ===================== quoted identifiers, end to end =====================
+
+    ! Delimited identifiers driven through the executor: a table whose
+    ! column names carry spaces and punctuation (the LibreOffice Base use
+    ! case) created, filled, queried, ordered and altered by their quoted
+    ! names.
+    subroutine test_quoted_names_exec()
+        type(db_t) :: db
+        type(sql_result_t) :: res
+        integer :: rs
+
+        call fresh_db(db)
+        call run(db, 'CREATE TABLE accounts ("Account#" INTEGER, "Rate %" REAL, "Rate (%)" CHAR(8))', res, rs)
+        call check(rs == SQR_OK, 'qid: create table with quoted columns')
+
+        call run(db, 'INSERT INTO accounts ("Account#", "Rate %", "Rate (%)") ' // &
+                     "VALUES (2, 4.5, 'b'), (1, 3.25, 'a')", res, rs)
+        call check(rs == SQR_OK .and. res%count == 2, 'qid: named insert via quoted columns')
+
+        call run(db, 'SELECT "Rate (%)" FROM accounts WHERE "Account#" = 1', res, rs)
+        call check(rs == SQR_OK .and. res%nrows == 1, 'qid: where on quoted column')
+        call check(cell(res, 1, 1) == 'a', 'qid: projected quoted column value')
+
+        call run(db, 'SELECT "Account#" FROM accounts ORDER BY "Rate %" DESC', res, rs)
+        call check(rs == SQR_OK .and. cell(res, 1, 1) == '2', 'qid: order by quoted column')
+
+        call run(db, 'ALTER TABLE accounts DROP COLUMN "Rate (%)"', res, rs)
+        call check(rs == SQR_OK, 'qid: drop quoted column')
+        call run(db, "SELECT * FROM accounts", res, rs)
+        call check(rs == SQR_OK .and. res%ncols == 2, 'qid: column really dropped')
 
         call db_close(db)
     end subroutine
