@@ -35,12 +35,13 @@ contains
 
     ! ===================== top-level entry points =====================
 
-    module subroutine sql_run(db, text, res, stat, errmsg)
+    module subroutine sql_run(db, text, res, stat, errmsg, binary_cells)
         type(db_t),         intent(inout), target   :: db
         character(len=*),   intent(in)              :: text
         type(sql_result_t), intent(out)             :: res
         integer,            intent(out),  optional  :: stat
         character(len=*),   intent(inout), optional :: errmsg
+        logical,            intent(in),   optional  :: binary_cells
         type(sql_stmt_t) :: stmt
         integer :: rs
         character(len=200) :: emsg
@@ -55,16 +56,20 @@ contains
             res%kind = SQLRES_NONE        ! blank line
             return
         end if
-        call sql_exec(db, stmt, res, stat, errmsg)
+        call sql_exec(db, stmt, res, stat, errmsg, binary_cells)
     end subroutine
 
-    module subroutine sql_exec(db, stmt, res, stat, errmsg)
+    module subroutine sql_exec(db, stmt, res, stat, errmsg, binary_cells)
         type(db_t),         intent(inout), target   :: db
         type(sql_stmt_t),   intent(in)              :: stmt
         type(sql_result_t), intent(out)             :: res
         integer,            intent(out),  optional  :: stat
         character(len=*),   intent(inout), optional :: errmsg
+        logical,            intent(in),   optional  :: binary_cells
+        logical :: bmode
 
+        bmode = .false.
+        if (present(binary_cells)) bmode = binary_cells
         if (present(stat)) stat = SQR_OK
 
         ! Transaction control statements need no open table.
@@ -89,7 +94,7 @@ contains
         case (ST_INSERT);       call exec_insert(db, stmt, res, stat, errmsg)
         case (ST_DELETE);       call exec_delete(db, stmt, res, stat, errmsg)
         case (ST_UPDATE);       call exec_update(db, stmt, res, stat, errmsg)
-        case (ST_SELECT);       call exec_select(db, stmt, res, stat, errmsg)
+        case (ST_SELECT);       call exec_select(db, stmt, res, bmode, stat, errmsg)
         case default
             call set_err(stat, errmsg, SQR_INVALID, 'unsupported statement')
         end select
@@ -434,10 +439,11 @@ contains
 
     ! ===================== SELECT =====================
 
-    subroutine exec_select(db, stmt, res, stat, errmsg)
+    subroutine exec_select(db, stmt, res, binary, stat, errmsg)
         type(db_t),         intent(inout), target :: db
         type(sql_stmt_t),   intent(in)    :: stmt
         type(sql_result_t), intent(out)   :: res
+        logical,            intent(in)    :: binary
         integer,            intent(out),  optional :: stat
         character(len=*),   intent(inout), optional :: errmsg
         type(row_match_ctx_t) :: g
@@ -486,11 +492,13 @@ contains
         do j = 1, nproj
             res%colnames(j) = cols(proj(j))%name
         end do
+        res%coltypes = cols(proj)%dtype
+        res%colsizes = cols(proj)%csize
         allocate(res%cells(nout, nproj))
         do i = 1, nout
             do j = 1, nproj
                 call render_cell(db, trim(stmt%table), cols(proj(j)), &
-                                 g%rids(perm(i)), g%bufs(perm(i)), res%cells(i, j))
+                                 g%rids(perm(i)), g%bufs(perm(i)), binary, res%cells(i, j))
             end do
         end do
     end subroutine
@@ -1013,28 +1021,45 @@ contains
         end select
     end subroutine
 
-    ! Render one column of a row into an output cell.
-    subroutine render_cell(db, tname, col, rid, buf, cell)
+    ! Render one column of a row into an output cell.  Text mode formats
+    ! INT/REAL for display; binary mode carries the value's native bytes
+    ! (exact — for wire clients).  CHAR/TEXT are identical in both modes.
+    subroutine render_cell(db, tname, col, rid, buf, binary, cell)
         type(db_t),       intent(inout) :: db
         character(len=*), intent(in)    :: tname
         type(column_t),   intent(in)    :: col
         integer(int32),   intent(in)    :: rid
         character(len=*), intent(in)    :: buf
+        logical,          intent(in)    :: binary
         type(sql_cell_t), intent(out)   :: cell
         character(len=32) :: nb
+        character(len=4)  :: b4
+        character(len=8)  :: b8
         integer :: rs
         if (row_is_null(buf, col)) then
             cell%is_null = .true.
-            cell%text = 'NULL'
+            if (binary) then
+                cell%text = ''
+            else
+                cell%text = 'NULL'
+            end if
             return
         end if
         select case (col%dtype)
         case (DT_INT)
-            write(nb, '(i0)') row_get_int(buf, col)
-            cell%text = trim(nb)
+            if (binary) then
+                cell%text = transfer(row_get_int(buf, col), b4)
+            else
+                write(nb, '(i0)') row_get_int(buf, col)
+                cell%text = trim(nb)
+            end if
         case (DT_REAL)
-            write(nb, '(es15.8)') row_get_real(buf, col)
-            cell%text = trim(adjustl(nb))
+            if (binary) then
+                cell%text = transfer(row_get_real(buf, col), b8)
+            else
+                write(nb, '(es15.8)') row_get_real(buf, col)
+                cell%text = trim(adjustl(nb))
+            end if
         case (DT_CHAR)
             cell%text = trim(row_get_char(buf, col))
         case (DT_TEXT)

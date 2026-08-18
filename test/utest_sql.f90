@@ -28,6 +28,8 @@ program utest_sql
     call test_where_predicates()
     call test_order_and_limit()
     call test_null_handling()
+    call test_column_metadata()
+    call test_binary_cells()
     call test_text_column()
     call test_update_delete()
     call test_index_scan_parity()
@@ -372,6 +374,83 @@ contains
         ! NULL renders as the NULL cell and sorts last ascending
         call run(db, "SELECT id, age FROM t ORDER BY age", res, rs)
         call check(res%cells(3,2)%is_null, 'null: NULL sorts last ascending')
+
+        call db_close(db)
+    end subroutine
+
+    ! ===================== column metadata =====================
+
+    subroutine test_column_metadata()
+        type(db_t) :: db
+        type(sql_result_t) :: res
+        integer :: rs
+
+        call fresh_db(db)
+        call run(db, "CREATE TABLE t (id INTEGER, x REAL, name CHAR(12), note TEXT)", res, rs)
+        call run(db, "INSERT INTO t VALUES (1, 0.5, 'a', 'b')", res, rs)
+
+        call run(db, "SELECT * FROM t", res, rs)
+        call check(rs == SQR_OK .and. allocated(res%coltypes) .and. allocated(res%colsizes), &
+                   'meta: coltypes/colsizes allocated')
+        call check(all(res%coltypes == [DT_INT, DT_REAL, DT_CHAR, DT_TEXT]), 'meta: star column types')
+        call check(res%colsizes(1) == 4 .and. res%colsizes(2) == 8 .and. res%colsizes(3) == 12, &
+                   'meta: star column sizes')
+
+        ! Metadata follows the projection order, not the declaration order.
+        call run(db, "SELECT name, id FROM t", res, rs)
+        call check(all(res%coltypes == [DT_CHAR, DT_INT]), 'meta: projected column types')
+        call check(all(res%colsizes == [12, 4]), 'meta: projected column sizes')
+
+        ! An empty result set still carries full column metadata.
+        call run(db, "SELECT x FROM t WHERE id = 99", res, rs)
+        call check(res%nrows == 0 .and. all(res%coltypes == [DT_REAL]), 'meta: empty result keeps metadata')
+
+        call db_close(db)
+    end subroutine
+
+    ! ===================== binary cell mode =====================
+
+    subroutine test_binary_cells()
+        type(db_t) :: db
+        type(sql_result_t) :: res
+        integer :: rs
+        character(len=200) :: em
+        integer(int32) :: iv
+        real(real64)   :: xv
+
+        call fresh_db(db)
+        call run(db, "CREATE TABLE t (id INTEGER, x REAL, name CHAR(12), note TEXT)", res, rs)
+        call run(db, "INSERT INTO t VALUES (7, 0.1, 'Alice', 'hello'),(-2, -1.5e-300, 'Bob', 'x')", res, rs)
+        call run(db, "INSERT INTO t (id) VALUES (9)", res, rs)      ! x/name/note NULL
+
+        em = ''
+        call sql_run(db, "SELECT * FROM t ORDER BY id", res, rs, em, binary_cells=.true.)
+        call check(rs == SQR_OK .and. res%nrows == 3, 'bin: select succeeds')
+
+        ! INT cells: 4 native bytes, exact round-trip through transfer.
+        call check(len(res%cells(1,1)%text) == 4, 'bin: INT cell is 4 bytes')
+        iv = transfer(res%cells(1,1)%text, iv)
+        call check(iv == -2_int32, 'bin: negative INT value exact')
+        iv = transfer(res%cells(2,1)%text, iv)
+        call check(iv == 7_int32, 'bin: INT value exact')
+
+        ! REAL cells: 8 native bytes, bit-exact (es15.8 text would round).
+        call check(len(res%cells(2,2)%text) == 8, 'bin: REAL cell is 8 bytes')
+        xv = transfer(res%cells(2,2)%text, xv)
+        call check(xv == 0.1_real64, 'bin: REAL value bit-exact')
+        xv = transfer(res%cells(1,2)%text, xv)
+        call check(xv == -1.5e-300_real64, 'bin: subnormal-range REAL bit-exact')
+
+        ! NULL: flagged, zero-length payload (not the text 'NULL').
+        call check(res%cells(3,2)%is_null .and. len(res%cells(3,2)%text) == 0, &
+                   'bin: NULL cell empty with is_null set')
+
+        ! CHAR/TEXT cells are unchanged by the mode.
+        call check(cell(res,2,3) == 'Alice' .and. cell(res,2,4) == 'hello', 'bin: CHAR/TEXT cells as text mode')
+
+        ! Default (text) mode still formats.
+        call run(db, "SELECT id FROM t WHERE id = 7", res, rs)
+        call check(cell(res,1,1) == '7', 'bin: text mode default unchanged')
 
         call db_close(db)
     end subroutine

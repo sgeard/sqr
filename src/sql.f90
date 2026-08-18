@@ -162,13 +162,16 @@ module sql
         logical :: is_null = .false.
     end type
 
-    !! The outcome of executing one statement.  A SELECT fills `colnames` and
-    !! the `(nrows, ncols)` `cells` grid; a DML statement fills `count`; DDL
-    !! fills `message`.  Both the REPL and the test suite consume this same
-    !! structure, so output is asserted directly rather than scraped from text.
+    !! The outcome of executing one statement.  A SELECT fills `colnames`,
+    !! `coltypes`/`colsizes` and the `(nrows, ncols)` `cells` grid; a DML
+    !! statement fills `count`; DDL fills `message`.  Both the REPL and the
+    !! test suite consume this same structure, so output is asserted directly
+    !! rather than scraped from text.
     type, public :: sql_result_t
         integer :: kind = SQLRES_NONE
         character(len=SQR_NAME_LEN), allocatable :: colnames(:)
+        integer,                     allocatable :: coltypes(:)  !! Per output column: `DT_INT`/`DT_REAL`/`DT_CHAR`/`DT_TEXT`
+        integer,                     allocatable :: colsizes(:)  !! Per output column: declared `csize` in bytes
         type(sql_cell_t),            allocatable :: cells(:,:)
         integer :: nrows = 0
         integer :: ncols = 0
@@ -211,22 +214,30 @@ module sql
         !! index-driven or scan-driven plan as appropriate, and fill `res`.
         !! Engine errors propagate through `stat`/`errmsg`.  `db` is `target`
         !! because the transaction façade the executor calls needs it.
-        module subroutine sql_exec(db, stmt, res, stat, errmsg)
+        !! With `binary_cells` true a SELECT fills INT/REAL cells with the
+        !! value's native bytes (`transfer`: 4 B int32 / 8 B IEEE double —
+        !! exact, for wire clients) instead of formatted text, and NULL cells
+        !! carry zero-length text (`is_null` is the marker either way);
+        !! CHAR/TEXT cells are identical in both modes.  `sql_render` expects
+        !! a text-mode result.
+        module subroutine sql_exec(db, stmt, res, stat, errmsg, binary_cells)
             type(db_t),        intent(inout), target   :: db  !! Open database handle
             type(sql_stmt_t),  intent(in)              :: stmt  !! Statement to run
             type(sql_result_t), intent(out)            :: res  !! Execution result
             integer,           intent(out),  optional  :: stat  !! `SQR_OK` or an error code
             character(len=*),  intent(inout), optional :: errmsg  !! Failure detail
+            logical,           intent(in),   optional  :: binary_cells  !! Native-byte INT/REAL cells (default text)
         end subroutine
 
         !! Convenience: lex + parse + execute one source line.  Equivalent to
-        !! `sql_parse` then `sql_exec`.
-        module subroutine sql_run(db, text, res, stat, errmsg)
+        !! `sql_parse` then `sql_exec` (`binary_cells` as there).
+        module subroutine sql_run(db, text, res, stat, errmsg, binary_cells)
             type(db_t),        intent(inout), target   :: db  !! Open database handle
             character(len=*),  intent(in)              :: text  !! Source line
             type(sql_result_t), intent(out)            :: res  !! Execution result
             integer,           intent(out),  optional  :: stat  !! `SQR_OK` or an error code
             character(len=*),  intent(inout), optional :: errmsg  !! Failure detail
+            logical,           intent(in),   optional  :: binary_cells  !! Native-byte INT/REAL cells (default text)
         end subroutine
 
         !! Render a result to a formatted unit: an aligned table for a SELECT,
