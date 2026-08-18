@@ -1,4 +1,4 @@
-.PHONY: all clean veryclean distclean utest sqlttest sqrdtest calctest install-calc faulttest run-faulttest proctest bench run-bench destruct run-destruct coverage coverage-gcov coverage-clean docs docs-clean help windows win-build sqrsh-regex test-regex
+.PHONY: all clean veryclean distclean utest sqlttest sqrdtest calctest install uninstall install-calc faulttest run-faulttest proctest bench run-bench destruct run-destruct coverage coverage-gcov coverage-clean docs docs-clean help windows win-build sqrsh-regex test-regex
 .SUFFIXES:
 .DEFAULT_GOAL := all
 
@@ -14,6 +14,13 @@ DESTRUCT_DIR := destruct
 # Fault-injection variant (sqr_fault submodule). off = production
 # (zero machinery, shared with fpm); on = coverage/fault test only.
 FAULT ?= off
+
+# Install location.  PREFIX=$(HOME)/.local installs without root (and
+# ~/.local/bin is already on PATH); DESTDIR stages the tree for packaging.
+# run_sqrd finds sqrd/sqrbak beside itself, so installing the four programs
+# and the launcher into one directory is all the wiring there is.
+PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/bin
 
 # Per-compiler extras consumed by foptions_$(F).mk
 F_EXTRA_GF  := -Wno-unused-dummy-argument
@@ -315,6 +322,21 @@ LO_SCRIPTS   := $(HOME)/.config/libreoffice/4/user/Scripts/python
 calctest: $(ODIR)/sqrd$(EXT)
 	tclsh $(CALC_DIR)/test_calc.tcl $(ODIR)/sqrd$(EXT)
 
+# Install the programs and the launcher side by side, which is the only
+# arrangement run_sqrd needs: it looks for sqrd/sqrbak in its own directory
+# first, and falls back to the obj_* build directories when it is being run
+# out of the source tree.  Nothing is symlinked and nothing has a path
+# compiled into it.
+install: $(APP_BIN)
+	mkdir -p $(DESTDIR)$(BINDIR)
+	install -m 755 $(APP_BIN) $(DESTDIR)$(BINDIR)/
+	install -m 755 run_sqrd $(DESTDIR)$(BINDIR)/
+	@echo "Installed $(notdir $(APP_BIN)) run_sqrd to $(DESTDIR)$(BINDIR)"
+
+uninstall:
+	rm -f $(addprefix $(DESTDIR)$(BINDIR)/,$(notdir $(APP_BIN)) run_sqrd)
+	@echo "Removed $(notdir $(APP_BIN)) run_sqrd from $(DESTDIR)$(BINDIR)"
+
 install-calc:
 	mkdir -p $(LO_SCRIPTS)
 	install -m 644 $(CALC_DIR)/tclcalc.py $(CALC_DIR)/sqr_calc.tcl $(LO_SCRIPTS)/
@@ -486,7 +508,8 @@ windows:
 	@for t in $(WIN_TESTS); do echo "    $(WIN_ODIR)/$$t.exe"; done
 
 help:
-	@echo "Targets : all, utest, sqlttest, sqrdtest, calctest, install-calc, faulttest, destruct, bench"
+	@echo "Targets : all, utest, sqlttest, sqrdtest, calctest, faulttest, destruct, bench"
+	@echo "          install, uninstall (PREFIX=$(PREFIX)), install-calc"
 	@echo "          clean, veryclean, distclean"
 	@echo "          coverage, coverage-gcov, coverage-clean, docs, docs-clean, windows"
 	@echo "          sqrsh-regex, test-regex (opt-in DT_CHAR regex search via tcl_re)"

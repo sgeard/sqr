@@ -22,9 +22,6 @@ namespace eval daemon {
 
     variable prog [file tail [info script]]
     variable name "sqrd"
-    # Relative to the script, not to the caller: the database is an argument,
-    # so this gets run from wherever that database happens to be.
-    variable loc [file dirname [file normalize [info script]]]
 
     # 0 = let the OS choose the port.  Pin a number only if something outside
     # must hard-code it (an ODBC DSN carrying an explicit PORT, say).
@@ -54,7 +51,6 @@ namespace eval daemon {
     # the log so the banner is kept without crossing the pipe.
     proc start {db} {
         variable name
-        variable loc
         variable bind_port
         variable port_no
         variable chan
@@ -64,10 +60,7 @@ namespace eval daemon {
             puts "$name already running on $db: pid = $id"
             return
         }
-        set dobj [file join $loc $name]
-        if {! [file executable $dobj]} {
-            error "$dobj is no executable"
-        }
+        set dobj [tool $name]
         if {! [file isdirectory $db]} {
             error "$db is not a directory"
         }
@@ -113,11 +106,7 @@ namespace eval daemon {
     # the OS chose it.
     proc status {db} {
         variable name
-        variable loc
-        set bak [file join $loc sqrbak]
-        if {! [file executable $bak]} {
-            error "$bak is no executable"
-        }
+        set bak [tool sqrbak]
         # The pid first: a daemon that is running but unreachable (an older
         # build, a wedged process) is a different story from nothing running
         # at all, and saying so beats silence.
@@ -136,6 +125,33 @@ namespace eval daemon {
     }
 
     # ---- internals ------------------------------------------------------
+
+    # Where `name` lives.  Beside this script is the installed arrangement
+    # (`make install` puts the programs and the launcher in one directory);
+    # the obj_* fallback is for running straight out of the source tree,
+    # newest first so it follows whichever compiler you last built with.
+    # Nothing is symlinked and no path is compiled in, so a `make distclean`
+    # that removes every binary just makes this say so.
+    proc tool {name} {
+        set here [file dirname [file normalize [info script]]]
+        if {[file executable [file join $here $name]]} {
+            return [file join $here $name]
+        }
+        set best ""
+        set newest 0
+        foreach d [glob -nocomplain -directory $here -type d obj_*] {
+            set exe [file join $d $name]
+            if {! [file executable $exe]} {continue}
+            if {[file mtime $exe] > $newest} {
+                set newest [file mtime $exe]
+                set best   $exe
+            }
+        }
+        if {$best eq ""} {
+            error "cannot find $name in $here or its obj_* build directories"
+        }
+        return $best
+    }
 
     # Built from the export list, so a new verb needs no second edit.
     proc usage {chan} {

@@ -239,6 +239,17 @@ every reader connects and checks which directory is really being served
 before believing it. That one check also catches a reused pid and a recycled
 port.
 
+Install the programs and the launcher side by side and there is nothing else
+to wire up — `run_sqrd` looks for `sqrd` and `sqrbak` in its own directory,
+falling back to the `obj_*` build directories when it is run straight out of
+the source tree:
+
+```
+make install                      # /usr/local/bin (needs root)
+make install PREFIX=~/.local      # no root; ~/.local/bin is usually on PATH
+make uninstall
+```
+
 `sqrbak` asks a running server exactly that, and takes backups:
 
 ```
