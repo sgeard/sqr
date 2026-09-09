@@ -260,8 +260,9 @@ contains
         integer          :: u, ios, i, namelen, maxlen, rs
 
         rs = SQR_OK
-        ! c_path_exists (stat), not file_exists (inquire) — inquire on a
-        ! directory is unreliable across compilers (ifx reports .false.).
+        ! c_path_exists (access(2)): inquire on a directory is unreliable
+        ! across compilers (ifx reports .false.), and file_exists now goes
+        ! the same way for every path (see c_file_size).
         if (c_path_exists(trim(dir))) then      ! never overwrite (Save-As semantics)
             call pk_report(SQR_DUP, stat, errmsg)
             return

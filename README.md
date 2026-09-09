@@ -347,6 +347,24 @@ inside an explicit transaction costs ~35 µs. **Batch your writes in
 scaling with the row count, so per-insert cost *falls* as the transaction
 grows.
 
+A store the host can rebuild, or one it will make durable itself when it
+is finished (an application's working scratch, a cache, a copy being
+assembled before an atomic rename), can be opened with
+`db_open(..., durable=.false.)`: every `fsync` is skipped — journal, commit
+barrier and the schema/catalog replace alike — while the writes, flushes,
+transactions, rollback and the atomic renames all stay, so the running
+process never sees a torn file. Only a crash can, and that is the trade the
+flag names.
+
+Two things the engine avoids on its own account, because their cost grows
+with the number of open tables: a name-based `inquire`/`open` (the ifx
+runtime resolves the real path of every connected unit to answer one — file
+lengths come from `stat` via `c_file_size`, and the journal keeps one unit
+open for the session instead of reopening per write), and rewriting
+metadata that has not changed (a close or quiesce rewrites a table's schema
+only when its counters moved, and the catalog only when the table list
+did — a clean open+close touches nothing on disk).
+
 ---
 
 ## Robustness

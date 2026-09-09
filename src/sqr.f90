@@ -155,6 +155,8 @@ module sqr
         integer                     :: record_size    = 0  !! Fixed record size in bytes
         integer                     :: next_id        = 1  !! Next row_id to assign
         integer                     :: live_count     = 0  !! Number of non-tombstoned rows
+        integer                     :: disk_next_id   = -1 !! next_id as last read from / written to the schema file
+        integer                     :: disk_live_count = -1 !! live_count likewise: close rewrites the schema only when these differ
         integer                     :: schema_version = 0  !! On-disk format version of this table
         integer                     :: unit           = -1  !! Open unit for `<table>.dat`, -1 if closed
         integer                     :: nindices       = 0  !! Number of secondary indices
@@ -278,10 +280,13 @@ module sqr
         integer                       :: ntables  = 0  !! Number of open tables
         logical                       :: opened   = .false.  !! `.true.` between `db_open` and `db_close`
         logical                       :: readonly = .false.  !! `.true.` if opened read-only
-        logical                       :: durable  = .true.   !! `.false.` skips the JOURNAL fsyncs
-        !!                                                      (writes + flush kept): for a scratch
-        !!                                                      or cache store the host can rebuild.
-        !!                                                      Schema/catalog replace stays durable.
+        logical                       :: durable  = .true.   !! `.false.` skips EVERY fsync — journal,
+        !!                                                      commit barrier, schema/catalog replace
+        !!                                                      (writes, flush and the atomic rename
+        !!                                                      kept): for a scratch or cache store the
+        !!                                                      host can rebuild, or one the host makes
+        !!                                                      durable itself when it is finished.
+        logical                       :: catalog_dirty = .false.  !! Table list changed since the catalog was last written
         logical                       :: quiesced = .false.  !! `.true.` between `db_quiesce` and `db_resume` (units closed)
         integer                       :: generation = 0  !! Bumped by every mutating call; cursors snapshot it
         integer(c_int64_t)            :: lock_tok = -1  !! Advisory-lock token held while open (-1 = none)
@@ -420,7 +425,7 @@ module sqr
     ! them — application code should use the db_begin/commit/rollback façade
     ! above, not these primitives directly.
     public :: txn_begin, txn_arm, txn_commit, txn_rollback
-    public :: jrnl_log_region, jrnl_log_extend, jrnl_recover, jrnl_hot
+    public :: jrnl_log_region, jrnl_log_extend, jrnl_recover, jrnl_hot, jrnl_close_unit
     public :: bt_journal_adapter
 
     !! Create a secondary index.  Accepts either a single column name or a
@@ -501,8 +506,8 @@ module sqr
             integer,          intent(out),  optional  :: stat  !! `SQR_OK` or an error code
             character(len=*), intent(inout), optional :: errmsg  !! Human-readable failure detail
             logical,          intent(in),   optional  :: readonly  !! Open read-only (default `.false.`)
-            logical,          intent(in),   optional  :: durable  !! `.false.` = skip the journal
-            !!                                                       fsyncs (writes + flush kept);
+            logical,          intent(in),   optional  :: durable  !! `.false.` = skip every fsync
+            !!                                                       (writes + flush + rename kept);
             !!                                                       default `.true.`.  For scratch
             !!                                                       stores the host can rebuild.
         end subroutine
@@ -1340,6 +1345,13 @@ module sqr
             class(db_t),      intent(inout)         :: db  !! Database handle (transaction active)
             character(len=*), intent(in)            :: path  !! Base file, relative to the db directory
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+        end subroutine
+
+        !! Release the journal's held stream unit (a no-op if none is open).
+        !! Called by db_close before the journal file is deleted and by
+        !! db_quiesce, whose contract is that no unit stays connected.
+        module subroutine jrnl_close_unit(db)
+            class(db_t), intent(inout) :: db  !! Database handle
         end subroutine
 
         !! Arm the journal (make it hot): serialise the undo set to the file,

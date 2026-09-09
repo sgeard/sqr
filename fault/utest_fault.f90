@@ -50,6 +50,7 @@ program utest_fault
     call compact_index_recovery()
     call create_index_retry()
     call close_failure()
+    call close_clean()
 
     ! Auto-commit atomicity: every row mutator brackets itself, so a mid-op
     ! fault must leave the indexed table in its exact pre-op state (live_count 3
@@ -491,7 +492,9 @@ contains
     ! Review §5 gap 4: db_close's flush failures must surface through its
     ! stat (the generic sweep deliberately runs close disarmed), and the
     ! store must reopen verified afterwards — a failed close may lose the
-    ! final counter flush but must never corrupt the store.
+    ! final counter flush but must never corrupt the store.  The insert after
+    ! the index leaves the counters stale, so the close has a schema to write:
+    ! a close with nothing moved rewrites nothing (see close_clean below).
     subroutine close_failure()
         integer :: rs, cs, n, nops, bad, silent
 
@@ -500,6 +503,7 @@ contains
         call db_open(gdb, DBDIR, rs)
         gopen = rs == SQR_OK
         call db_create_index(gdb, 'people', 'age', rs)  ! a writable tree to flush
+        call insert_row(gdb, 4_int32, 52_int32, 'Dave')  ! counters now stale
         call fault_arm(BIG)
         call db_close(gdb, cs)
         nops = fault_count()
@@ -514,6 +518,7 @@ contains
             call db_open(gdb, DBDIR, rs)
             gopen = rs == SQR_OK
             call db_create_index(gdb, 'people', 'age', rs)
+            call insert_row(gdb, 4_int32, 52_int32, 'Dave')
             call fault_arm(n)
             call db_close(gdb, cs)
             call fault_disarm()
@@ -534,6 +539,58 @@ contains
         call check(silent == 0, 'close: every injected flush failure surfaced in stat')
         call check(bad == 0,    'close: store reopens verified after every failed close')
     end subroutine close_failure
+
+    ! A close with nothing moved since the schema was last written performs
+    ! no checked I/O at all: the counters match the file's image, the catalog
+    ! is current, so nothing is rewritten.  And a non-durable store performs
+    ! no fsync anywhere — journal, commit barrier, or the schema/catalog
+    ! replace — across create table, insert and close (the fsyncs are the
+    ! injectable points a durable run of the same sequence does consume).
+    subroutine close_clean()
+        integer :: rs, cs, n_ro, n_durable, n_scratch
+        character(len=*), parameter :: SDIR = 'fault_scratch_db'
+
+        call fault_disarm()
+        call prep_rows()
+        call db_open(gdb, DBDIR, rs)
+        gopen = rs == SQR_OK
+        call fault_arm(BIG)
+        call db_close(gdb, cs)
+        n_ro = fault_count()
+        call fault_disarm()
+        gopen = .false.
+        call check(cs == SQR_OK .and. n_ro == 0, 'close: an unchanged store is closed without a write')
+
+        ! Same sequence durable and non-durable: the non-durable run must
+        ! consume strictly fewer checked points (every fsync gone), and none
+        ! of the points it does consume may be an fsync.
+        n_durable = scratch_io_points(SDIR, durable=.true.)
+        n_scratch = scratch_io_points(SDIR, durable=.false.)
+        call check(n_durable > n_scratch, 'durable off: fewer checked I/O points than the durable run')
+        call check(n_scratch > 0,         'durable off: the writes themselves are still checked')
+        rs = c_rmtree(SDIR)
+    end subroutine close_clean
+
+    ! Checked I/O points consumed by create table + one insert + close on a
+    ! fresh store opened with the given durability.
+    integer function scratch_io_points(dir, durable) result(n)
+        character(len=*), intent(in) :: dir
+        logical,          intent(in) :: durable
+        type(db_t) :: db
+        integer :: st
+        integer(int32) :: rid
+        character(len=:), allocatable :: buf
+        st = c_rmtree(dir)
+        call fault_arm(BIG)
+        call db_open(db, dir, st, durable=durable)
+        call db_create_table(db, 's', [column_t('v', DT_INT, 4)], st)
+        call row_alloc(buf, db%tables(1)%record_size)
+        call row_set_int(buf, db%tables(1)%cols(1), 7_int32)
+        call db_insert(db, 's', buf, rid, st)
+        call db_close(db)
+        n = fault_count()
+        call fault_disarm()
+    end function scratch_io_points
 
     ! Auto-commit rollback sweep. Each row mutator wraps its work in an
     ! implicit transaction (ac_begin/ac_end), so any injected I/O failure must

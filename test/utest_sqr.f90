@@ -2,7 +2,7 @@ program utest_sqr
     use, intrinsic :: iso_fortran_env, only: int8, int32, int64, real64
     use sqr
     use clib_wrap, only: c_rename, c_remove, c_mkdir, c_chmod, c_rmtree, c_path_exists, &
-                         c_fsync_path, c_fsync_dir, c_truncate, c_lock_release
+                         c_fsync_path, c_fsync_dir, c_truncate, c_file_size, c_lock_release
     implicit none
 
     type :: scan_ctx_t
@@ -69,6 +69,7 @@ program utest_sqr
     call test_strict_write_length()
     call test_row_id_exhaustion()
     call test_readonly_media_lock()
+    call test_clean_close()
     call test_engine_errmsg()
     call test_wide_table()
     call test_scan_empty()
@@ -136,6 +137,8 @@ contains
         call check(c_truncate(f, 40_int64) == 0,          'c_truncate shrink to 40')
         inquire(file=f, size=sz)
         call check(sz == 40_int64,                        'file is 40 bytes after truncate')
+        call check(c_file_size(f) == 40_int64,            'c_file_size agrees with inquire')
+        call check(c_file_size('no_such_file.xyz') == -1_int64, 'c_file_size on missing file is -1')
         call check(c_fsync_path('no_such_file.xyz') /= 0, 'c_fsync_path on missing file fails')
         call check(c_truncate('no_such_file.xyz', 8_int64) /= 0, &
                                                           'c_truncate on missing file fails')
@@ -689,12 +692,12 @@ contains
         close(u)
     end function
 
+    ! By stat, not inquire: a unit a stale (crash stand-in) handle still holds
+    ! would make inquire answer from that connection, not from the disk.
     function jfile_size(path) result(n)
         character(len=*), intent(in) :: path
         integer(int64) :: n
-        integer :: ios
-        inquire(file=path, size=n, iostat=ios)
-        if (ios /= 0) n = -1_int64
+        n = c_file_size(path)
     end function
 
     pure function people_cols() result(c)
@@ -4308,6 +4311,63 @@ contains
         end if
         ios = c_chmod(MDIR // '/_lock', int(o'644'))
         ios = c_rmtree(MDIR)
+    end subroutine
+
+    ! A read-write open followed by a close with nothing changed writes
+    ! NOTHING: the schema counters match the file's image and the catalog is
+    ! current, so neither is rewritten.  Proved black-box by making the
+    ! directory unwritable between open and close — a rewrite goes through a
+    ! temp file + rename, which the unwritable directory refuses — and
+    ! requiring a clean close.  The mirror case (a row inserted, so the
+    ! counters moved) must then FAIL its close, showing the probe can see a
+    ! rewrite when there is one.  Also the journal: the working unit is held
+    ! for the session, and a clean close must still delete the file.
+    subroutine test_clean_close()
+        character(len=*), parameter :: CDIR = 'utest_sqr_cleanclose_db'
+        type(db_t) :: db
+        type(column_t) :: c(1)
+        integer :: rs, ios, ti
+        integer(int32) :: rid
+        character(len=:), allocatable :: buf
+        ios = c_rmtree(CDIR)
+        c(1)%name = 'id'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        call db_open(db, CDIR, rs)
+        call db_create_table(db, 't', c, rs)
+        ti = db_table_index(db, 't')
+        call row_alloc(buf, db_record_size(db, 't'))
+        call row_set_int(buf, db%tables(ti)%cols(1), 42_int32)
+        call db_insert(db, 't', buf, rid, rs)
+        call db_close(db, rs)
+        call check(rs == SQR_OK, 'clean close: seed store closes')
+        call check(.not. c_path_exists(CDIR // '/_journal.dat'), &
+                   'clean close: the journal file is gone after an autocommit session')
+
+        ! Nothing changed: an unwritable directory must not trouble the close.
+        call db_open(db, CDIR, rs)
+        call check(rs == SQR_OK, 'clean close: reopen read-write')
+        call db_get(db, 't', rid, buf, rs)
+        ios = c_chmod(CDIR, int(o'555'))
+        call check(ios == 0, 'clean close: chmod dir read-only')
+        call db_close(db, rs)
+        ios = c_chmod(CDIR, int(o'755'))
+        call check(rs == SQR_OK, 'clean close: unchanged store closes without writing')
+
+        ! Counters moved: the same probe must now see the schema rewrite fail.
+        call db_open(db, CDIR, rs)
+        call row_set_int(buf, db%tables(ti)%cols(1), 43_int32)
+        call db_insert(db, 't', buf, rid, rs)
+        call check(rs == SQR_OK, 'clean close: insert on the writable dir')
+        ios = c_chmod(CDIR, int(o'555'))
+        call db_close(db, rs)
+        ios = c_chmod(CDIR, int(o'755'))
+        call check(rs /= SQR_OK, 'clean close: a moved counter needs the rewrite (probe sees it)')
+
+        ! The store is still whole: the row count is re-derived from the data file.
+        call db_open(db, CDIR, rs)
+        call check(rs == SQR_OK .and. db_row_count(db, 't') == 2, &
+                   'clean close: store reopens with both rows')
+        call db_close(db)
+        ios = c_rmtree(CDIR)
     end subroutine
 
     ! Review §5.4: engine-level errmsg CONTENT (substring matches so the

@@ -27,6 +27,7 @@ module clib_wrap
     public :: c_fsync_path  !! flush a file's data to stable storage
     public :: c_fsync_dir   !! flush a directory's entries to stable storage
     public :: c_truncate    !! set a file's length (shrink or grow)
+    public :: c_file_size   !! a file's length in bytes by stat, -1 if absent
     public :: c_realpath    !! canonical absolute path of an existing path
     public :: c_abspath     !! absolute path, final component need not exist
     public :: c_joincwd     !! absolute path with symlinks and `..` left intact
@@ -107,6 +108,12 @@ module clib_wrap
             character(kind=c_char), intent(in) :: p(*)
             integer(c_int64_t),     value      :: length
             integer(c_int)                     :: r
+        end function
+
+        function sqr_os_file_size(p) bind(c, name='sqr_os_file_size') result(n)
+            import :: c_char, c_int64_t
+            character(kind=c_char), intent(in) :: p(*)
+            integer(c_int64_t)                 :: n
         end function
 
         subroutine sqr_os_exit(code) bind(c, name='sqr_os_exit')
@@ -299,6 +306,17 @@ module clib_wrap
             character(len=*),   intent(in) :: path    !! File to resize
             integer(c_int64_t), intent(in) :: length  !! New length in bytes
             integer                        :: ierr  !! 0 on success, nonzero on failure
+        end function
+
+        !! A file's length in bytes from `stat` alone: -1 if the path does not
+        !! exist or cannot be examined.  Preferred over `inquire(file=, size=)`
+        !! on every engine path: a name-based inquire makes the ifx runtime
+        !! resolve the real path of every connected unit, so its cost grows
+        !! with the number of open tables.  Reports the on-disk length, as the
+        !! inquire did; bytes still buffered in a unit are not counted either way.
+        module function c_file_size(path) result(n)
+            character(len=*), intent(in) :: path  !! File to measure
+            integer(c_int64_t)           :: n     !! Length in bytes, -1 if absent
         end function
 
         !! Canonical absolute path of `path` — `.`/`..` folded away and,

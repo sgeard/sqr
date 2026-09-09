@@ -40,6 +40,9 @@ program bench_sqr
     integer, parameter :: SQL_REPS     = 5       ! timed scan queries
     integer, parameter :: ORDER_ROWS   = 10000   ! ORDER BY result size
     integer, parameter :: LIT_LEN      = 50000   ! long string literal (lexer)
+    integer, parameter :: DOC_TABLES   = 13      ! document-shaped store: tables...
+    integer, parameter :: DOC_ROWS     = 100     ! ...rows per table (one txn per table)
+    integer, parameter :: DOC_REPS     = 5       ! open+close cycles timed
 
     call system_clock(count_rate=clk_rate)
     call cleanup()
@@ -54,6 +57,7 @@ program bench_sqr
     call bench_delete_compact()
     call bench_text()
     call bench_sql()
+    call bench_document()
 
     call cleanup()
     print '(a)', ''
@@ -437,6 +441,88 @@ contains
         print '(a,f8.3,a,f8.2,a)', '   get_text ', secs(t2, t3), ' s  (', &
             mb / secs(t2, t3), ' MB/s)'
         print '(a)', ''
+    end subroutine
+
+    ! --- 7. Document-shaped store: many tables, few rows ----------------
+    ! What an application document looks like (2d_cad: 13 tables, an index
+    ! each, tens to hundreds of rows) as opposed to one big table.  Per-
+    ! operation costs that scale with the number of OPEN UNITS — a name-
+    ! based open or inquire makes the ifx runtime resolve the real path of
+    ! every connected unit — and per-table costs at open and close (a schema
+    ! rewrite is a temp file, fsync, rename and directory fsync) only show
+    ! at this shape.  Three figures: build the store (create tables + index,
+    ! one txn of rows each), copy it row by row into a second non-durable
+    ! store (the 2d_cad Open path, one txn), and a plain open+close cycle.
+    subroutine bench_document()
+        type(db_t) :: db, dst
+        character(len=:), allocatable :: buf
+        character(len=SQR_NAME_LEN), allocatable :: names(:)
+        character(len=16) :: tn
+        integer :: rs, i, t, ti, r
+        integer(int32) :: rid, got
+        integer(int64) :: t0, t1
+        character(len=*), parameter :: COPYDIR = 'bench_db_copy'
+        print '(a,i0,a,i0,a)', '-- 7. document-shaped store (', DOC_TABLES, ' tables x ', DOC_ROWS, ' rows, one index each) --'
+        call cleanup();  rs = c_rmtree(COPYDIR)
+        call system_clock(t0)
+        call db_open(db, DBDIR, rs);                                   call die('doc open', rs)
+        do t = 1, DOC_TABLES
+            write(tn, '(a,i0)') 't', t
+            call db_create_table(db, trim(tn), bench_cols(), rs);     call die('doc create', rs)
+            call db_create_index(db, trim(tn), 'k', rs);              call die('doc index', rs)
+            ti = db_table_index(db, trim(tn))
+            call row_alloc(buf, db%tables(ti)%record_size)
+            call db_begin(db, rs);                                     call die('doc begin', rs)
+            do i = 1, DOC_ROWS
+                call row_set_status(buf, ROW_ALIVE)
+                call row_set_int(buf, db%tables(ti)%cols(1), int(i, int32))
+                call row_set_int(buf, db%tables(ti)%cols(2), int(DOC_ROWS - i, int32))
+                call db_insert(db, trim(tn), buf, rid, rs)
+                if (rs /= SQR_OK) call die('doc insert', rs)
+            end do
+            call db_commit(db, rs);                                    call die('doc commit', rs)
+        end do
+        call db_close(db)
+        call system_clock(t1)
+        print '(a,f8.3,a)', '   build (durable):            ', secs(t0, t1), ' s'
+
+        ! Row-by-row copy into a fresh non-durable store, one transaction.
+        call system_clock(t0)
+        call db_open(db, DBDIR, rs, readonly=.true.);                 call die('doc src open', rs)
+        call db_open(dst, COPYDIR, rs, durable=.false.);                  call die('doc dst open', rs)
+        call db_list_tables(db, names)
+        do t = 1, size(names)
+            call db_create_table(dst, trim(names(t)), bench_cols(), rs); call die('doc copy create', rs)
+            call db_create_index(dst, trim(names(t)), 'k', rs);          call die('doc copy index', rs)
+        end do
+        call db_begin(dst, rs);                                        call die('doc copy begin', rs)
+        do t = 1, size(names)
+            ti = db_table_index(db, trim(names(t)))
+            call row_alloc(buf, db%tables(ti)%record_size)
+            do r = 1, db%tables(ti)%next_id - 1
+                call db_get(db, trim(names(t)), int(r, int32), buf, rs)
+                if (rs /= SQR_OK) cycle
+                call db_insert(dst, trim(names(t)), buf, got, rs)
+                if (rs /= SQR_OK) call die('doc copy insert', rs)
+            end do
+        end do
+        call db_commit(dst, rs);                                       call die('doc copy commit', rs)
+        call db_close(dst)
+        call db_close(db)
+        call system_clock(t1)
+        print '(a,f8.3,a)', '   copy (one txn, non-durable):', secs(t0, t1), ' s'
+
+        ! Plain open + close, nothing changed: should touch nothing on disk.
+        call system_clock(t0)
+        do r = 1, DOC_REPS
+            call db_open(db, DBDIR, rs);                               call die('doc reopen', rs)
+            call db_close(db)
+        end do
+        call system_clock(t1)
+        print '(a,f8.3,a,i0,a)', '   open+close (unchanged):     ', &
+            1.0e3_real64 * secs(t0, t1) / real(DOC_REPS, real64), ' ms  (mean of ', DOC_REPS, ')'
+        print '(a)', ''
+        rs = c_rmtree(COPYDIR)
     end subroutine
 
     ! --- reporting helpers --------------------------------------------

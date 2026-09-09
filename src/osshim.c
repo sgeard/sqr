@@ -135,6 +135,12 @@ int sqr_os_fsync_dir(const char *p) {
     return 0;
 }
 
+int64_t sqr_os_file_size(const char *p) {
+    struct _stat64 st;
+    if (_stat64(p, &st) != 0) return -1;
+    return (int64_t)st.st_size;
+}
+
 int sqr_os_truncate(const char *p, int64_t length) {
     int fd = _open(p, _O_RDWR);
     int rc;
@@ -405,6 +411,17 @@ int sqr_os_fsync_path(const char *p) {
 
 int sqr_os_fsync_dir(const char *p) {
     return fsync_via_open(p);
+}
+
+/* Size of a file by stat(2) alone: -1 if absent or unreadable.  The engine
+   uses this rather than Fortran inquire(file=, size=) because the ifx
+   runtime answers a name-based inquire (or open) by resolving the real path
+   of EVERY connected unit to test for an existing connection, a readlink per
+   path component each — a cost that grows with the number of open tables. */
+int64_t sqr_os_file_size(const char *p) {
+    struct stat st;
+    if (stat(p, &st) != 0) return -1;
+    return (int64_t)st.st_size;
 }
 
 int sqr_os_truncate(const char *p, int64_t length) {

@@ -116,6 +116,14 @@ contains
         ierr = int(sqr_os_fsync_dir(p))
     end function
 
+    module function c_file_size(path) result(n)
+        character(len=*), intent(in) :: path
+        integer(c_int64_t)           :: n
+        character(kind=c_char) :: p(len_trim(path) + 1)
+        call to_cstr(path, p)
+        n = sqr_os_file_size(p)
+    end function
+
     module function c_truncate(path, length) result(ierr)
         character(len=*),   intent(in) :: path
         integer(c_int64_t), intent(in) :: length

@@ -7,7 +7,7 @@
 ! lookup helpers.
 
 submodule (sqr:sqr_base) sqr_table
-    use :: clib_wrap, only: c_remove, c_lock_try, c_lock_share   ! c_rename/c_fsync_dir host-associated from sqr_base
+    use :: clib_wrap, only: c_remove, c_lock_try, c_lock_share   ! c_rename/c_fsync_dir/c_file_size host-associated from sqr_base
     implicit none
 contains
 
@@ -165,7 +165,7 @@ contains
                                 ! is recounted below.
                                 stale_id: block
                                     integer(int64) :: fsize
-                                    inquire(file=data_path(db, t%name), size=fsize)
+                                    fsize = c_file_size(data_path(db, t%name))
                                     t%next_id = int(fsize / t%record_size, int32) + 1_int32
                                 end block stale_id
                             end if
@@ -271,7 +271,7 @@ contains
                 ! Schema counters (next_id/live_count) are flushed only here,
                 ! so capture the first write failure for the caller — but keep
                 ! closing everything so units are not leaked.
-                if (.not. db%readonly) then
+                if (.not. db%readonly .and. schema_stale(t)) then
                     call write_schema(db, t, rs)
                     if (rs /= SQR_OK .and. first == SQR_OK) first = rs
                 end if
@@ -301,19 +301,23 @@ contains
             end associate
         end do close_tables
         if (.not. db%readonly) then
-            call write_catalog(db, rs)
-            if (rs /= SQR_OK .and. first == SQR_OK) first = rs
+            if (db%catalog_dirty) then
+                call write_catalog(db, rs)
+                if (rs /= SQR_OK .and. first == SQR_OK) first = rs
+            end if
             ! Any in-flight transaction was rolled back above, so a journal on
             ! disk is now a voided leftover: delete it so the next open does zero
             ! recovery work.  (Read-only opens never write, so they leave it.)
             del_journal: block
                 character(len=:), allocatable :: jpath
+                call jrnl_close_unit(db)
                 jpath = pathjoin(db%dir, '_journal.dat')
                 if (c_path_exists(jpath)) then
                     if (c_remove(jpath) /= 0 .and. first == SQR_OK) first = SQR_ERR
                 end if
             end block del_journal
         end if
+        call jrnl_close_unit(db)      ! a read-only handle never opened one; harmless
         if (allocated(db%tables)) deallocate(db%tables)
         if (allocated(db%dir))    deallocate(db%dir)
         ! Release the advisory lock (closing its descriptor/handle).
@@ -352,7 +356,7 @@ contains
         ! db_resume can reopen from the same in-memory schemas.
         quiesce_tables: do i = 1, db%ntables
             associate (t => db%tables(i))
-                if (.not. db%readonly) then
+                if (.not. db%readonly .and. schema_stale(t)) then
                     call write_schema(db, t, rs)   ! next_id/live_count live only in memory
                     if (rs /= SQR_OK .and. first == SQR_OK) first = rs
                 end if
@@ -373,10 +377,11 @@ contains
                 end do quiesce_indices
             end associate
         end do quiesce_tables
-        if (.not. db%readonly) then
+        if (.not. db%readonly .and. db%catalog_dirty) then
             call write_catalog(db, rs)
             if (rs /= SQR_OK .and. first == SQR_OK) first = rs
         end if
+        call jrnl_close_unit(db)     ! reopened lazily by the next arm or void
         ! Quiesced even on a partial failure: some units are already closed, so
         ! db_resume (or db_close) is the only safe continuation either way.
         db%quiesced = .true.
@@ -531,6 +536,7 @@ contains
         new_tables(db%ntables + 1) = tbl
         call move_alloc(new_tables, db%tables)
         db%ntables = db%ntables + 1
+        db%catalog_dirty = .true.
 
         call write_catalog(db, rs)
         if (rs /= SQR_OK) then
@@ -538,6 +544,7 @@ contains
             ! of memory (the slot beyond ntables is never referenced) and
             ! remove its files so no orphans remain.
             db%ntables = db%ntables - 1
+            db%catalog_dirty = .false.      ! memory matches the unchanged file again
             call discard_new_table(db, tbl)
             call report(db, rs, stat, errmsg)
             return
@@ -606,6 +613,7 @@ contains
         nt(idx:db%ntables-1) = db%tables(idx+1:db%ntables)  ! constructor temp
         call move_alloc(nt, db%tables)
         db%ntables = db%ntables - 1
+        db%catalog_dirty = .true.
 
         call write_catalog(db, rs)
         if (rs /= SQR_OK) then

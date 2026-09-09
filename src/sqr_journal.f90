@@ -217,7 +217,7 @@ contains
         class(db_t), intent(inout)        :: db
         integer,    intent(out), optional :: stat
         character(len=:), allocatable :: newbytes
-        integer                       :: u, ios, i, st, ck
+        integer                       :: u, ios, st, ck
         integer(int64)                :: newplen
         logical                       :: fresh
         st = SQR_OK
@@ -241,8 +241,7 @@ contains
         call serialise_range(db%jrnl, db%jrnl%nrec_durable + 1, db%jrnl%nrec, newbytes)
         newplen = db%jrnl%plen_durable + int(len(newbytes), int64)
         ck      = checksum_fold(db%jrnl%cksum_acc, newbytes)   ! extends the prefix's checksum
-        open(newunit=u, file=db%jrnl%path, access='stream', form='unformatted', &
-             status='old', action='readwrite', iostat=ios)
+        call jrnl_unit(db, u, ios)
         call io_check(ios)
         if (ios /= 0) then
             if (present(stat)) stat = SQR_ERR
@@ -267,7 +266,6 @@ contains
             end if
         end if
         if (ios /= 0) then
-            close(u, iostat=i)
             if (present(stat)) stat = SQR_ERR
             return
         end if
@@ -277,7 +275,6 @@ contains
         call io_check(ios)
         if (ios == 0) flush(u, iostat=ios)
         call io_check(ios)
-        close(u, iostat=i)
         if (ios /= 0) then
             if (present(stat)) stat = SQR_ERR
             return
@@ -857,6 +854,11 @@ contains
         integer :: u, ios
         allocate(character(len=int(JPRESIZE)) :: zeros)
         zeros = repeat(char(0), int(JPRESIZE))
+        ! A unit may already be connected (recovery voided a leftover journal
+        ! through it at open): a replace-open of a connected file is an error,
+        ! so let it go first.  The replaced file is then held open for the
+        ! session (see jrnl_unit).
+        call jrnl_close_unit(db)
         open(newunit=u, file=db%jrnl%path, access='stream', form='unformatted', &
              status='replace', action='readwrite', iostat=ios)
         call io_check(ios)
@@ -864,10 +866,10 @@ contains
             st = SQR_ERR
             return
         end if
+        db%jrnl%unit = u
         write(u, pos=1, iostat=ios) zeros
         call io_check(ios)
         if (ios == 0) flush(u, iostat=ios)
-        close(u)
         if (ios /= 0) then
             st = SQR_ERR
             return
@@ -885,11 +887,10 @@ contains
     ! Write a JSTATE_VOID header + fsync — the durable invalidation used at
     ! commit, on rollback, and after recovery.
     subroutine void_header(db, st)
-        class(db_t), intent(in)    :: db
+        class(db_t), intent(inout) :: db
         integer,     intent(inout) :: st
         integer :: u, ios
-        open(newunit=u, file=db%jrnl%path, access='stream', form='unformatted', &
-             status='old', action='readwrite', iostat=ios)
+        call jrnl_unit(db, u, ios)
         call io_check(ios)
         if (ios /= 0) then
             st = SQR_ERR
@@ -898,7 +899,6 @@ contains
         write(u, pos=1, iostat=ios) JMAGIC, JFMT, JSTATE_VOID, 0, 0, 0_int64
         call io_check(ios)
         if (ios == 0) flush(u, iostat=ios)
-        close(u)
         if (ios /= 0) then
             st = SQR_ERR
             return
@@ -908,6 +908,33 @@ contains
             call io_check(ios)
             if (ios /= 0) st = SQR_ERR
         end if
+    end subroutine
+
+    ! The journal's stream unit, opened on first use and HELD for the session:
+    ! presize creates the file through it, every arm and void writes through
+    ! it, and only db_close/db_quiesce let it go (jrnl_close_unit).  It used to
+    ! be opened and closed around each arm and each void — two name-based opens
+    ! per base write — and a name-based open makes the ifx runtime resolve the
+    ! real path of every connected unit, a cost that grows with the table count.
+    ! The fsyncs still go by path (c_fsync_path) while the unit is connected,
+    ! as the phase-1 payload fsync always has.
+    subroutine jrnl_unit(db, u, ios)
+        class(db_t), intent(inout) :: db
+        integer,     intent(out)   :: u, ios
+        ios = 0
+        if (db%jrnl%unit == -1) then
+            open(newunit=db%jrnl%unit, file=db%jrnl%path, access='stream', &
+                 form='unformatted', status='old', action='readwrite', iostat=ios)
+            if (ios /= 0) db%jrnl%unit = -1
+        end if
+        u = db%jrnl%unit
+    end subroutine
+
+    module subroutine jrnl_close_unit(db)
+        class(db_t), intent(inout) :: db
+        integer :: ios
+        if (db%jrnl%unit /= -1) close(db%jrnl%unit, iostat=ios)
+        db%jrnl%unit = -1
     end subroutine
 
     ! True if an equal undo record was already captured this transaction.
@@ -1198,11 +1225,12 @@ contains
 
     ! ---- raw byte file IO ----
 
+    ! On-disk length by stat (-1 if absent).  c_file_size, never inquire: the
+    ! ifx runtime answers a name-based inquire by resolving the real path of
+    ! every connected unit, and this probe runs on every pre-image capture.
     integer(int64) function file_len(path) result(n)
         character(len=*), intent(in) :: path
-        integer :: ios
-        inquire(file=path, size=n, iostat=ios)
-        if (ios /= 0) n = -1_int64
+        n = c_file_size(path)
     end function
 
     ! Read `length` bytes at `offset`.  The length can be derived from on-disk

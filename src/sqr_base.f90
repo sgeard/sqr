@@ -43,7 +43,7 @@
 submodule (sqr) sqr_base
     use, intrinsic :: iso_fortran_env, only: error_unit  ! int8/int32/int64/real64 via host association from sqr
     use, intrinsic :: ieee_arithmetic, only: ieee_is_nan
-    use :: clib_wrap, only: c_mkdir, c_path_exists, c_lock_release, &
+    use :: clib_wrap, only: c_mkdir, c_path_exists, c_file_size, c_lock_release, &
                             c_rename, c_fsync_path, c_fsync_dir, c_remove
     use :: sqr_fault, only: io_check
     use :: b_tree, only: btree_t, bt_open, bt_close, bt_discard, bt_reload, bt_sync, bt_insert, &
@@ -273,10 +273,12 @@ contains
 
     ! ===== Filesystem probe =====
 
+    ! By access(2), never inquire: a name-based inquire costs the ifx runtime a
+    ! real-path resolution of every connected unit (see c_file_size).
     function file_exists(p) result(ok)
         character(len=*), intent(in) :: p
         logical :: ok
-        inquire(file=p, exist=ok)
+        ok = c_path_exists(p)
     end function
 
     ! Create `path` and every missing parent (mkdir -p semantics) via libc
@@ -591,29 +593,39 @@ contains
     ! column layout, so an in-place `status='replace'` truncate that a crash
     ! caught mid-write would lose the table (or the whole db) with the row data
     ! still intact.
+    ! A non-durable store (db_open durable=.false.) keeps the rename — the
+    ! running process never sees a torn file — and skips both fsyncs, as it
+    ! does everywhere else: the host rebuilds such a store or syncs it itself.
     subroutine atomic_replace(db, tmp, final, stat)
         type(db_t),       intent(in)  :: db
         character(len=*), intent(in)  :: tmp, final
         integer,          intent(out) :: stat
         integer :: ios
-        ios = c_fsync_path(tmp)
-        call io_check(ios)
-        if (ios /= 0) then
-            stat = SQR_ERR
-            return
+        if (db%durable) then
+            ios = c_fsync_path(tmp)
+            call io_check(ios)
+            if (ios /= 0) then
+                stat = SQR_ERR
+                return
+            end if
         end if
         if (c_rename(tmp, final) /= 0) then
             stat = SQR_ERR
             return
         end if
-        ios = c_fsync_dir(db%dir)
-        call io_check(ios)
-        stat = merge(SQR_ERR, SQR_OK, ios /= 0)
+        stat = SQR_OK
+        if (db%durable) then
+            ios = c_fsync_dir(db%dir)
+            call io_check(ios)
+            stat = merge(SQR_ERR, SQR_OK, ios /= 0)
+        end if
     end subroutine
 
+    ! Clears db%catalog_dirty on success, so db_close/db_quiesce know the
+    ! on-disk table list is current and need not rewrite it.
     subroutine write_catalog(db, stat)
-        type(db_t), intent(in)  :: db
-        integer,    intent(out) :: stat
+        type(db_t), intent(inout) :: db
+        integer,    intent(out)   :: stat
         integer :: u, ios, i
         character(len=4) :: magic
         character(len=SQR_NAME_LEN) :: nm
@@ -648,14 +660,19 @@ contains
             return
         end if
         call atomic_replace(db, tmp, final, stat)
+        if (stat == SQR_OK) db%catalog_dirty = .false.
     end subroutine
 
     ! ===== Schema I/O =====
 
+    ! On success the counters just written are remembered (disk_next_id /
+    ! disk_live_count), so a close or quiesce rewrites the schema only when
+    ! the in-memory counters have moved since — a clean open+close touches
+    ! nothing on disk.  Column and index changes always write immediately.
     subroutine write_schema(db, tbl, stat)
-        type(db_t),    intent(in)  :: db
-        type(table_t), intent(in)  :: tbl
-        integer,       intent(out) :: stat
+        type(db_t),    intent(in)    :: db
+        type(table_t), intent(inout) :: tbl
+        integer,       intent(out)   :: stat
         integer :: u, ios, i, m
         character(len=4) :: magic
         character(len=SQR_NAME_LEN) :: nm
@@ -710,7 +727,17 @@ contains
             return
         end if
         call atomic_replace(db, tmp, final, stat)
+        if (stat == SQR_OK) then
+            tbl%disk_next_id    = tbl%next_id
+            tbl%disk_live_count = tbl%live_count
+        end if
     end subroutine
+
+    ! True when the counters have moved since the schema file last held them.
+    pure logical function schema_stale(tbl) result(yes)
+        type(table_t), intent(in) :: tbl
+        yes = tbl%next_id /= tbl%disk_next_id .or. tbl%live_count /= tbl%disk_live_count
+    end function
 
     subroutine read_schema(db, name, tbl, stat, errmsg)
         type(db_t),                  intent(in)            :: db
@@ -763,6 +790,8 @@ contains
             stat = SQR_ERR
             return
         end if
+        tbl%disk_next_id    = tbl%next_id       ! the file's image, for schema_stale
+        tbl%disk_live_count = tbl%live_count
         if (tbl%schema_version /= SQR_SCHEMA_VERSION) then
             close(u)
             stat = SQR_VERSION
@@ -1517,7 +1546,7 @@ contains
             if (db%jrnl%active) then
                 capture: block
                     integer(int64) :: isz
-                    inquire(file=index_path(db, t%name, j), size=isz)
+                    isz = c_file_size(index_path(db, t%name, j))
                     call jrnl_log_extend(db, index_relpath(t%name, j), stat)
                     ! Whole file from the 1-based stream start (pos 1, not 0).
                     if (stat == SQR_OK .and. isz > 0) &

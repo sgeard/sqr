@@ -16,7 +16,7 @@
 program utest_journal
     use, intrinsic :: iso_fortran_env, only: int32, int64
     use sqr
-    use clib_wrap, only: c_rmtree, c_truncate, c_lock_release
+    use clib_wrap, only: c_rmtree, c_truncate, c_file_size, c_lock_release
     implicit none
 
     integer :: pass = 0, fail = 0
@@ -197,12 +197,12 @@ contains
         close(u)
     end function jread_file
 
+    ! By stat, not inquire: a unit a stale (crash stand-in) handle still holds
+    ! would make inquire answer from that connection, not from the disk.
     function jfile_size(path) result(n)
         character(len=*), intent(in) :: path
         integer(int64) :: n
-        integer :: io
-        inquire(file=path, size=n, iostat=io)
-        if (io /= 0) n = -1_int64
+        n = c_file_size(path)
     end function jfile_size
 
 end program utest_journal
