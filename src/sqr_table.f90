@@ -11,12 +11,13 @@ submodule (sqr:sqr_base) sqr_table
     implicit none
 contains
 
-    module subroutine db_open(db, dir, stat, errmsg, readonly)
+    module subroutine db_open(db, dir, stat, errmsg, readonly, durable)
         class(db_t),       intent(out)             :: db
         character(len=*), intent(in)              :: dir
         integer,          intent(out),  optional  :: stat
         character(len=*), intent(inout), optional :: errmsg
         logical,          intent(in),   optional  :: readonly
+        logical,          intent(in),   optional  :: durable
         integer :: rs, i, j, n
         character(len=SQR_NAME_LEN), allocatable :: names(:)
         character(len=:), allocatable :: ndir
@@ -40,6 +41,8 @@ contains
             db%opened   = .false.
             db%readonly = .false.
             if (present(readonly)) db%readonly = readonly
+            db%durable  = .true.
+            if (present(durable)) db%durable = durable
 
             ! Read-only opens require an initialised database (catalog file
             ! must exist); read-write opens create the directory if needed.

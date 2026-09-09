@@ -261,8 +261,10 @@ contains
         if (ios == 0) flush(u, iostat=ios)
         call io_check(ios)
         if (ios == 0) then
-            ios = c_fsync_path(db%jrnl%path)     ! payload durable
-            call io_check(ios)
+            if (db%durable) then
+                ios = c_fsync_path(db%jrnl%path)     ! payload durable
+                call io_check(ios)
+            end if
         end if
         if (ios /= 0) then
             close(u, iostat=i)
@@ -280,9 +282,11 @@ contains
             if (present(stat)) stat = SQR_ERR
             return
         end if
-        ios = c_fsync_path(db%jrnl%path)         ! header durable
-        call io_check(ios)
-        if (ios /= 0) st = SQR_ERR
+        if (db%durable) then
+            ios = c_fsync_path(db%jrnl%path)     ! header durable
+            call io_check(ios)
+            if (ios /= 0) st = SQR_ERR
+        end if
         ! The payload+header bytes are now durable, so the trio may advance to name
         ! them (the dir fsync below only affects the fresh file's directory entry,
         ! not these bytes).  Reached only on a clean header fsync; any earlier
@@ -293,7 +297,7 @@ contains
             db%jrnl%nrec_durable = db%jrnl%nrec
             db%jrnl%cksum_acc    = ck
         end if
-        if (fresh) then
+        if (fresh .and. db%durable) then
             ios = c_fsync_dir(db%dir)        ! make the new file durable
             call io_check(ios)
             if (ios /= 0) st = SQR_ERR
@@ -633,9 +637,11 @@ contains
                 end if
                 nseen = nseen + 1
                 first(nseen) = i
-                ios = c_fsync_path(pathjoin(db%dir, db%jrnl%recs(i)%path))
-                call io_check(ios)
-                if (ios /= 0) st = SQR_ERR
+                if (db%durable) then
+                    ios = c_fsync_path(pathjoin(db%dir, db%jrnl%recs(i)%path))
+                    call io_check(ios)
+                    if (ios /= 0) st = SQR_ERR
+                end if
             end do
         end block dedup_block
     end subroutine
@@ -834,9 +840,11 @@ contains
                 if (ios /= 0) st = SQR_ERR
             end if
         end select
-        ios = c_fsync_path(full)
-        call io_check(ios)
-        if (ios /= 0) st = SQR_ERR
+        if (db%durable) then
+            ios = c_fsync_path(full)
+            call io_check(ios)
+            if (ios /= 0) st = SQR_ERR
+        end if
     end subroutine
 
     ! Create the journal file and pre-write it to JPRESIZE zero bytes, so a
@@ -895,9 +903,11 @@ contains
             st = SQR_ERR
             return
         end if
-        ios = c_fsync_path(db%jrnl%path)
-        call io_check(ios)
-        if (ios /= 0) st = SQR_ERR
+        if (db%durable) then
+            ios = c_fsync_path(db%jrnl%path)
+            call io_check(ios)
+            if (ios /= 0) st = SQR_ERR
+        end if
     end subroutine
 
     ! True if an equal undo record was already captured this transaction.

@@ -42,6 +42,7 @@ program utest_sqr
     call test_open_corruption_paths()
     call test_catalog_traversal_name()
     call test_crash_recovery()
+    call test_durable_off()
     call test_version_check()
     call test_schema_corruption()
     call test_text()
@@ -4837,6 +4838,48 @@ contains
 
         call db_close(a)
         ios = c_rmtree(EDIR)
+    end subroutine
+
+    ! durable=.false. (v1.4.0): the journal fsyncs are skipped - writes and
+    ! flushes are kept, so txns, rollback and reopen behave identically; only
+    ! crash-durability is traded away (for scratch stores a host can rebuild).
+    subroutine test_durable_off()
+        type(db_t) :: a
+        character(len=*), parameter :: DDIR = 'utest_sqr_dur'
+        character(len=:), allocatable :: buf
+        integer :: rs, i, got, ios
+        integer(int32) :: rid
+        ios = c_rmtree(DDIR)
+        call db_open(a, DDIR, rs, durable=.false.)
+        call check(rs == SQR_OK .and. .not. a%durable, 'durable off: opens, flag held')
+        call db_create_table(a, 't', [column_t('v', DT_INT, 4)], rs)
+        call check(rs == SQR_OK, 'durable off: create table')
+        call row_alloc(buf, a%tables(1)%record_size)
+        call db_begin(a, rs)
+        do i = 1, 3
+            call row_set_int(buf, a%tables(1)%cols(1), int(10 * i, int32))
+            call db_insert(a, 't', buf, rid, rs)
+        end do
+        call db_commit(a, rs)
+        call check(rs == SQR_OK, 'durable off: a txn commits')
+        call db_begin(a, rs)
+        call row_set_int(buf, a%tables(1)%cols(1), 99_int32)
+        call db_insert(a, 't', buf, rid, rs)
+        call db_rollback(a, rs)
+        call check(rs == SQR_OK, 'durable off: a rollback still works')
+        call db_get(a, 't', 2_int32, buf, rs)
+        got = row_get_int(buf, a%tables(1)%cols(1))
+        call check(rs == SQR_OK .and. got == 20, 'durable off: committed rows read back')
+        call db_get(a, 't', 4_int32, buf, rs)
+        call check(rs /= SQR_OK, 'durable off: the rolled-back row is gone')
+        call db_close(a, rs)
+        call db_open(a, DDIR, rs)                  ! reopen with the default
+        call check(rs == SQR_OK .and. a%durable, 'durable off: reopen defaults durable')
+        call db_get(a, 't', 3_int32, buf, rs)
+        got = row_get_int(buf, a%tables(1)%cols(1))
+        call check(rs == SQR_OK .and. got == 30, 'durable off: data survives reopen')
+        call db_close(a)
+        ios = c_rmtree(DDIR)
     end subroutine
 
 end program utest_sqr

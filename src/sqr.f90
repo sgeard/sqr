@@ -278,6 +278,10 @@ module sqr
         integer                       :: ntables  = 0  !! Number of open tables
         logical                       :: opened   = .false.  !! `.true.` between `db_open` and `db_close`
         logical                       :: readonly = .false.  !! `.true.` if opened read-only
+        logical                       :: durable  = .true.   !! `.false.` skips the JOURNAL fsyncs
+        !!                                                      (writes + flush kept): for a scratch
+        !!                                                      or cache store the host can rebuild.
+        !!                                                      Schema/catalog replace stays durable.
         logical                       :: quiesced = .false.  !! `.true.` between `db_quiesce` and `db_resume` (units closed)
         integer                       :: generation = 0  !! Bumped by every mutating call; cursors snapshot it
         integer(c_int64_t)            :: lock_tok = -1  !! Advisory-lock token held while open (-1 = none)
@@ -491,12 +495,16 @@ module sqr
         !! would otherwise be leaked with the files left open.  `db_open`
         !! cannot defend against this internally — the handle is already
         !! wiped on entry.
-        module subroutine db_open(db, dir, stat, errmsg, readonly)
+        module subroutine db_open(db, dir, stat, errmsg, readonly, durable)
             class(db_t),       intent(out)             :: db  !! Database handle (overwritten)
             character(len=*), intent(in)              :: dir  !! Database directory name
             integer,          intent(out),  optional  :: stat  !! `SQR_OK` or an error code
             character(len=*), intent(inout), optional :: errmsg  !! Human-readable failure detail
             logical,          intent(in),   optional  :: readonly  !! Open read-only (default `.false.`)
+            logical,          intent(in),   optional  :: durable  !! `.false.` = skip the journal
+            !!                                                       fsyncs (writes + flush kept);
+            !!                                                       default `.true.`.  For scratch
+            !!                                                       stores the host can rebuild.
         end subroutine
 
         !! Close a database handle: flush schema/catalog (read-write
