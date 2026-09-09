@@ -1,6 +1,6 @@
 !! SPDX-License-Identifier: MIT
 !! Copyright (c) 2026 Simon Geard
-!! Vendored into sqr from https://github.com/sgeard/cmdgraph (fortran/src); kept in sync by hand.
+!! Vendored into sqr from https://github.com/sgeard/cmdgraph (fortran/src) at svn r1883, 2026-07-09 (after its v1.3.1 release); kept in sync by hand.
 !!
 submodule (dlist) dlist_sm
     implicit none
@@ -14,19 +14,19 @@ contains
     end function make_int_node
 
     module function make_real_node(v) result(n)
-        real(8), intent(in)   :: v
+        real(dp), intent(in)  :: v
         type(dlist_node_real) :: n
         n%data = v
     end function make_real_node
 
     module function make_real_a_node(v) result(n)
-        real(8), intent(in)     :: v(:)
+        real(dp), intent(in)    :: v(:)
         type(dlist_node_real_a) :: n
         n%data = v
     end function make_real_a_node
 
     module function make_real_m_node(v) result(n)
-        real(8), intent(in)     :: v(:,:)
+        real(dp), intent(in)    :: v(:,:)
         type(dlist_node_real_m) :: n
         n%data = v
     end function make_real_m_node
@@ -155,6 +155,27 @@ contains
 
     end subroutine remove_ll
 
+    module subroutine replace_ll(lst, idx, data)
+        class(dlist_t), intent(inout)        :: lst
+        integer, intent(in)                  :: idx
+        class(dlist_node_data_t), intent(in) :: data
+        integer                              :: i
+        type(dlist_node_t), pointer          :: this
+        if (idx < 1 .or. idx > lst%num_of_elements) then
+            return ! index out of range ignored
+        end if
+
+        ! Locate the node and reassign its data in place. Intrinsic assignment
+        ! to the allocatable polymorphic component re-fits it to data's dynamic
+        ! type, so a replacement of a different kind (e.g. int -> real) is fine.
+        this => lst%begin
+        do i = 2, idx
+            this => this%next
+        end do
+        this%data = data
+
+    end subroutine replace_ll
+
     module subroutine print_ll(lst, unit)
         use iso_fortran_env, only: output_unit
         class(dlist_t), intent(in)    :: lst
@@ -199,18 +220,6 @@ contains
         class(dlist_t), intent(in)    :: lst
         size_ll = lst%num_of_elements
     end function size_ll
-
-    integer function calc_size(lst)
-        class(dlist_t), intent(inout) :: lst
-        type(dlist_node_t), pointer   :: node
-        calc_size = 0
-        node => lst%begin
-        do
-            if (.not. associated(node)) exit
-            calc_size = calc_size + 1
-            node => node%next
-        end do
-    end function calc_size
 
     module subroutine clear_ll(lst)
         class(dlist_t), intent(inout) :: lst

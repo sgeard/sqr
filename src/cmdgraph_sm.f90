@@ -1,6 +1,6 @@
 !! SPDX-License-Identifier: MIT
 !! Copyright (c) 2026 Simon Geard
-!! Vendored into sqr from https://github.com/sgeard/cmdgraph (fortran/src); kept in sync by hand.
+!! Vendored into sqr from https://github.com/sgeard/cmdgraph (fortran/src) at svn r1883, 2026-07-09 (after its v1.3.1 release); kept in sync by hand.
 !!
 submodule (cmdgraph) cmdgraph_sm
     implicit none
@@ -24,6 +24,40 @@ contains
 
     ! ===== Construction =====
 
+    ! Common builder-method preamble: propagate any sticky build error, reject
+    ! use after finalize, and (when `state` is supplied) resolve it to an index.
+    ! Returns .false. — having set the sticky error and raised stat/errmsg — on
+    ! any failure, whereupon the caller returns immediately.  add_state omits
+    ! `state`: it does its own inverted duplicate-name check.
+    function builder_guard(this, opname, stat, errmsg, state, sidx) result(ok)
+        class(engine_t), intent(inout)                       :: this
+        character(len=*), intent(in)                         :: opname
+        integer, intent(out), optional                       :: stat
+        character(len=:), allocatable, intent(out), optional :: errmsg
+        character(len=*), intent(in), optional               :: state
+        integer, intent(out), optional                       :: sidx
+        logical                                              :: ok
+        integer                                              :: idx
+
+        ok = .false.
+        if (propagate_build_error(this, stat, errmsg)) return
+        if (this%finalized) then
+            call set_build_error(this, "cmdgraph: " // opname // ": engine already finalized")
+            call raise(this%build_error_msg, stat, errmsg)
+            return
+        end if
+        if (present(state)) then
+            idx = find_state_idx(this, state)
+            if (idx == 0) then
+                call set_build_error(this, "cmdgraph: " // opname // ": unknown state '" // state // "'")
+                call raise(this%build_error_msg, stat, errmsg)
+                return
+            end if
+            if (present(sidx)) sidx = idx
+        end if
+        ok = .true.
+    end function builder_guard
+
     module subroutine add_state_engine(this, name, prompt, stat, errmsg)
         class(engine_t), intent(inout)                       :: this
         character(len=*), intent(in)                         :: name
@@ -33,24 +67,25 @@ contains
         type(state_t), allocatable                           :: tmp(:)
         integer                                              :: n
 
-        if (propagate_build_error(this, stat, errmsg)) return
-        if (this%finalized) then
-            call set_build_error(this, "cmdgraph: add_state: engine already finalized")
-            call raise(this%build_error_msg, stat, errmsg)
-            return
-        end if
+        if (.not. builder_guard(this, "add_state", stat=stat, errmsg=errmsg)) return
         if (.not. allocated(this%states)) allocate(this%states(0))
         if (find_state_idx(this, name) /= 0) then
             call set_build_error(this, "cmdgraph: state '" // name // "' already added")
             call raise(this%build_error_msg, stat, errmsg)
             return
         end if
-        n = size(this%states)
-        allocate(tmp(n+1))
-        tmp(1:n) = this%states
-        tmp(n+1)%name = name
-        if (present(prompt)) tmp(n+1)%prompt = prompt
-        call move_alloc(tmp, this%states)
+        ! Grow the states array by capacity-doubling (mirrors the command-array
+        ! scheme in add_command), avoiding an O(N) deep copy of every state_t
+        ! per add.  state_count is the live count; finalize trims to it.
+        if (this%state_count == size(this%states)) then
+            n = max(size(this%states) * 2, 8)
+            allocate(tmp(n))
+            tmp(1:this%state_count) = this%states(1:this%state_count)
+            call move_alloc(tmp, this%states)
+        end if
+        this%state_count = this%state_count + 1
+        this%states(this%state_count)%name = name
+        if (present(prompt)) this%states(this%state_count)%prompt = prompt
         if (present(stat)) stat = 0
     end subroutine add_state_engine
 
@@ -70,18 +105,8 @@ contains
         type(command_t), allocatable                         :: tmp(:)
         type(command_t)                                      :: new_cmd
 
-        if (propagate_build_error(this, stat, errmsg)) return
-        if (this%finalized) then
-            call set_build_error(this, "cmdgraph: add_command: engine already finalized")
-            call raise(this%build_error_msg, stat, errmsg)
-            return
-        end if
-        sidx = find_state_idx(this, state)
-        if (sidx == 0) then
-            call set_build_error(this, "cmdgraph: add_command: unknown state '" // state // "'")
-            call raise(this%build_error_msg, stat, errmsg)
-            return
-        end if
+        if (.not. builder_guard(this, "add_command", state=state, sidx=sidx, &
+                                stat=stat, errmsg=errmsg)) return
 
         new_cmd%spec = spec
         new_cmd%kind = kind
@@ -90,39 +115,36 @@ contains
         if (present(proc))   new_cmd%proc   => proc
         if (present(args))   new_cmd%args   = args
 
-        select case (kind)
-        case (EDGE_ACTION)
-            if (.not. associated(new_cmd%proc)) then
-                call die_missing(this, "action", spec, "proc", stat, errmsg)
+        ! Validate that the edge kind is known and carries the components it
+        ! needs.  edge_kind_name doubles as the known-kind test (empty ⇒ unknown)
+        ! and as the spelling used in die_missing.  For do_goto/do_swap the
+        ! missing-target error must precede the missing-proc error, so target is
+        ! tested first.
+        validate_kind: block
+            logical                       :: needs_target, needs_proc
+            character(len=:), allocatable :: kname
+            kname = edge_kind_name(kind)
+            if (len(kname) == 0) then
+                write(kind_buf,'(i0)') kind
+                call set_build_error(this, "cmdgraph: unknown edge kind " // trim(kind_buf))
+                call raise(this%build_error_msg, stat, errmsg)
                 return
             end if
-        case (EDGE_GOTO)
-            if (.not. allocated(new_cmd%target)) then
-                call die_missing(this, "goto", spec, "target", stat, errmsg)
-                return
+            needs_target = any(kind == [EDGE_GOTO, EDGE_SWAP, EDGE_DO_GOTO, EDGE_DO_SWAP])
+            needs_proc   = any(kind == [EDGE_ACTION, EDGE_DO_GOTO, EDGE_DO_SWAP, EDGE_DO_POP])
+            if (needs_target) then
+                if (.not. allocated(new_cmd%target)) then
+                    call die_missing(this, kname, spec, "target", stat, errmsg)
+                    return
+                end if
             end if
-        case (EDGE_DO_GOTO)
-            if (.not. allocated(new_cmd%target)) then
-                call die_missing(this, "do_goto", spec, "target", stat, errmsg)
-                return
+            if (needs_proc) then
+                if (.not. associated(new_cmd%proc)) then
+                    call die_missing(this, kname, spec, "proc", stat, errmsg)
+                    return
+                end if
             end if
-            if (.not. associated(new_cmd%proc)) then
-                call die_missing(this, "do_goto", spec, "proc", stat, errmsg)
-                return
-            end if
-        case (EDGE_DO_POP)
-            if (.not. associated(new_cmd%proc)) then
-                call die_missing(this, "do_pop", spec, "proc", stat, errmsg)
-                return
-            end if
-        case (EDGE_POP, EDGE_QUIT)
-            continue
-        case default
-            write(kind_buf,'(i0)') kind
-            call set_build_error(this, "cmdgraph: unknown edge kind " // trim(kind_buf))
-            call raise(this%build_error_msg, stat, errmsg)
-            return
-        end select
+        end block validate_kind
 
         if (allocated(new_cmd%args)) then
             block
@@ -160,19 +182,13 @@ contains
         character(len=:), allocatable                        :: tmp(:)
         integer                                              :: sidx, n, max_len
 
-        if (propagate_build_error(this, stat, errmsg)) return
-        if (this%finalized) then
-            call set_build_error(this, "cmdgraph: add_include: engine already finalized")
-            call raise(this%build_error_msg, stat, errmsg)
-            return
-        end if
-        sidx = find_state_idx(this, state)
-        if (sidx == 0) then
-            call set_build_error(this, "cmdgraph: add_include: unknown state '" // state // "'")
-            call raise(this%build_error_msg, stat, errmsg)
-            return
-        end if
+        if (.not. builder_guard(this, "add_include", state=state, sidx=sidx, &
+                                stat=stat, errmsg=errmsg)) return
 
+        ! Grow-by-one is retained here (unlike states/commands): includes are
+        ! rare (1-2 per state), the element is a short state name rather than a
+        ! deep state_t, and the shared deferred length must be re-fitted on each
+        ! add anyway — capacity headroom would buy nothing.
         if (.not. allocated(this%states(sidx)%includes)) then
             allocate(character(len=len(included)) :: this%states(sidx)%includes(1))
             this%states(sidx)%includes(1) = included
@@ -197,18 +213,8 @@ contains
         character(len=:), allocatable, intent(out), optional :: errmsg
         integer                                              :: sidx
 
-        if (propagate_build_error(this, stat, errmsg)) return
-        if (this%finalized) then
-            call set_build_error(this, "cmdgraph: set_on_enter: engine already finalized")
-            call raise(this%build_error_msg, stat, errmsg)
-            return
-        end if
-        sidx = find_state_idx(this, state)
-        if (sidx == 0) then
-            call set_build_error(this, "cmdgraph: set_on_enter: unknown state '" // state // "'")
-            call raise(this%build_error_msg, stat, errmsg)
-            return
-        end if
+        if (.not. builder_guard(this, "set_on_enter", state=state, sidx=sidx, &
+                                stat=stat, errmsg=errmsg)) return
         this%states(sidx)%on_enter => proc
         if (present(stat)) stat = 0
     end subroutine set_on_enter_engine
@@ -235,6 +241,20 @@ contains
         if (.not. allocated(this%states)) then
             call raise("cmdgraph: cannot finalize: no states defined", stat, errmsg)
             return
+        end if
+
+        ! Trim the states array from build capacity (add_state doubles) to the
+        ! exact count, so every `size(this%states)` loop below — snapshot,
+        ! transform, rollback — sees only real states.  Done before the
+        ! snapshot; a failed finalize leaves the array trimmed but unfinalized,
+        ! and a retry re-grows it via add_state.
+        if (this%state_count < size(this%states)) then
+            trim_states: block
+                type(state_t), allocatable :: kept(:)
+                allocate(kept(this%state_count))
+                kept(1:this%state_count) = this%states(1:this%state_count)
+                call move_alloc(kept, this%states)
+            end block trim_states
         end if
 
         ! Snapshot the per-state command arrays before any mutation. finalize is
@@ -265,12 +285,19 @@ contains
                 end associate
             end do
 
-            ! Parse every command's spec into req/opt
+            ! Parse every command's spec into req/opt/full and cache the rest-arg
+            ! slot.  Done before the include-merge so these caches ride through
+            ! merge_commands' whole-command copy (only target_idx, which needs
+            ! the merged graph, is deferred to the target-validation pass).
             do i = 1, size(this%states)
                 do j = 1, size(this%states(i)%commands)
-                    call parse_spec(this%states(i)%commands(j)%spec, &
-                                    this%states(i)%commands(j)%req, &
-                                    this%states(i)%commands(j)%opt)
+                    associate (cmd => this%states(i)%commands(j))
+                        call parse_spec(cmd%spec, cmd%req, cmd%opt, cmd%full)
+                        if (allocated(cmd%args)) then
+                            if (size(cmd%args) > 0) &
+                                cmd%rest_idx = findloc(cmd%args%kind, ARG_REST, dim=1)
+                        end if
+                    end associate
                 end do
             end do
 
@@ -300,11 +327,13 @@ contains
                 call move_alloc(merged, this%states(i)%commands)
             end do
 
-            ! Validate goto/do_goto targets
+            ! Validate goto/do_goto/swap/do_swap targets
             do i = 1, size(this%states)
                 do j = 1, size(this%states(i)%commands)
-                    if (this%states(i)%commands(j)%kind == EDGE_GOTO .or. &
-                        this%states(i)%commands(j)%kind == EDGE_DO_GOTO) then
+                    if (this%states(i)%commands(j)%kind == EDGE_GOTO    .or. &
+                        this%states(i)%commands(j)%kind == EDGE_DO_GOTO .or. &
+                        this%states(i)%commands(j)%kind == EDGE_SWAP    .or. &
+                        this%states(i)%commands(j)%kind == EDGE_DO_SWAP) then
                         tidx = find_state_idx(this, this%states(i)%commands(j)%target)
                         if (tidx == 0) then
                             emsg = "cmdgraph: state '" // this%states(i)%name // &
@@ -322,13 +351,17 @@ contains
                             ok = .false.
                             exit transform
                         end if
+                        ! Cache the resolved index so apply_edge/dfs skip the
+                        ! per-transition find_state_idx scan (E1).
+                        this%states(i)%commands(j)%target_idx = tidx
                     end if
                 end do
             end do
 
             ! Validate DAG-ness of forward edges (goto/do_goto) between concrete
-            ! states. pop is the return path; abstract states are command
-            ! mix-ins, not nodes.
+            ! states. pop is the return path; swap/do_swap replace the top frame
+            ! (pop-then-push) so they are inherently cyclic and exempt too;
+            ! abstract states are command mix-ins, not nodes.
             call find_cycle(this, has_cycle, cycle_msg)
             if (has_cycle) then
                 emsg = cycle_msg
@@ -483,7 +516,7 @@ contains
         character(len=*), intent(in)           :: line
         integer                                :: rc
         character(len=:), allocatable          :: cmd, rest
-        integer                                :: n_matches, match_idx
+        integer                                :: n_matches, match_idx, sidx_cur
         type(dlist_t)                          :: args
 
         if (.not. this%is_running()) then
@@ -508,71 +541,80 @@ contains
                 rc = RC_UNKNOWN
             end if
         case (1)
-            block
-                integer                       :: sidx_cur, rest_idx, n_lead
-                logical                       :: ok
-                character(len=:), allocatable :: vmsg, tail, lead_src
-                sidx_cur = this%stack(this%stack_top)%state_idx
-                rest_idx = 0
-                if (allocated(this%states(sidx_cur)%commands(match_idx)%args)) then
-                    associate (cargs => this%states(sidx_cur)%commands(match_idx)%args)
-                        if (size(cargs) > 0) then
-                            if (cargs(size(cargs))%kind == ARG_REST) &
-                                rest_idx = size(cargs)
-                        end if
-                    end associate
-                end if
-
-                if (rest_idx > 0) then
-                    ! Spec ends in a rest slot: tokenise only the leading
-                    ! structured args, then take the remainder verbatim.
-                    n_lead = rest_idx - 1
-                    call parse_args_lead(rest, n_lead, args, tail)
-                    ! Quote balance only constrains the structured lead; the
-                    ! rest portion is free text and may contain a lone '"'.
-                    lead_src = rest(1 : len(rest) - len(tail))
-                    if (.not. has_balanced_quotes(lead_src)) then
-                        call emit_error(this, "unmatched quote in arguments")
-                        rc = RC_ERROR
-                        call args%clear()
-                        return
-                    end if
-                    tail = strip_leading_arg_space(tail)
-                    if (len(tail) > 0) call args%append(char_node(tail))
-                else
-                    if (.not. has_balanced_quotes(rest)) then
-                        call emit_error(this, "unmatched quote in arguments")
-                        rc = RC_ERROR
-                        call args%clear()
-                        return
-                    end if
-                    call parse_args(rest, args)
-                end if
-
-                if (allocated(this%states(sidx_cur)%commands(match_idx)%args)) then
-                    call validate_args( &
-                        this%states(sidx_cur)%commands(match_idx)%args, &
-                        args, ok, vmsg)
-                    if (.not. ok) then
-                        call emit_error(this, vmsg)
-                        rc = RC_ERROR
-                        call args%clear()
-                        return
-                    end if
-                    ! Post-validate normalisation: a token parsed as integer in
-                    ! a real slot is promoted to real(8) so the action receives
-                    ! a real-typed node (parity with Tcl/C++).
-                    call normalise_int_to_real( &
-                        this%states(sidx_cur)%commands(match_idx)%args, args)
-                end if
-            end block
-            rc = apply_edge(this, match_idx, args)
+            sidx_cur = this%stack(this%stack_top)%state_idx
+            rc = parse_and_validate(this, sidx_cur, match_idx, rest, args)
+            if (rc == RC_OK) rc = apply_edge(this, match_idx, args)
+            ! Single cleanup point (Q7).  dlist_t has final :: finalize_ll so
+            ! args is freed on scope exit anyway; this explicit clear is
+            ! belt-and-braces against historic gfortran local-finalization gaps
+            ! and is kept deliberately — do not "simplify" it away.  On the
+            ! parse/validate error path parse_and_validate returns a
+            ! populated-then-abandoned list; this same clear cleans it up.
             call args%clear()
         case default
             call report_ambiguous(this, cmd)
             rc = RC_AMBIGUOUS
         end select
     end function dispatch_engine
+
+    ! Parse `rest` into `args` for the single matched command and validate it
+    ! against the command's arg spec (R6).  Returns RC_OK when args are ready
+    ! for apply_edge, or RC_ERROR (having emitted the message) on an unbalanced
+    ! quote or a failed validation.  `args` is intent(out): it is reset on
+    ! entry and, on an error return, left populated for the caller's single
+    ! clear.  Check order is load-bearing: for a rest slot the lead-prefix quote
+    ! balance is tested before the tail is stripped; otherwise the whole `rest`
+    ! is balance-checked before parse_args — both before validate_args.
+    function parse_and_validate(this, sidx, match_idx, rest, args) result(rc)
+        class(engine_t), intent(inout)         :: this
+        integer, intent(in)                    :: sidx, match_idx
+        character(len=*), intent(in)           :: rest
+        type(dlist_t), intent(out)             :: args
+        integer                                :: rc
+        integer                                :: rest_idx, n_lead
+        logical                                :: ok
+        character(len=:), allocatable          :: vmsg, tail, lead_src
+
+        rc = RC_OK
+        rest_idx = this%states(sidx)%commands(match_idx)%rest_idx
+
+        if (rest_idx > 0) then
+            ! Spec ends in a rest slot: tokenise only the leading structured
+            ! args, then take the remainder verbatim.
+            n_lead = rest_idx - 1
+            call parse_args_lead(rest, n_lead, args, tail)
+            ! Quote balance only constrains the structured lead; the rest
+            ! portion is free text and may contain a lone '"'.
+            lead_src = rest(1 : len(rest) - len(tail))
+            if (.not. has_balanced_quotes(lead_src)) then
+                call emit_error(this, "unmatched quote in arguments")
+                rc = RC_ERROR
+                return
+            end if
+            tail = strip_leading_arg_space(tail)
+            if (len(tail) > 0) call args%append(char_node(tail))
+        else
+            if (.not. has_balanced_quotes(rest)) then
+                call emit_error(this, "unmatched quote in arguments")
+                rc = RC_ERROR
+                return
+            end if
+            call parse_args(rest, args)
+        end if
+
+        if (allocated(this%states(sidx)%commands(match_idx)%args)) then
+            call validate_args(this%states(sidx)%commands(match_idx)%args, args, ok, vmsg)
+            if (.not. ok) then
+                call emit_error(this, vmsg)
+                rc = RC_ERROR
+                return
+            end if
+            ! Post-validate normalisation: a token parsed as integer in a real
+            ! slot is promoted to a real node so the action receives a
+            ! real-typed value (parity with Tcl/C++).
+            call normalise_int_to_real(this%states(sidx)%commands(match_idx)%args, args)
+        end if
+    end function parse_and_validate
 
     module subroutine set_io_units_engine(this, input_unit, output_unit, error_unit)
         class(engine_t), intent(inout)         :: this
@@ -675,7 +717,7 @@ contains
         integer                                :: idx, i
         idx = 0
         if (.not. allocated(this%states)) return
-        do i = 1, size(this%states)
+        do i = 1, this%state_count
             if (this%states(i)%name == name) then
                 idx = i
                 return
@@ -683,10 +725,10 @@ contains
         end do
     end function find_state_idx
 
-    subroutine parse_spec(spec, req, opt)
-        character(len=*), intent(in)             :: spec
-        character(len=:), allocatable, intent(out) :: req, opt
-        integer                                  :: p1, p2
+    subroutine parse_spec(spec, req, opt, full)
+        character(len=*), intent(in)               :: spec
+        character(len=:), allocatable, intent(out) :: req, opt, full
+        integer                                    :: p1, p2
         p1 = index(spec, '(')
         p2 = index(spec, ')', back=.true.)
         if (p1 > 0 .and. p2 > p1) then
@@ -696,6 +738,7 @@ contains
             req = spec
             opt = ""
         end if
+        full = req // opt   ! longest acceptable abbreviation (E2)
     end subroutine parse_spec
 
     subroutine split_first_token(line, cmd, rest)
@@ -721,24 +764,20 @@ contains
         end if
     end subroutine split_first_token
 
-    recursive function strip_leading_arg_space(text) result(rest)
+    pure function strip_leading_arg_space(text) result(rest)
         character(len=*), intent(in)             :: text
         character(len=:), allocatable            :: rest
+        integer                                  :: p
 
-        if (len(text) == 0) then
+        p = verify(text, ARG_DELIMITERS)   ! first non-delimiter, 0 if none/empty
+        if (p == 0) then
             rest = ""
-        else if (scan(text(1:1), ARG_DELIMITERS) == 1) then
-            if (len(text) == 1) then
-                rest = ""
-            else
-                rest = strip_leading_arg_space(text(2:))
-            end if
         else
-            rest = text
+            rest = text(p:)
         end if
     end function strip_leading_arg_space
 
-    function first_arg_separator(text) result(pos)
+    pure function first_arg_separator(text) result(pos)
         character(len=*), intent(in)             :: text
         integer                                  :: pos, i
         logical                                  :: in_quote
@@ -764,80 +803,74 @@ contains
         ok = mod(count_char(text, '"'), 2) == 0
     end function has_balanced_quotes
 
-    recursive function count_char(text, ch) result(n)
+    pure function count_char(text, ch) result(n)
         character(len=*), intent(in)             :: text
         character(len=1), intent(in)             :: ch
-        integer                                  :: n, p
+        integer                                  :: n, i
 
-        p = index(text, ch)
-        if (p == 0) then
-            n = 0
-        else
-            n = 1 + count_char(text(p+1:), ch)
-        end if
+        n = count([(text(i:i) == ch, i = 1, len(text))])
     end function count_char
 
+    ! Tokenise the whole line, walking a start position into `text` (slicing
+    ! only each token) rather than copying the unconsumed remainder per step.
     subroutine parse_args(text, args)
         character(len=*), intent(in)             :: text
         type(dlist_t), intent(out)               :: args
+        integer                                  :: pos, p, sep
 
-        call parse_args_rec(text, args)
+        pos = 1
+        do
+            ! Skip leading delimiters to the next token (strip_leading_arg_space).
+            p = verify(text(pos:), ARG_DELIMITERS)
+            if (p == 0) return                       ! only delimiters / exhausted
+            pos = pos + p - 1
+            sep = first_arg_separator(text(pos:))
+            if (sep == 0) then                       ! last token runs to the end
+                call append_arg_token(unquote_arg_token(text(pos:)), args)
+                return
+            end if
+            call append_arg_token(unquote_arg_token(text(pos:pos+sep-2)), args)
+            pos = pos + sep                          ! step past the separator
+        end do
     end subroutine parse_args
-
-    recursive subroutine parse_args_rec(text, args)
-        character(len=*), intent(in)             :: text
-        type(dlist_t), intent(inout)             :: args
-        character(len=:), allocatable            :: trimmed, token, rest
-        integer                                  :: sep
-
-        trimmed = strip_leading_arg_space(text)
-        if (len(trimmed) == 0) return
-
-        sep = first_arg_separator(trimmed)
-        if (sep == 0) then
-            token = trimmed
-            rest  = ""
-        else
-            token = trimmed(1:sep-1)
-            rest  = trimmed(sep+1:)
-        end if
-
-        call append_arg_token(unquote_arg_token(token), args)
-        call parse_args_rec(rest, args)
-    end subroutine parse_args_rec
 
     ! Tokenise at most n_lead leading args (like parse_args), then return the
     ! unconsumed remainder verbatim in `tail` (a true suffix of `text`, so
     ! len(text)-len(tail) is the consumed-prefix length). Used for the
-    ! rest-of-line slot: the caller takes `tail` as free text.
+    ! rest-of-line slot: the caller takes `tail` as free text.  The position
+    ! walk preserves that suffix property exactly: tail = text(pos:) with pos
+    ! sitting just past the last consumed separator (or "" when exhausted).
     subroutine parse_args_lead(text, n_lead, args, tail)
         character(len=*), intent(in)               :: text
         integer, intent(in)                        :: n_lead
         type(dlist_t), intent(out)                 :: args
         character(len=:), allocatable, intent(out) :: tail
-        character(len=:), allocatable              :: cur, trimmed, token
-        integer                                    :: taken, sep
+        integer                                    :: pos, p, sep, taken
 
-        cur   = text
+        pos   = 1
         taken = 0
         do while (taken < n_lead)
-            trimmed = strip_leading_arg_space(cur)
-            if (len(trimmed) == 0) then
-                cur = ""
+            p = verify(text(pos:), ARG_DELIMITERS)
+            if (p == 0) then                         ! line exhausted early
+                pos = len(text) + 1
                 exit
             end if
-            sep = first_arg_separator(trimmed)
-            if (sep == 0) then
-                token = trimmed
-                cur   = ""
-            else
-                token = trimmed(1:sep-1)
-                cur   = trimmed(sep+1:)
+            pos = pos + p - 1
+            sep = first_arg_separator(text(pos:))
+            if (sep == 0) then                       ! last lead token to the end
+                call append_arg_token(unquote_arg_token(text(pos:)), args)
+                pos = len(text) + 1
+                exit
             end if
-            call append_arg_token(unquote_arg_token(token), args)
+            call append_arg_token(unquote_arg_token(text(pos:pos+sep-2)), args)
+            pos = pos + sep
             taken = taken + 1
         end do
-        tail = cur
+        if (pos > len(text)) then
+            tail = ""
+        else
+            tail = text(pos:)
+        end if
     end subroutine parse_args_lead
 
     recursive function unquote_arg_token(token) result(unquoted)
@@ -859,7 +892,7 @@ contains
         character(len=*), intent(in)             :: token
         type(dlist_t), intent(inout)             :: args
         integer                                  :: ival, iostat
-        real(8)                                  :: rval
+        real(dp)                                 :: rval
 
         if (is_integer_token(token)) then
             read(token, *, iostat=iostat) ival
@@ -905,7 +938,7 @@ contains
     ! input terminator, `.false.`, paths, etc.), then delegate to read.
     logical function is_real_token(s)
         character(len=*), intent(in) :: s
-        real(8) :: rval
+        real(dp) :: rval
         integer :: n, iostat
         character(len=*), parameter :: real_chars = '+-0123456789.eEdD'
         character(len=*), parameter :: digits     = '0123456789'
@@ -918,72 +951,100 @@ contains
         is_real_token = (iostat == 0)
     end function is_real_token
 
+    ! Prefix-match test shared by find_matches and report_ambiguous (R2): cmd
+    ! matches iff it is at least the required prefix, at most the full spelling,
+    ! and equals that leading slice of full.  Uses the finalize-cached full,
+    ! so it allocates nothing.
+    pure function command_matches(c, cmd) result(ok)
+        type(command_t), intent(in)  :: c
+        character(len=*), intent(in) :: cmd
+        logical                      :: ok
+        integer                      :: clen
+        clen = len(cmd)
+        ok = clen >= len(c%req) .and. clen <= len(c%full)
+        if (ok) ok = c%full(1:clen) == cmd
+    end function command_matches
+
     subroutine find_matches(this, cmd, n_matches, match_idx)
         class(engine_t), intent(in)              :: this
         character(len=*), intent(in)             :: cmd
         integer, intent(out)                     :: n_matches, match_idx
-        integer                                  :: i, sidx, clen, rlen, flen
-        character(len=:), allocatable            :: req, opt, full
+        integer                                  :: i
 
         n_matches = 0
         match_idx = 0
-        sidx = this%stack(this%stack_top)%state_idx
-        clen = len(cmd)
-        do i = 1, size(this%states(sidx)%commands)
-            req = this%states(sidx)%commands(i)%req
-            opt = this%states(sidx)%commands(i)%opt
-            full = req // opt
-            rlen = len(req)
-            flen = len(full)
-            if (clen >= rlen .and. clen <= flen) then
-                if (full(1:clen) == cmd) then
+        associate (cmds => this%states(this%stack(this%stack_top)%state_idx)%commands)
+            do i = 1, size(cmds)
+                if (command_matches(cmds(i), cmd)) then
                     n_matches = n_matches + 1
                     match_idx = i
                 end if
-            end if
-        end do
+            end do
+        end associate
     end subroutine find_matches
+
+    ! Invoke the matched command's proc and emit any error message.  Fetches
+    ! the context from the CURRENT top frame itself (the ordering contract:
+    ! ctx is read at invoke time, before any stack mutation).  Returns .true.
+    ! iff the action errored; `r` carries the result to the caller.
+    function invoke_proc(this, sidx, cmd_idx, args, r) result(errored)
+        class(engine_t), intent(inout)           :: this
+        integer, intent(in)                      :: sidx, cmd_idx
+        type(dlist_t), intent(in)                :: args
+        type(action_result_t), intent(out)       :: r
+        logical                                  :: errored
+        character(len=:), allocatable            :: ctx
+
+        ctx = this%stack(this%stack_top)%context
+        r = this%states(sidx)%commands(cmd_idx)%proc(args, ctx)
+        errored = r%errored
+        if (errored) then
+            if (allocated(r%errmsg)) then
+                if (len(r%errmsg) > 0) call emit_error(this, r%errmsg)
+            end if
+        end if
+    end function invoke_proc
+
+    ! Enter state `tidx` with context `ctx`.  When `replace` is true the current
+    ! top frame is popped first (swap: pop-then-push); otherwise the frame is
+    ! pushed on top (goto).  Decrement-before-push and the on_enter-after-push
+    ! ordering are observable through on_enter hooks and must not change.
+    subroutine transition(this, tidx, ctx, replace)
+        class(engine_t), intent(inout)           :: this
+        integer, intent(in)                      :: tidx
+        character(len=*), intent(in)             :: ctx
+        logical, intent(in)                      :: replace
+        if (replace) this%stack_top = this%stack_top - 1
+        call push_stack(this, tidx, ctx)
+        call fire_on_enter(this)
+    end subroutine transition
 
     function apply_edge(this, cmd_idx, args) result(rc)
         class(engine_t), intent(inout)           :: this
         integer, intent(in)                      :: cmd_idx
         type(dlist_t), intent(in)                :: args
         integer                                  :: rc
-        integer                                  :: sidx, tidx
+        integer                                  :: sidx
         type(action_result_t)                    :: r
-        character(len=:), allocatable            :: ctx
 
         sidx = this%stack(this%stack_top)%state_idx
-        select case (this%states(sidx)%commands(cmd_idx)%kind)
+        associate (cmd => this%states(sidx)%commands(cmd_idx))
+        select case (cmd%kind)
         case (EDGE_ACTION)
-            ctx = this%stack(this%stack_top)%context
-            r = this%states(sidx)%commands(cmd_idx)%proc(args, ctx)
-            if (r%errored) then
-                if (allocated(r%errmsg)) then
-                    if (len(r%errmsg) > 0) call emit_error(this, r%errmsg)
-                end if
+            if (invoke_proc(this, sidx, cmd_idx, args, r)) then
                 rc = RC_ERROR
             else
                 rc = RC_OK
             end if
         case (EDGE_GOTO)
-            tidx = find_state_idx(this, this%states(sidx)%commands(cmd_idx)%target)
-            call push_stack(this, tidx, "")
-            call fire_on_enter(this)
+            call transition(this, cmd%target_idx, "", replace=.false.)
             rc = RC_TRANSITIONED
         case (EDGE_DO_GOTO)
-            ctx = this%stack(this%stack_top)%context
-            r = this%states(sidx)%commands(cmd_idx)%proc(args, ctx)
-            if (r%errored) then
-                if (allocated(r%errmsg)) then
-                    if (len(r%errmsg) > 0) call emit_error(this, r%errmsg)
-                end if
+            if (invoke_proc(this, sidx, cmd_idx, args, r)) then
                 rc = RC_ERROR
             else if (allocated(r%value)) then
                 if (len(r%value) > 0) then
-                    tidx = find_state_idx(this, this%states(sidx)%commands(cmd_idx)%target)
-                    call push_stack(this, tidx, r%value)
-                    call fire_on_enter(this)
+                    call transition(this, cmd%target_idx, r%value, replace=.false.)
                     rc = RC_TRANSITIONED
                 else
                     rc = RC_OK
@@ -999,12 +1060,7 @@ contains
                 rc = RC_TRANSITIONED
             end if
         case (EDGE_DO_POP)
-            ctx = this%stack(this%stack_top)%context
-            r = this%states(sidx)%commands(cmd_idx)%proc(args, ctx)
-            if (r%errored) then
-                if (allocated(r%errmsg)) then
-                    if (len(r%errmsg) > 0) call emit_error(this, r%errmsg)
-                end if
+            if (invoke_proc(this, sidx, cmd_idx, args, r)) then
                 rc = RC_ERROR
             else
                 this%stack_top = this%stack_top - 1
@@ -1014,12 +1070,31 @@ contains
                     rc = RC_TRANSITIONED
                 end if
             end if
+        case (EDGE_SWAP)
+            ! Replace the top frame: pop-then-push, empty context.
+            call transition(this, cmd%target_idx, "", replace=.true.)
+            rc = RC_TRANSITIONED
+        case (EDGE_DO_SWAP)
+            if (invoke_proc(this, sidx, cmd_idx, args, r)) then
+                rc = RC_ERROR
+            else if (allocated(r%value)) then
+                if (len(r%value) > 0) then
+                    ! Non-empty return replaces the top frame with that value as context.
+                    call transition(this, cmd%target_idx, r%value, replace=.true.)
+                    rc = RC_TRANSITIONED
+                else
+                    rc = RC_OK
+                end if
+            else
+                rc = RC_OK
+            end if
         case (EDGE_QUIT)
             this%stack_top = 0
             rc = RC_EXITED
         case default
             rc = RC_ERROR
         end select
+        end associate
     end function apply_edge
 
     subroutine push_stack(this, state_idx, ctx)
@@ -1062,6 +1137,24 @@ contains
         end select
     end function arg_kind_name
 
+    ! Spelling of an edge kind for build diagnostics; empty for an unknown kind
+    ! (add_command uses that as its known-kind test).  Mirror of arg_kind_name.
+    pure function edge_kind_name(k) result(nm)
+        integer, intent(in)           :: k
+        character(len=:), allocatable :: nm
+        select case (k)
+        case (EDGE_ACTION);  nm = "action"
+        case (EDGE_GOTO);    nm = "goto"
+        case (EDGE_SWAP);    nm = "swap"
+        case (EDGE_DO_GOTO); nm = "do_goto"
+        case (EDGE_DO_SWAP); nm = "do_swap"
+        case (EDGE_DO_POP);  nm = "do_pop"
+        case (EDGE_POP);     nm = "pop"
+        case (EDGE_QUIT);    nm = "quit"
+        case default;        nm = ""
+        end select
+    end function edge_kind_name
+
     ! Usage label for a command: the spec followed by its arg specs.
     ! Required args render as <name:kind>, optional as [name:kind].
     function command_usage(c) result(label)
@@ -1072,10 +1165,10 @@ contains
         if (allocated(c%args)) then
             do i = 1, size(c%args)
                 if (c%args(i)%optional) then
-                    label = label // " [" // trim(c%args(i)%name) // ":" // &
+                    label = label // " [" // c%args(i)%name // ":" // &
                             arg_kind_name(c%args(i)%kind) // "]"
                 else
-                    label = label // " <" // trim(c%args(i)%name) // ":" // &
+                    label = label // " <" // c%args(i)%name // ":" // &
                             arg_kind_name(c%args(i)%kind) // ">"
                 end if
             end do
@@ -1108,22 +1201,16 @@ contains
     subroutine report_ambiguous(this, cmd)
         class(engine_t), intent(inout)           :: this
         character(len=*), intent(in)             :: cmd
-        integer                                  :: sidx, i, clen, rlen, flen
-        character(len=:), allocatable            :: req, opt, full, msg, sep
+        integer                                  :: sidx, i
+        character(len=:), allocatable            :: msg, sep
         logical                                  :: first
 
         sidx  = this%stack(this%stack_top)%state_idx
-        clen  = len(cmd)
         msg   = "ambiguous: " // cmd // " matches"
         first = .true.
-        do i = 1, size(this%states(sidx)%commands)
-            req = this%states(sidx)%commands(i)%req
-            opt = this%states(sidx)%commands(i)%opt
-            full = req // opt
-            rlen = len(req)
-            flen = len(full)
-            if (clen >= rlen .and. clen <= flen) then
-                if (full(1:clen) == cmd) then
+        associate (cmds => this%states(sidx)%commands)
+            do i = 1, size(cmds)
+                if (command_matches(cmds(i), cmd)) then
                     ! Canonical wording (matches Tcl / C++): the first match is
                     ! introduced by a space after "matches"; subsequent matches
                     ! are joined with ", ".
@@ -1133,10 +1220,10 @@ contains
                     else
                         sep = ", "
                     end if
-                    msg = msg // sep // this%states(sidx)%commands(i)%spec
+                    msg = msg // sep // cmds(i)%spec
                 end if
-            end if
-        end do
+            end do
+        end associate
         call emit_info(this, msg)
     end subroutine report_ambiguous
 
@@ -1262,7 +1349,9 @@ contains
     end subroutine raise
 
     ! DFS cycle detection over goto/do_goto edges between concrete states.
-    ! Sets found=.true. and emits a "A -> B -> ... -> A" message on first cycle.
+    ! pop/do_pop/swap/do_swap are exempt (return/replace paths, not forward
+    ! tree-edges). Sets found=.true. and emits a "A -> B -> ... -> A" message
+    ! on first cycle.
     subroutine find_cycle(this, found, msg)
         class(engine_t), intent(in)                          :: this
         logical, intent(out)                                 :: found
@@ -1295,13 +1384,13 @@ contains
         integer, intent(inout)                   :: color(:), parent(:)
         logical, intent(inout)                   :: found
         integer, intent(inout)                   :: ancestor, descendant
-        integer                                  :: j, vidx, kind
+        integer                                  :: j, vidx, ekind
 
         color(u) = 1
         do j = 1, size(this%states(u)%commands)
-            kind = this%states(u)%commands(j)%kind
-            if (kind /= EDGE_GOTO .and. kind /= EDGE_DO_GOTO) cycle
-            vidx = find_state_idx(this, this%states(u)%commands(j)%target)
+            ekind = this%states(u)%commands(j)%kind
+            if (ekind /= EDGE_GOTO .and. ekind /= EDGE_DO_GOTO) cycle  ! swap/pop/quit exempt
+            vidx = this%states(u)%commands(j)%target_idx
             if (vidx == 0) cycle                                ! validated earlier
             if (.not. allocated(this%states(vidx)%prompt)) cycle ! abstract; validated earlier
             select case (color(vidx))
@@ -1447,7 +1536,7 @@ contains
         n_required = findloc(spec%optional, .false., dim=1, back=.true.)
 
         if (n_args < n_required) then
-            msg = "missing required argument <" // trim(spec(n_args + 1)%name) // ">"
+            msg = "missing required argument <" // spec(n_args + 1)%name // ">"
             ok  = .false.
             return
         end if
@@ -1466,7 +1555,7 @@ contains
                 type is (dlist_node_integer)
                     continue
                 class default
-                    msg = "argument <" // trim(spec(i)%name) // "> expects integer"
+                    msg = "argument <" // spec(i)%name // "> expects integer"
                     ok  = .false.
                     return
                 end select
@@ -1481,7 +1570,7 @@ contains
                 type is (dlist_node_integer)
                     continue
                 class default
-                    msg = "argument <" // trim(spec(i)%name) // "> expects real"
+                    msg = "argument <" // spec(i)%name // "> expects real"
                     ok  = .false.
                     return
                 end select
@@ -1490,7 +1579,7 @@ contains
                 type is (dlist_node_char)
                     continue
                 class default
-                    msg = "argument <" // trim(spec(i)%name) // "> expects string"
+                    msg = "argument <" // spec(i)%name // "> expects string"
                     ok  = .false.
                     return
                 end select
@@ -1517,8 +1606,7 @@ contains
             select type (node)
             type is (dlist_node_integer)
                 ival = node%data
-                call args%remove(i)
-                call args%insert(i, real_node(real(ival, 8)))
+                call args%replace(i, real_node(real(ival, dp)))
             end select
         end do
     end subroutine normalise_int_to_real

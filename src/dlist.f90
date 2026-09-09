@@ -1,14 +1,17 @@
 !! SPDX-License-Identifier: MIT
 !! Copyright (c) 2026 Simon Geard
-!! Vendored into sqr from https://github.com/sgeard/cmdgraph (fortran/src); kept in sync by hand.
+!! Vendored into sqr from https://github.com/sgeard/cmdgraph (fortran/src) at svn r1883, 2026-07-09 (after its v1.3.1 release); kept in sync by hand.
 !!
 !! Polymorphic doubly-linked list used as the parsed-argument container.
 !!
 !! Elements are stored as class(`dlist_node_data_t`) and accessed by
 !! index (`get`) or by iterating with a visitor procedure (`iterate`).
 !! The built-in node types cover the argument kinds used by cmdgraph:
-!! integer, real(8), character, and real arrays.
+!! integer, real, character; the real-array node types are provided for
+!! client use (cmdgraph itself never creates them).
 module dlist
+    use, intrinsic :: iso_fortran_env, only : dp => real64
+    implicit none
     public
 
     !! Doubly-linked list with polymorphic element storage.
@@ -25,6 +28,7 @@ module dlist
         procedure, public :: append          => append_ll           !! Append a node to the tail
         procedure, public :: insert          => insert_ll           !! Insert a node at 1-based index
         procedure, public :: remove          => remove_ll           !! Remove element at 1-based index
+        procedure, public :: replace         => replace_ll          !! Replace element data at 1-based index (no-op if out of range)
         procedure, public :: size            => size_ll             !! Number of elements
         procedure, public :: clear           => clear_ll            !! Remove all elements
         procedure, public :: get             => get_ll              !! Index-based accessor (1-based); unallocated if out of range
@@ -44,17 +48,17 @@ module dlist
 
     !! Node holding a single `real(8)` value.
     type, extends(dlist_node_data_t) :: dlist_node_real
-        real(8) :: data = 0.0d0
+        real(dp) :: data = 0.0_dp
     end type dlist_node_real
 
     !! Node holding a `real(8)` rank-1 array.
     type, extends(dlist_node_data_t) :: dlist_node_real_a
-        real(8), allocatable :: data(:)
+        real(dp), allocatable :: data(:)
     end type dlist_node_real_a
 
     !! Node holding a `real(8)` rank-2 array.
     type, extends(dlist_node_data_t) :: dlist_node_real_m
-        real(8), allocatable :: data(:,:)
+        real(dp), allocatable :: data(:,:)
     end type dlist_node_real_m
 
     !! Node holding an allocatable `character` string.
@@ -103,17 +107,17 @@ module dlist
         end function make_int_node
 
         module function make_real_node(v) result(n)
-            real(8), intent(in)          :: v
+            real(dp), intent(in)         :: v
             type(dlist_node_real)        :: n
         end function make_real_node
 
         module function make_real_a_node(v) result(n)
-            real(8), intent(in)     :: v(:)
+            real(dp), intent(in)    :: v(:)
             type(dlist_node_real_a) :: n
         end function make_real_a_node
 
         module function make_real_m_node(v) result(n)
-            real(8), intent(in)     :: v(:,:)
+            real(dp), intent(in)    :: v(:,:)
             type(dlist_node_real_m) :: n
         end function make_real_m_node
 
@@ -163,6 +167,15 @@ module dlist
             class(dlist_t), intent(inout) :: lst
             integer, intent(in)           :: idx
         end subroutine remove_ll
+
+        !! Replace the data at 1-based `idx` in place (one walk, no node churn).
+        !! The new `data` may be a different dynamic type than the old.
+        !! Silently does nothing if `idx` is out-of-range (matching `remove`).
+        module subroutine replace_ll(lst, idx, data)
+            class(dlist_t), intent(inout)        :: lst
+            integer, intent(in)                  :: idx
+            class(dlist_node_data_t), intent(in) :: data
+        end subroutine replace_ll
 
         !! Apply `f` to each element in reverse order.
         module function reverse_iterate_ll(this, f) result(r)
