@@ -880,12 +880,18 @@ contains
         call jrnl_close_unit(db)
         open(newunit=u, file=db%jrnl%path, access='stream', form='unformatted', &
              status='replace', action='readwrite', iostat=ios)
+        ! A successful open hands the unit to the handle BEFORE any status
+        ! check: an injected (or later) failure below must not strand a
+        ! connected unit nothing will close - jrnl_close_unit releases it.
+        ! (A stranded unit kept `_journal.dat` connected; the next handle's
+        ! replace-open of that file then failed on flang, which refuses a
+        ! second connection.)
+        if (ios == 0) db%jrnl%unit = u
         call io_check(ios)
         if (ios /= 0) then
             st = SQR_ERR
             return
         end if
-        db%jrnl%unit = u
         write(u, pos=1, iostat=ios) zeros
         call io_check(ios)
         if (ios == 0) flush(u, iostat=ios)

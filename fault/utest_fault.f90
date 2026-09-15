@@ -13,7 +13,7 @@ program utest_fault
     use, intrinsic :: iso_fortran_env, only: int32, int64
     use sqr
     use sqr_fault, only: fault_arm, fault_disarm, fault_count
-    use clib_wrap, only: c_rmtree
+    use clib_wrap, only: c_rmtree, c_path_exists
     implicit none
 
     integer :: pass = 0, fail = 0
@@ -26,6 +26,7 @@ program utest_fault
     ! closed disarmed after the op.
     type(db_t) :: gdb
     logical    :: gopen = .false.
+    integer    :: fds0  = -1      ! open descriptors at program start (-1 = no /proc)
 
     abstract interface
         subroutine prep_i()
@@ -35,6 +36,7 @@ program utest_fault
         end subroutine op_i
     end interface
 
+    fds0 = open_fds()                 ! the baseline no_stranded_units compares to
     call sweep('open',         prep_fulldb,      op_open,    .true.)
     call sweep('insert',       prep_table,       op_insert,  .false.)
     call sweep('update',       prep_rows,        op_update,  .false.)
@@ -45,6 +47,11 @@ program utest_fault
     call sweep('compact',      prep_compactable, op_compact, .false.)
     call sweep('set_text',     prep_textrow,     op_settext, .false.)
     call sweep('get_text',     prep_textset,     op_gettext, .false., expect=SQR_ERR)
+    ! Every sweep closes its handle after each faulted run: an error path that
+    ! strands a connected unit (presize once did, on the journal) goes unseen
+    ! on a compiler that allows a file on two units, and breaks every later
+    ! open of that file on one that refuses (flang).  Check on all of them.
+    call check(no_stranded_units(), 'sweeps: no unit left connected after faulted runs')
 
     call compact_atomicity()
     call compact_index_recovery()
@@ -73,6 +80,7 @@ program utest_fault
 
     ! H1: a faulted undo replay must leave the journal hot, never voided.
     call recover_fault()
+    call check(no_stranded_units(), 'all: no unit left connected after faulted runs')
 
     call cleanup()
     print '(a,i0,a,i0,a)', 'sqr fault tests: ', pass, ' passed, ', fail, ' failed'
@@ -91,6 +99,33 @@ contains
             print '(a,a)', '  FAIL ', label
         end if
     end subroutine check
+
+    ! Open file descriptors of this process (Linux /proc/self/fd), or -1 where
+    ! there is no /proc.  A unit stranded by an error path keeps its
+    ! descriptor, so the count after faulted runs exceeds the count before.
+    ! Counted by descriptor because no Fortran INQUIRE finds such a unit
+    ! portably: by FILE, gfortran matches by identity and the stranded file
+    ! has since been deleted and recreated; by UNIT number, the runtimes'
+    ! internal negative units make gfortran crash.
+    integer function open_fds() result(n)
+        character(len=32) :: p
+        integer :: fd
+        n = -1
+        if (.not. c_path_exists('/proc/self/fd')) return
+        n = 0
+        do fd = 0, 4095
+            write(p, '(a,i0)') '/proc/self/fd/', fd
+            if (c_path_exists(trim(p))) n = n + 1
+        end do
+    end function open_fds
+
+    ! No descriptor more than at program start (always true without /proc).
+    logical function no_stranded_units() result(none)
+        integer :: n
+        n = open_fds()
+        none = (fds0 < 0 .or. n <= fds0)
+        if (.not. none) print '(a,i0,a,i0)', '  open descriptors: ', n, ', at start: ', fds0
+    end function no_stranded_units
 
     subroutine cleanup()
         integer :: ios
