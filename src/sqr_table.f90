@@ -127,6 +127,26 @@ contains
                         ! magic / version mismatch / ...); thread it through a
                         ! local so it reaches the sticky state even when the
                         ! caller passed no errmsg.
+                        ! An interrupted column-layout change (see
+                        ! apply_layout_change) is rolled forward BEFORE the
+                        ! schema is read: its staged schema is the truth.
+                        altering: block
+                            if (file_exists(alter_marker_path(db, trim(names(i))))) then
+                                if (db%readonly) then
+                                    rs = SQR_READONLY
+                                    call raise_db(db, rs, stat, errmsg, &
+                                        'database needs layout-change recovery; reopen read-write: "' &
+                                        // trim(db%dir) // '"')
+                                    exit open_seq
+                                end if
+                                call complete_alter_swap(db, trim(names(i)), rs)
+                                if (rs /= SQR_OK) then
+                                    call raise_db(db, rs, stat, errmsg, &
+                                        'cannot finish interrupted layout change for ' // trim(names(i)))
+                                    exit open_seq
+                                end if
+                            end if
+                        end block altering
                         em = ''
                         call read_schema(db, trim(names(i)), t, rs, em)
                         if (rs /= SQR_OK) then
@@ -1104,6 +1124,106 @@ contains
         call report(db, rs, stat, errmsg)
     end subroutine
 
+    module subroutine db_reshape_table(db, table_name, cols, stat, errmsg)
+        class(db_t),      intent(inout)           :: db
+        character(len=*), intent(in)              :: table_name
+        type(column_t),   intent(in)              :: cols(:)
+        integer,          intent(out),  optional  :: stat
+        character(len=*), intent(inout), optional :: errmsg
+        integer :: ti, nj, new_rs, rs
+        type(column_t), allocatable :: newcols(:)
+        integer, allocatable :: src(:), cascade(:)
+        character(len=SQR_ERRMSG_LEN) :: em
+
+        call clear_last_err(db)
+        if (readonly_block(db, stat, errmsg)) return
+        if (txn_block(db, stat, errmsg)) return
+        ti = db_table_index(db, table_name)
+        if (ti == 0) then
+            call raise_db(db, SQR_NOT_FOUND, stat, errmsg, 'no such table: ' // trim(table_name))
+            return
+        end if
+        if (size(cols) == 0) then
+            call raise_db(db, SQR_INVALID, stat, errmsg, &
+                       'a table must keep at least one column: "' // trim(table_name) // '"')
+            return
+        end if
+
+        ! The target set on its own terms first (names, types, sizes, duplicate
+        ! names, record bound) - exactly what db_create_table would accept.
+        allocate(newcols(size(cols)))
+        do nj = 1, size(cols)
+            newcols(nj)%name  = cols(nj)%name
+            newcols(nj)%dtype = cols(nj)%dtype
+            newcols(nj)%csize = cols(nj)%csize
+        end do
+        em = ''
+        call validate_columns(newcols, rs, em)
+        if (rs /= SQR_OK) then
+            call raise_db(db, rs, stat, errmsg, trim(em))
+            return
+        end if
+
+        associate (t => db%tables(ti))
+            ! src(nj): the stored column feeding target nj, by name (0 = new).
+            allocate(src(size(newcols)))
+            do nj = 1, size(newcols)
+                src(nj) = col_index(t, newcols(nj)%name)
+                if (src(nj) == 0) cycle
+                if (t%cols(src(nj))%dtype /= newcols(nj)%dtype .or. &
+                    t%cols(src(nj))%csize /= newcols(nj)%csize) then
+                    call raise_db(db, SQR_INVALID, stat, errmsg, 'column "' // &
+                               trim(newcols(nj)%name) // '" would change type or size')
+                    return
+                end if
+            end do
+            ! Already the target layout: nothing to rewrite, history kept.
+            if (size(newcols) == t%ncols) then
+                if (all(src == [(nj, nj = 1, t%ncols)])) then
+                    call report(db, SQR_OK, stat, errmsg)
+                    return
+                end if
+            end if
+            call cascade_absent(t, newcols, cascade)
+        end associate
+
+        db%generation = db%generation + 1   ! structural change: invalidate cursors
+        call db_reset_history(db)           ! record layout change: steps can't replay
+        call layout_columns(newcols, new_rs)
+        call apply_layout_change(db, ti, newcols, new_rs, src, cascade, rs)
+        call report(db, rs, stat, errmsg)
+    end subroutine
+
+    ! Slots of every live index of `t` with a member column absent from
+    ! `keep` - the indices db_reshape_table CASCADE-drops.
+    subroutine cascade_absent(t, keep, slots)
+        type(table_t),        intent(in)  :: t
+        type(column_t),       intent(in)  :: keep(:)
+        integer, allocatable, intent(out) :: slots(:)
+        integer :: j, m, k, n
+        logical :: found
+        integer :: tmp(t%nindices)
+        n = 0
+        scan_idx: do j = 1, t%nindices
+            if (.not. idx_live(t%indices(j))) cycle scan_idx
+            members: do m = 1, t%indices(j)%ncols
+                found = .false.
+                do k = 1, size(keep)
+                    if (trim(keep(k)%name) == trim(t%indices(j)%columns(m))) then
+                        found = .true.
+                        exit
+                    end if
+                end do
+                if (.not. found) then
+                    n = n + 1
+                    tmp(n) = j
+                    exit members
+                end if
+            end do members
+        end do scan_idx
+        slots = tmp(1:n)
+    end subroutine
+
     ! Slots of every live index of `t` that has `col_name` as a member — the
     ! indices db_drop_column CASCADE-drops because their key would lose a column.
     subroutine cascade_indices(t, col_name, slots)
@@ -1154,26 +1274,30 @@ contains
         end do cols
     end subroutine
 
-    ! Rewrite every record of table ti from its current layout into `newcols`
-    ! (already laid out, record size `new_rs`); `src(nj)` is the old column
-    ! index supplying new column nj (0 = brand-new, written NULL). Shared by
-    ! db_add_column and db_drop_column.
+    ! Rewrite every record of table ti into `newcols` (already laid out, record
+    ! size `new_rs`); `src(nj)` is the old column feeding new column nj (0 =
+    ! brand-new, written NULL); `cascade` lists the index slots to drop (an
+    ! index with a member that no longer exists).  Shared by db_add_column,
+    ! db_drop_column and db_reshape_table.
     !
     ! row_ids are PRESERVED: alive and tombstoned slots alike are rewritten at
-    ! the same record number, and next_id / live_count are unchanged (unlike
-    ! db_compact, which renumbers). `cascade` lists secondary-index slots to
-    ! drop (the indices that referenced a dropped column). Surviving indices
-    ! keep their on-disk B+-trees untouched — the column VALUES and row_ids in
-    ! every entry are unchanged, and key_off / key_size do not move, so the only
-    ! thing that shifts is the in-memory col_idx (a drop renumbers later
-    ! columns), which is simply re-resolved by name. No index is rebuilt.
+    ! the same record number, and next_id / live_count are unchanged.
+    ! Surviving indices keep their B+-trees untouched - member values and
+    ! row_ids are unchanged and key_off / key_size do not move - so only the
+    ! in-memory col_idx is re-resolved by name.  No index is rebuilt.
     !
-    ! Durability mirrors db_compact: build a temp data file alongside the
-    ! original (failure there is clean — originals untouched), then commit by
-    ! renaming it in and rewriting the schema back to back. A hard crash
-    ! strictly between those two is the documented pre-journal residual window
-    ! (the on-disk data would then be the new layout while the schema still
-    ! describes the old one); the Phase-2 journal closes it.
+    ! Atomicity, the db_compact pattern:
+    !   1. STAGE - every fallible write happens beside the originals: the
+    !      rewritten data file (`<t>.dat.alter`) and the new schema
+    !      (`<t>.schema.alter`), each made durable.  A failure here deletes the
+    !      temps; the table is untouched.
+    !   2. COMMIT - a durable marker (`<t>.altering`).  From here the staged
+    !      files are the truth.
+    !   3. SWAP - renames only, then the marker is cleared.  An interruption
+    !      anywhere after the marker is rolled forward on the next open
+    !      (complete_alter_swap), before the schema is read.
+    ! A failure past the commit returns an error but leaves the database
+    ! consistent on disk in the NEW layout (a reopen sees it whole).
     subroutine apply_layout_change(db, ti, newcols, new_rs, src, cascade, stat)
         type(db_t),     intent(inout) :: db
         integer,        intent(in)    :: ti
@@ -1182,27 +1306,30 @@ contains
         integer,        intent(in)    :: src(:)
         integer,        intent(in)    :: cascade(:)
         integer,        intent(out)   :: stat
-        integer :: ud, ios, rs, j, m, k, old_rs, nnew
+        integer :: ud, ios, rs, j, m, k, old_rs
         integer(int32) :: rid
         logical :: had_text, has_text_new
-        character(len=:), allocatable :: rbuf, nbuf, dpath, dtmp
+        character(len=:), allocatable :: rbuf, nbuf, dpath, dtmp, spath, stmp
         type(column_t), allocatable :: oldcols(:)
+        type(table_t) :: nt
 
         stat = SQR_OK
         ud   = -1
-        nnew = size(newcols)
         associate (t => db%tables(ti))
             old_rs   = t%record_size
             oldcols  = t%cols(1:t%ncols)
             had_text = table_has_text(t)
             dpath = data_path(db, t%name)
             dtmp  = dpath // '.alter'
+            spath = schema_path(db, t%name)
+            stmp  = spath // '.alter'
 
-            ! ---- Phase A: build the rewritten data file beside the original.
-            ! The original data unit stays open and untouched, so any failure
-            ! here just drops the temp file and returns with nothing committed.
+            ! ---- 1. STAGE: the rewritten data file beside the original.  The
+            ! original data unit stays open and untouched, so any failure here
+            ! just drops the temps and returns with nothing committed.
             build: block
-                call remove_file(dtmp)   ! stale temp from a crash
+                call remove_file(dtmp)   ! stale temps from an abandoned attempt
+                call remove_file(stmp)
                 open(newunit=ud, file=dtmp, access='direct', form='unformatted', &
                      recl=new_rs, status='replace', action='readwrite', iostat=ios)
                 if (ios /= 0) then
@@ -1233,46 +1360,69 @@ contains
                 stat = rs
                 return
             end if
-            ! Guard the temp close (final flush) before committing the swap.
-            close(ud, iostat=ios)
+            close(ud, iostat=ios)                     ! the final flush
+            if (ios == 0 .and. db%durable) then
+                ios = c_fsync_path(dtmp)
+                call io_check(ios)
+            end if
             if (ios /= 0) then
+                call remove_file(dtmp)
                 stat = SQR_ERR
                 return
             end if
 
-            ! ---- Commit: swap in the rewritten data, then persist the new
-            ! schema. These two are kept adjacent — the residual crash window.
+            ! ...and the schema describing it: a copy of the table in the new
+            ! layout with the cascaded slots tombstoned, staged durably.
+            nt = t
+            nt%cols        = newcols
+            nt%ncols       = size(newcols)
+            nt%record_size = new_rs
+            do k = 1, size(cascade)
+                call tombstone_slot(nt%indices(cascade(k)))
+            end do
+            call stage_schema(db, nt, stmp, rs)
+            if (rs == SQR_OK .and. db%durable) then
+                ios = c_fsync_dir(db%dir)
+                call io_check(ios)
+                if (ios /= 0) rs = SQR_ERR
+            end if
+            if (rs /= SQR_OK) then
+                call remove_file(dtmp)
+                call remove_file(stmp)
+                stat = rs
+                return
+            end if
+
+            ! ---- 2. COMMIT: the marker makes the staged pair authoritative.
+            call write_alter_marker(db, t%name, rs)
+            if (rs /= SQR_OK) then
+                call remove_file(alter_marker_path(db, t%name))
+                call remove_file(dtmp)
+                call remove_file(stmp)
+                stat = rs
+                return
+            end if
+
+            ! ---- 3. SWAP: renames only; the next open finishes an interrupted one.
             close(t%unit, iostat=ios); t%unit = -1
-            if (c_rename(dtmp, dpath) /= 0) then
-                stat = SQR_ERR
-                return
-            end if
+            call complete_alter_swap(db, t%name, rs)
+            if (rs /= SQR_OK) stat = rs          ! on disk: rolled forward by the next open
 
-            ! In-memory table now takes the new layout.
+            ! In-memory table now takes the new layout (the staged schema's).
             t%cols        = newcols
-            t%ncols       = nnew
+            t%ncols       = size(newcols)
             t%record_size = new_rs
+            t%disk_next_id    = t%next_id
+            t%disk_live_count = t%live_count
 
             ! CASCADE: tombstone each dropped-member index (slot kept stable so
-            ! survivors' __i<slot> file names are undisturbed) and close its
-            ! tree; the file is deleted after the schema commit.
+            ! survivors' __i<slot> file names are undisturbed) and close its tree.
             drop_cascade: do k = 1, size(cascade)
-                associate (ix => t%indices(cascade(k)))
-                    call bt_discard(ix%bt)
-                    ix%ncols    = 0
-                    ix%key_size = 0
-                    ix%nentries = 0
-                    ix%unique   = .false.
-                    if (allocated(ix%columns)) deallocate(ix%columns)
-                    if (allocated(ix%col_idx)) deallocate(ix%col_idx)
-                    if (allocated(ix%key_off)) deallocate(ix%key_off)
-                end associate
+                call bt_discard(t%indices(cascade(k))%bt)
+                call tombstone_slot(t%indices(cascade(k)))
             end do drop_cascade
 
-            ! Surviving indices: re-resolve member ordinals against the new
-            ! column array (a drop shifts later columns down). key_off /
-            ! key_size and the tree itself are unchanged — same keys, same
-            ! row_ids — so nothing is rebuilt.
+            ! Surviving indices: re-resolve member ordinals against the new columns.
             fix_idx: do j = 1, t%nindices
                 if (.not. idx_live(t%indices(j))) cycle fix_idx
                 members: do m = 1, t%indices(j)%ncols
@@ -1280,13 +1430,7 @@ contains
                 end do members
             end do fix_idx
 
-            call write_schema(db, t, rs)
-            if (rs /= SQR_OK) then
-                stat = rs
-                return
-            end if
-
-            ! ---- Past the commit: reopen data, adjust the blob, drop cascade files.
+            ! ---- Past the swap: reopen data, adjust the blob, drop cascade files.
             call open_data(db, t, 'old', rs)
             if (rs /= SQR_OK) then
                 stat = rs
@@ -1315,7 +1459,75 @@ contains
                 call remove_file(index_path(db, t%name, cascade(k)))
             end do del_cascade
         end associate
-        stat = SQR_OK
+    end subroutine
+
+    ! An index slot emptied in place (its number stays reserved, so the
+    ! surviving indices' file names do not move).
+    subroutine tombstone_slot(ix)
+        type(index_t), intent(inout) :: ix
+        ix%ncols    = 0
+        ix%key_size = 0
+        ix%nentries = 0
+        ix%unique   = .false.
+        if (allocated(ix%columns)) deallocate(ix%columns)
+        if (allocated(ix%col_idx)) deallocate(ix%col_idx)
+        if (allocated(ix%key_off)) deallocate(ix%key_off)
+    end subroutine
+
+    ! Drop the layout-change commit marker (alter_marker_path) durably.
+    subroutine write_alter_marker(db, name, stat)
+        type(db_t),       intent(in)  :: db
+        character(len=*), intent(in)  :: name
+        integer,          intent(out) :: stat
+        integer :: u, ios
+        open(newunit=u, file=alter_marker_path(db, name), access='stream', &
+             form='unformatted', status='replace', action='write', iostat=ios)
+        if (ios /= 0) then
+            stat = SQR_ERR
+            return
+        end if
+        close(u, iostat=ios)
+        if (ios == 0 .and. db%durable) ios = c_fsync_path(alter_marker_path(db, name))
+        call io_check(ios)
+        if (ios == 0 .and. db%durable) ios = c_fsync_dir(db%dir)
+        call io_check(ios)
+        stat = merge(SQR_ERR, SQR_OK, ios /= 0)
+    end subroutine
+
+    ! Roll a committed layout change forward: move each staged file still
+    ! present over its target, then clear the marker.  Idempotent - every step
+    ! is a rename or a removal of something that may already be gone - so it
+    ! is safe to re-run when it is itself interrupted.  Used by the change
+    ! itself and by db_open when it finds the marker.
+    subroutine complete_alter_swap(db, name, stat)
+        type(db_t),       intent(in)  :: db
+        character(len=*), intent(in)  :: name
+        integer,          intent(out) :: stat
+        integer :: ios
+        character(len=:), allocatable :: dpath, spath
+        ios = 0
+        dpath = data_path(db, name)
+        spath = schema_path(db, name)
+        if (c_path_exists(dpath // '.alter')) ios = c_rename(dpath // '.alter', dpath)
+        if (ios == 0 .and. c_path_exists(spath // '.alter')) &
+            ios = c_rename(spath // '.alter', spath)
+        if (ios /= 0) then
+            stat = SQR_ERR
+            return
+        end if
+        if (db%durable) then
+            ios = c_fsync_dir(db%dir)            ! the renames must be durable
+            call io_check(ios)                   ! before the marker goes
+            if (ios /= 0) then
+                stat = SQR_ERR
+                return
+            end if
+        end if
+        ios = 0
+        if (c_path_exists(alter_marker_path(db, name))) ios = c_remove(alter_marker_path(db, name))
+        if (ios == 0 .and. db%durable) ios = c_fsync_dir(db%dir)
+        call io_check(ios)
+        stat = merge(SQR_ERR, SQR_OK, ios /= 0)
     end subroutine
 
 end submodule sqr_table

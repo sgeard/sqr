@@ -28,7 +28,10 @@ crash, even at the cost of an `fsync` per write.
   independently reusable.
 - **Schema evolution:** `ADD COLUMN` / `DROP COLUMN` by table rewrite, with
   row ids preserved (no index rebuild) and `DROP` cascading to dependent
-  indices.
+  indices; `db_reshape_table` makes a table exactly a declared column list
+  (drop, add and reorder matched by name) in one rewrite.  Every layout change
+  stages its rewritten data and schema, commits with a durable marker and
+  swaps by renames, so an interrupted change is rolled forward on open.
 - **Crash-safe transactions:** explicit `db_begin`/`db_commit`/`db_rollback`,
   plus auto-commit brackets around every single-row mutator. See
   [ACID guarantees](#acid-guarantees) below.
@@ -132,7 +135,8 @@ call db_commit(db, st)     ! durable here; or db_rollback(db, st)
 
 - **Lifecycle:** `db_open`, `db_close`, `db_set_readonly`
 - **Tables:** `db_create_table`, `db_drop_table`, `db_compact`,
-  `db_add_column`, `db_drop_column`, `db_list_tables`, `db_table_index`,
+  `db_add_column`, `db_drop_column`, `db_reshape_table`, `db_list_tables`,
+  `db_table_index`,
   `idx_live`
 - **Rows:** `db_insert`, `db_get`, `db_update`, `db_delete`, `db_scan`,
   `db_insert_many`

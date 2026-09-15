@@ -45,6 +45,8 @@ program utest_fault
     call sweep('create_index', prep_rows,        op_index,   .false.)
     call sweep('find_by_int',  prep_indexed,     op_find,    .false.)
     call sweep('compact',      prep_compactable, op_compact, .false.)
+    call sweep('reshape',      prep_indexed,     op_reshape, .false.)
+    call reshape_atomicity()
     call sweep('set_text',     prep_textrow,     op_settext, .false.)
     call sweep('get_text',     prep_textset,     op_gettext, .false., expect=SQR_ERR)
     ! Every sweep closes its handle after each faulted run: an error path that
@@ -368,6 +370,79 @@ contains
         integer(int32) :: rid
         call db_find_by_int(gdb, 'people', 'age', 45_int32, rid, rs)
     end subroutine op_find
+
+    ! Reshape `people` (pid, age, name, bio; age indexed): drop the indexed
+    ! `age`, move `name` first, add `score` - every kind of change in one rewrite.
+    subroutine op_reshape(rs)
+        integer, intent(out) :: rs
+        type(column_t) :: c(4)
+        c(1)%name = 'name' ; c(1)%dtype = DT_CHAR ; c(1)%csize = 16
+        c(2)%name = 'pid'  ; c(2)%dtype = DT_INT  ; c(2)%csize = 4
+        c(3)%name = 'bio'  ; c(3)%dtype = DT_TEXT ; c(3)%csize = SQR_TEXT_DESC
+        c(4)%name = 'score'; c(4)%dtype = DT_INT  ; c(4)%csize = 4
+        call db_reshape_table(gdb, 'people', c, rs)
+    end subroutine op_reshape
+
+    ! A reshape that fails at any I/O point leaves a database that reopens as
+    ! EITHER the whole old table (4 columns, age second, Bob aged 45, the age
+    ! index answering) OR the whole new one (name first, no age, Bob's name
+    ! kept, score NULL) - never a mixture - and db_verify passes either way.
+    ! (A failure past the commit point legitimately leaves the new layout.)
+    subroutine reshape_atomicity()
+        type(db_t) :: db
+        integer :: nops, n, rs, bad, ti
+        integer(int32) :: rid
+        character(len=:), allocatable :: buf
+        character(len=128) :: em
+        logical :: old_ok, new_ok
+        call fault_disarm()
+        call prep_indexed()
+        call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
+        call fault_arm(BIG)
+        call op_reshape(rs)
+        nops = fault_count()
+        call fault_disarm()
+        call close_g()
+        bad = 0
+        sweep_loop: do n = 1, nops
+            call prep_indexed()
+            call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
+            call fault_arm(n)
+            call op_reshape(rs)
+            call fault_disarm()
+            call close_g()
+            if (rs == SQR_OK) cycle sweep_loop
+            call db_open(db, DBDIR, rs)
+            if (rs /= SQR_OK) then
+                print '(a,i0,a,i0)', '  reshape fault ', n, ': reopen failed ', rs
+                bad = bad + 1
+                cycle sweep_loop
+            end if
+            ti = db_table_index(db, 'people')
+            call row_alloc(buf, db%tables(ti)%record_size)
+            call db_get(db, 'people', 2_int32, buf, rs)
+            old_ok = .false.;  new_ok = .false.
+            if (rs == SQR_OK .and. db%tables(ti)%ncols == 4) then
+                if (trim(db%tables(ti)%cols(2)%name) == 'age') then
+                    old_ok = row_get_int(buf, db%tables(ti)%cols(2)) == 45_int32
+                    call db_find_by_int(db, 'people', 'age', 21_int32, rid, rs)
+                    old_ok = old_ok .and. rs == SQR_OK .and. rid == 3_int32
+                else if (trim(db%tables(ti)%cols(1)%name) == 'name') then
+                    new_ok = trim(row_get_char(buf, db%tables(ti)%cols(1))) == 'Bob' .and. &
+                             row_is_null(buf, db%tables(ti)%cols(4))
+                end if
+            end if
+            em = ''
+            call db_verify(db, 'people', rs, em)
+            if (.not. (old_ok .or. new_ok) .or. rs /= SQR_OK) then
+                print '(a,i0,a,l1,l1,a,i0,1x,a)', '  reshape fault ', n, ': old/new ', old_ok, new_ok, &
+                    ' verify ', rs, trim(em)
+                bad = bad + 1
+            end if
+            call db_close(db)
+        end do sweep_loop
+        call check(bad == 0, 'reshape: every failed reshape reopens wholly old or wholly new, verified')
+    end subroutine reshape_atomicity
 
     subroutine op_compact(rs)
         integer, intent(out) :: rs

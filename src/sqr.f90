@@ -316,6 +316,7 @@ module sqr
         procedure :: drop_table   => db_drop_table
         procedure :: add_column   => db_add_column
         procedure :: drop_column  => db_drop_column
+        procedure :: reshape_table => db_reshape_table
         procedure :: compact      => db_compact
         procedure :: list_tables  => db_list_tables
         procedure :: table_index  => db_table_index
@@ -406,7 +407,7 @@ module sqr
     public :: db_quiesce, db_resume
     public :: db_create_table, db_drop_table, db_compact
     public :: db_pack, db_pack_live, db_unpack
-    public :: db_add_column, db_drop_column
+    public :: db_add_column, db_drop_column, db_reshape_table
     public :: db_list_tables, db_table_index, db_record_size, db_describe, db_row_count, db_in_txn, idx_live
     public :: db_last_error, sqr_errstr
     public :: db_insert, db_get, db_update, db_delete, db_scan
@@ -703,6 +704,35 @@ module sqr
             class(db_t),      intent(inout)           :: db  !! Database handle
             character(len=*), intent(in)              :: table_name  !! Target table
             character(len=*), intent(in)              :: col_name  !! Column to drop
+            integer,          intent(out),  optional  :: stat  !! `SQR_OK` or an error code
+            character(len=*), intent(inout), optional :: errmsg  !! Human-readable failure detail
+        end subroutine
+
+        !! Make a table's stored layout exactly `cols` in one rewrite (schema
+        !! evolution toward a declared column list).  Columns are matched to the
+        !! stored ones **by name**: a match keeps its values and NULL state (its
+        !! `dtype` and `csize` must be unchanged), a column of `cols` with no
+        !! stored match is added as NULL, a stored column absent from `cols` is
+        !! dropped, and the record is laid out in the order of `cols`.
+        !! **CASCADE**: an index with a dropped member is dropped, as for
+        !! `db_drop_column`; surviving indices are kept unrebuilt.
+        !!
+        !! CONTRACT: row_ids are **preserved**.  A `cols` equal to the stored
+        !! layout (same names, types, sizes, order) is a no-op: nothing is
+        !! rewritten and the Undo/Redo history is kept.  Otherwise the history is
+        !! reset, as for any record-size change.  Only `name`, `dtype` and
+        !! `csize` of each element are read; offsets are laid out afresh.
+        !! Fails with `SQR_NOT_FOUND` (no such table), `SQR_INVALID` (an empty or
+        !! malformed column set, a duplicate name, or a matched column whose type
+        !! or size differs - no conversion is attempted), `SQR_READONLY`, or
+        !! inside a transaction.  Same build-then-swap durability as
+        !! `db_add_column`.  A dropped `DT_TEXT` column's blob bytes are kept
+        !! until the table's text is rewritten (the whole blob file is deleted
+        !! when the last `DT_TEXT` column goes).
+        module subroutine db_reshape_table(db, table_name, cols, stat, errmsg)
+            class(db_t),      intent(inout)           :: db  !! Database handle
+            character(len=*), intent(in)              :: table_name  !! Target table
+            type(column_t),   intent(in)              :: cols(:)  !! The complete target column list
             integer,          intent(out),  optional  :: stat  !! `SQR_OK` or an error code
             character(len=*), intent(inout), optional :: errmsg  !! Human-readable failure detail
         end subroutine

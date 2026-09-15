@@ -78,6 +78,8 @@ program utest_sqr
     call test_idx_live_direct()
     call test_insert_many()
     call test_alter_column()
+    call test_reshape_table()
+    call test_alter_recovery()
     call test_oo_bindings()
     call test_coverage_paths()
     call test_clib_wrappers()
@@ -3861,6 +3863,181 @@ contains
     end function
 
     ! ===== #7 schema evolution: add / drop column =====
+
+    ! db_reshape_table: one rewrite to a declared column list - drop, reorder
+    ! and add together, matched by name, row ids and survivors' values kept.
+    subroutine test_reshape_table()
+        character(len=*), parameter :: RDIR = 'utest_sqr_reshape_db'
+        type(db_t) :: db
+        type(column_t) :: c(4), t2(4), bad(2)
+        integer :: rs, ios, ti, gen0
+        integer(int32) :: rid
+        character(len=:), allocatable :: buf, got
+        character(len=128) :: emsg
+
+        ios = c_rmtree(RDIR)
+        c(1)%name = 'pid'  ; c(1)%dtype = DT_INT  ; c(1)%csize = 4
+        c(2)%name = 'age'  ; c(2)%dtype = DT_INT  ; c(2)%csize = 4
+        c(3)%name = 'name' ; c(3)%dtype = DT_CHAR ; c(3)%csize = 32
+        c(4)%name = 'bio'  ; c(4)%dtype = DT_TEXT ; c(4)%csize = SQR_TEXT_DESC
+        call db_open(db, RDIR, rs, emsg)
+        call db_create_table(db, 'people', c, rs, emsg)
+        ti = db_table_index(db, 'people')
+        call db_create_index(db, 'people', 'age', rs)    ! cascades with age
+        call db_create_index(db, 'people', 'name', rs)   ! survives, moves to slot 1
+        call ins_ic3(db, 'people', ti, 1_int32, 30_int32, 'Alice', buf)
+        call ins_ic3(db, 'people', ti, 2_int32, 40_int32, 'Bob',   buf)
+        call ins_ic3(db, 'people', ti, 3_int32, 50_int32, 'Carol', buf)
+        call db_set_text(db, 'people', 3_int32, 'bio', 'carol bio', rs)
+        call db_delete(db, 'people', 2_int32, rs)
+        call check(rs == SQR_OK, 'reshape: setup (2 indices, text, 3 rows, 1 deleted)')
+
+        ! --- equal layout: a no-op (no rewrite, cursors not invalidated) ---
+        gen0 = db%generation
+        call db_reshape_table(db, 'people', c, rs, emsg)
+        call check(rs == SQR_OK .and. db%generation == gen0, 'reshape: equal layout is a no-op')
+
+        ! --- drop age (indexed), name first, keep pid and bio, add score ---
+        t2(1)%name = 'name' ; t2(1)%dtype = DT_CHAR ; t2(1)%csize = 32
+        t2(2)%name = 'pid'  ; t2(2)%dtype = DT_INT  ; t2(2)%csize = 4
+        t2(3)%name = 'bio'  ; t2(3)%dtype = DT_TEXT ; t2(3)%csize = SQR_TEXT_DESC
+        t2(4)%name = 'score'; t2(4)%dtype = DT_INT  ; t2(4)%csize = 4
+        call db_reshape_table(db, 'people', t2, rs, emsg)
+        call check(rs == SQR_OK, 'reshape: drop + reorder + add in one call')
+        ti = db_table_index(db, 'people')
+        call check(db%tables(ti)%ncols == 4 .and. trim(db%tables(ti)%cols(1)%name) == 'name' .and. &
+                   trim(db%tables(ti)%cols(4)%name) == 'score', 'reshape: stored layout is the target order')
+        call row_alloc(buf, db%tables(ti)%record_size)
+        call db_get(db, 'people', 1_int32, buf, rs)
+        call check(rs == SQR_OK .and. trim(row_get_char(buf, db%tables(ti)%cols(1))) == 'Alice' .and. &
+                   row_get_int(buf, db%tables(ti)%cols(2)) == 1, 'reshape: row 1 values follow their names')
+        call check(row_is_null(buf, db%tables(ti)%cols(4)), 'reshape: the added column reads NULL')
+        call db_get(db, 'people', 2_int32, buf, rs)
+        call check(rs == SQR_NOT_FOUND, 'reshape: the tombstoned row id stays tombstoned')
+        call db_get(db, 'people', 3_int32, buf, rs)
+        call check(rs == SQR_OK .and. row_get_int(buf, db%tables(ti)%cols(2)) == 3, &
+                   'reshape: row 3 keeps its row id')
+        call db_get_text(db, 'people', 3_int32, 'bio', got, rs)
+        call check(rs == SQR_OK .and. got == 'carol bio', 'reshape: text survives a moved column')
+        call db_find_by_int(db, 'people', 'age', 30_int32, rid, rs)
+        call check(rs /= SQR_OK, 'reshape: CASCADE removed the age index')
+        call db_find_by_char(db, 'people', 'name', 'Carol', rid, rs)
+        call check(rs == SQR_OK .and. rid == 3, 'reshape: the name index survives its column moving')
+        call db_verify(db, 'people', rs, emsg)
+        call check(rs == SQR_OK, 'reshape: db_verify passes')
+
+        ! --- persistence ---
+        call db_close(db)
+        call db_open(db, RDIR, rs, emsg)
+        ti = db_table_index(db, 'people')
+        call check(rs == SQR_OK .and. trim(db%tables(ti)%cols(1)%name) == 'name', 'reshape: layout persists')
+        call db_find_by_char(db, 'people', 'name', 'Alice', rid, rs)
+        call check(rs == SQR_OK .and. rid == 1, 'reshape: index persists')
+
+        ! --- refusals ---
+        bad(1) = t2(1); bad(2) = t2(2); bad(2)%csize = 8   ! pid 4 -> 8 bytes
+        call db_reshape_table(db, 'people', bad, rs, emsg)
+        call check(rs == SQR_INVALID, 'reshape: a size change is refused')
+        bad(2) = t2(2); bad(2)%dtype = DT_REAL; bad(2)%csize = 8
+        call db_reshape_table(db, 'people', bad, rs, emsg)
+        call check(rs == SQR_INVALID, 'reshape: a type change is refused')
+        ti = db_table_index(db, 'people')
+        call check(db%tables(ti)%ncols == 4, 'reshape: a refused reshape changes nothing')
+        bad(1) = t2(1); bad(2) = t2(1)
+        call db_reshape_table(db, 'people', bad, rs, emsg)
+        call check(rs == SQR_INVALID, 'reshape: a duplicate name is refused')
+        call db_reshape_table(db, 'people', t2(1:0), rs, emsg)
+        call check(rs == SQR_INVALID, 'reshape: an empty column list is refused')
+        call db_reshape_table(db, 'nosuch', t2, rs, emsg)
+        call check(rs == SQR_NOT_FOUND, 'reshape: a missing table')
+        call db_begin(db, rs)
+        call db_reshape_table(db, 'people', c(1:3), rs, emsg)
+        call check(rs /= SQR_OK, 'reshape: refused inside a transaction')
+        call db_rollback(db, rs)
+        call db_close(db)
+        call db_open(db, RDIR, rs, emsg, readonly=.true.)
+        call db_reshape_table(db, 'people', c(1:3), rs, emsg)
+        call check(rs == SQR_READONLY, 'reshape: refused read-only')
+        call db_close(db)
+        ios = c_rmtree(RDIR)
+    end subroutine test_reshape_table
+
+    ! An interrupted layout change is rolled forward on open.  The interrupted
+    ! states are built by hand: a twin database is reshaped for real, and its
+    ! data and schema are placed beside the original as the staged `.alter`
+    ! files, with the `.altering` marker - (a) nothing renamed yet, (b) the data
+    ! already renamed.  A read-only open refuses; a read-write open finishes the
+    ! swap and the table reads in the new layout.
+    subroutine test_alter_recovery()
+        character(len=*), parameter :: ODIR = 'utest_sqr_altrec_db', TDIR = 'utest_sqr_altrec_twin'
+        type(db_t) :: db
+        type(column_t) :: c(3), t2(2)
+        integer :: rs, ios, ti, k
+        character(len=:), allocatable :: buf
+        character(len=128) :: emsg
+        character(len=32) :: stage
+        logical :: okc
+        c(1)%name = 'pid'  ; c(1)%dtype = DT_INT  ; c(1)%csize = 4
+        c(2)%name = 'age'  ; c(2)%dtype = DT_INT  ; c(2)%csize = 4
+        c(3)%name = 'name' ; c(3)%dtype = DT_CHAR ; c(3)%csize = 32
+        t2(1) = c(3);  t2(2) = c(1)
+        do k = 1, 2
+            stage = merge('before any rename    ', 'after the data rename', k == 1)
+            ios = c_rmtree(ODIR);  ios = c_rmtree(TDIR)
+            call altrec_people(ODIR)
+            call altrec_people(TDIR)
+            call db_open(db, TDIR, rs, emsg)
+            call db_reshape_table(db, 'people', t2, rs, emsg)
+            call db_close(db)
+            if (k == 1) then
+                call copy_file(TDIR // '/people.dat', ODIR // '/people.dat.alter', okc)
+            else
+                call copy_file(TDIR // '/people.dat', ODIR // '/people.dat', okc)
+            end if
+            call copy_file(TDIR // '/people.schema', ODIR // '/people.schema.alter', okc)
+            call copy_file(TDIR // '/people.schema', ODIR // '/people.altering', okc)   ! any bytes: presence counts
+
+            call db_open(db, ODIR, rs, emsg, readonly=.true.)
+            call check(rs == SQR_READONLY, 'altrec (' // trim(stage) // '): read-only open refuses')
+            call db_open(db, ODIR, rs, emsg)
+            call check(rs == SQR_OK, 'altrec (' // trim(stage) // '): read-write open recovers')
+            ti = db_table_index(db, 'people')
+            call check(db%tables(ti)%ncols == 2 .and. trim(db%tables(ti)%cols(1)%name) == 'name', &
+                       'altrec (' // trim(stage) // '): the staged layout is in force')
+            call row_alloc(buf, db%tables(ti)%record_size)
+            call db_get(db, 'people', 2_int32, buf, rs)
+            call check(rs == SQR_OK .and. trim(row_get_char(buf, db%tables(ti)%cols(1))) == 'Bob' .and. &
+                       row_get_int(buf, db%tables(ti)%cols(2)) == 2, &
+                       'altrec (' // trim(stage) // '): rows read in the new layout')
+            call db_verify(db, 'people', rs, emsg)
+            call check(rs == SQR_OK, 'altrec (' // trim(stage) // '): db_verify passes')
+            call db_close(db)
+            call check(.not. c_path_exists(ODIR // '/people.altering') .and. &
+                       .not. c_path_exists(ODIR // '/people.dat.alter') .and. &
+                       .not. c_path_exists(ODIR // '/people.schema.alter'), &
+                       'altrec (' // trim(stage) // '): marker and staged files gone')
+        end do
+        ios = c_rmtree(ODIR);  ios = c_rmtree(TDIR)
+    end subroutine test_alter_recovery
+
+    ! A two-row people(pid, age, name) table with a name index (altrec fixture).
+    subroutine altrec_people(dir)
+        character(len=*), intent(in) :: dir
+        type(db_t) :: d
+        type(column_t) :: c(3)
+        integer :: r, tj
+        character(len=:), allocatable :: b
+        c(1)%name = 'pid'  ; c(1)%dtype = DT_INT  ; c(1)%csize = 4
+        c(2)%name = 'age'  ; c(2)%dtype = DT_INT  ; c(2)%csize = 4
+        c(3)%name = 'name' ; c(3)%dtype = DT_CHAR ; c(3)%csize = 32
+        call db_open(d, dir, r)
+        call db_create_table(d, 'people', c, r)
+        tj = db_table_index(d, 'people')
+        call db_create_index(d, 'people', 'name', r)
+        call ins_ic3(d, 'people', tj, 1_int32, 30_int32, 'Alice', b)
+        call ins_ic3(d, 'people', tj, 2_int32, 40_int32, 'Bob',   b)
+        call db_close(d)
+    end subroutine altrec_people
 
     subroutine test_alter_column()
         character(len=*), parameter :: ADIR = 'utest_sqr_alter_db'

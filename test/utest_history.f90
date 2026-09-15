@@ -357,6 +357,16 @@ contains
         call check(rs == SQR_OK .and. .not. db_can_undo(db), 'struct: db_drop_column clears history')
         call db_close(db); ios = c_rmtree('utest_hist_struct')
 
+        ! db_reshape_table: a real layout change clears the history; a reshape to
+        ! the layout the table already has rewrites nothing and keeps it.
+        call prime2(db, 'utest_hist_struct'); r1 = ins(db, 5)
+        call db_begin(db, rs, label='G'); call setv(db, r1, 6); call db_commit(db, rs)
+        call db_reshape_table(db, 't', db%tables(db_table_index(db, 't'))%cols, rs)
+        call check(rs == SQR_OK .and. db_can_undo(db), 'struct: a no-op db_reshape_table keeps history')
+        call db_reshape_table(db, 't', [db%tables(db_table_index(db, 't'))%cols, newc], rs)
+        call check(rs == SQR_OK .and. .not. db_can_undo(db), 'struct: db_reshape_table clears history')
+        call db_close(db); ios = c_rmtree('utest_hist_struct')
+
         call prime2(db, 'utest_hist_struct'); r1 = ins(db, 5)
         call db_begin(db, rs, label='G'); call setv(db, r1, 6); call db_commit(db, rs)
         call db_drop_table(db, 't', rs)

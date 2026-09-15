@@ -197,6 +197,17 @@ contains
         p = pathjoin(db%dir, trim(name) // '.compacting')
     end function
 
+    ! Marker dropped by a column-layout change (add / drop column, reshape)
+    ! once its rewritten data file and schema are staged durably beside the
+    ! originals.  Its presence on open means the swap was interrupted and must
+    ! be rolled forward before the schema is read (complete_alter_swap).
+    pure function alter_marker_path(db, name) result(p)
+        type(db_t),       intent(in)  :: db
+        character(len=*), intent(in)  :: name
+        character(len=:), allocatable :: p
+        p = pathjoin(db%dir, trim(name) // '.altering')
+    end function
+
     ! Order-sensitive rolling checksum over a byte image, folded into a
     ! non-negative int32. Used by the journal (torn-payload detection) and the
     ! pack/unpack codec (truncated-container detection); one definition here so
@@ -673,14 +684,47 @@ contains
         type(db_t),    intent(in)    :: db
         type(table_t), intent(inout) :: tbl
         integer,       intent(out)   :: stat
+        character(len=:), allocatable :: final, tmp
+        final = schema_path(db, tbl%name)
+        tmp   = final // '.tmp'
+        call write_schema_file(tbl, tmp, stat)
+        if (stat /= SQR_OK) return
+        call atomic_replace(db, tmp, final, stat)
+        if (stat == SQR_OK) then
+            tbl%disk_next_id    = tbl%next_id
+            tbl%disk_live_count = tbl%live_count
+        end if
+    end subroutine
+
+    ! Write `tbl`'s schema to `path` and make it durable there, WITHOUT putting
+    ! it in place: the staging half of a layout change, whose swap commits the
+    ! schema and the rewritten data file together (apply_layout_change).
+    subroutine stage_schema(db, tbl, path, stat)
+        type(db_t),       intent(in)  :: db
+        type(table_t),    intent(in)  :: tbl
+        character(len=*), intent(in)  :: path
+        integer,          intent(out) :: stat
+        integer :: ios
+        call write_schema_file(tbl, path, stat)
+        if (stat /= SQR_OK) return
+        if (db%durable) then
+            ios = c_fsync_path(path)
+            call io_check(ios)
+            if (ios /= 0) stat = SQR_ERR
+        end if
+    end subroutine
+
+    ! The schema file body: write `tbl`'s header, columns and index set to
+    ! `path` (replaced); a failed write deletes the partial file.
+    subroutine write_schema_file(tbl, path, stat)
+        type(table_t),    intent(in)  :: tbl
+        character(len=*), intent(in)  :: path
+        integer,          intent(out) :: stat
         integer :: u, ios, i, m
         character(len=4) :: magic
         character(len=SQR_NAME_LEN) :: nm
-        character(len=:), allocatable :: final, tmp
         magic = SQR_MAGIC
-        final = schema_path(db, tbl%name)
-        tmp   = final // '.tmp'
-        open(newunit=u, file=tmp, access='stream', form='unformatted', &
+        open(newunit=u, file=path, access='stream', form='unformatted', &
              status='replace', action='write', iostat=ios)
         if (ios /= 0) then
             stat = SQR_ERR
@@ -726,11 +770,7 @@ contains
             stat = SQR_ERR
             return
         end if
-        call atomic_replace(db, tmp, final, stat)
-        if (stat == SQR_OK) then
-            tbl%disk_next_id    = tbl%next_id
-            tbl%disk_live_count = tbl%live_count
-        end if
+        stat = SQR_OK
     end subroutine
 
     ! True when the counters have moved since the schema file last held them.
