@@ -178,7 +178,7 @@ contains
         if (present(bytes)) then
             r%bytes = bytes
         else
-            call read_region(pathjoin(db%dir, trim(path)), offset, rlen, r%bytes, ios)
+            call read_region(db, trim(path), offset, rlen, r%bytes, ios)
             call io_check(ios)
             if (ios /= 0) then
                 if (present(stat)) stat = SQR_ERR
@@ -437,6 +437,7 @@ contains
         character(len=4) :: magic
         integer          :: u, ios, fmt, state, nrec, cksum, i, st
         integer(int64)   :: plen, fsize
+        logical          :: held
         st = SQR_OK
         if (.not. allocated(db%jrnl%path)) &
             db%jrnl%path = pathjoin(db%dir, '_journal.dat')
@@ -444,17 +445,26 @@ contains
             if (present(stat)) stat = SQR_OK
             return
         end if
-        open(newunit=u, file=db%jrnl%path, access='stream', form='unformatted', &
-             status='old', action='readwrite', iostat=ios)
-        if (ios /= 0) then
-            if (present(stat)) stat = SQR_ERR
-            return
+        ! A live handle already holds the journal on its own unit (jrnl_unit):
+        ! read through it rather than connect the file a second time (processor
+        ! dependent - flang refuses), and leave it held.
+        held = (db%jrnl%unit /= -1)
+        if (held) then
+            u = db%jrnl%unit
+            flush(u, iostat=ios)
+        else
+            open(newunit=u, file=db%jrnl%path, access='stream', form='unformatted', &
+                 status='old', action='readwrite', iostat=ios)
+            if (ios /= 0) then
+                if (present(stat)) stat = SQR_ERR
+                return
+            end if
         end if
         read(u, pos=1, iostat=ios) magic, fmt, state, nrec, cksum, plen
-        inquire(unit=u, size=fsize)
+        fsize = file_len(db%jrnl%path)
         if (ios /= 0 .or. magic /= JMAGIC .or. fmt /= JFMT &
                      .or. state /= JSTATE_HOT) then
-            close(u)                       ! absent/void/foreign -> nothing to do
+            if (.not. held) close(u)       ! absent/void/foreign -> nothing to do
             if (present(stat)) stat = SQR_OK
             return
         end if
@@ -468,20 +478,20 @@ contains
         ! clears the int32 ceiling — from reaching a 2 GiB allocate.
         if (plen < 0_int64 .or. plen > int(huge(0), int64) .or. &
             plen > fsize - JHEADER) then
-            close(u)
+            if (.not. held) close(u)
             call void_header(db, st)
             if (present(stat)) stat = st
             return
         end if
         allocate(character(len=int(plen)) :: payload, stat=ios)
         if (ios /= 0) then
-            close(u)
+            if (.not. held) close(u)
             call void_header(db, st)
             if (present(stat)) stat = st
             return
         end if
         if (plen > 0) read(u, pos=JHEADER + 1, iostat=ios) payload
-        close(u)
+        if (.not. held) close(u)
         ! A torn or mismatched payload means arming never completed, so no base
         ! file was touched: discard the journal rather than replay garbage.
         ! Nested rather than `ios /= 0 .or. checksum(...) /= cksum`: .or. does
@@ -539,11 +549,20 @@ contains
             jpath = pathjoin(db%dir, '_journal.dat')
         end if
         if (.not. c_path_exists(jpath)) return
-        open(newunit=u, file=jpath, access='stream', form='unformatted', &
-             status='old', action='read', iostat=ios)
-        if (ios /= 0) return
-        read(u, pos=1, iostat=ios) magic, fmt, state
-        close(u)
+        if (db%jrnl%unit /= -1) then
+            ! The session holds the journal on its own unit (jrnl_unit): read
+            ! the header through it.  A second connection of a connected file
+            ! is processor dependent - flang refuses it.
+            u = db%jrnl%unit
+            flush(u, iostat=ios)
+            read(u, pos=1, iostat=ios) magic, fmt, state
+        else
+            open(newunit=u, file=jpath, access='stream', form='unformatted', &
+                 status='old', action='read', iostat=ios)
+            if (ios /= 0) return
+            read(u, pos=1, iostat=ios) magic, fmt, state
+            close(u)
+        end if
         hot = (ios == 0 .and. magic == JMAGIC .and. fmt == JFMT &
                          .and. state == JSTATE_HOT)
     end function
@@ -824,7 +843,7 @@ contains
         full = pathjoin(db%dir, r%path)
         select case (r%kind)
         case (UNDO_REGION)
-            call restore_region(full, r%offset, r%bytes, ios)
+            call restore_region(db, r%path, r%offset, r%bytes, ios)
             call io_check(ios)
             if (ios /= 0) st = SQR_ERR
         case (UNDO_EXTEND)
@@ -1233,17 +1252,114 @@ contains
         n = c_file_size(path)
     end function
 
-    ! Read `length` bytes at `offset`.  The length can be derived from on-disk
-    ! metadata (a history delta spans whatever the schema's counters imply), so
-    ! it is bounded before `int()` sees it: an int64 beyond the int32 range
-    ! truncates, and a negative result then reaches the allocate as a wild
-    ! size.  An unallocatable length is reported, never fatal.
-    subroutine read_region(path, offset, length, bytes, ios)
-        character(len=*),              intent(in)  :: path
+    ! ---- region IO through the unit sqr already holds -------------------------
+    ! sqr keeps each table's data, blob and index files connected for the
+    ! session.  Connecting a connected file to a SECOND unit is processor
+    ! dependent (ifx and gfortran allow it, flang refuses), so every byte-range
+    ! read or write of a base file goes through the unit already holding it,
+    ! and opens by name only when none does (recovery before the units exist,
+    ! a file sqr does not hold).  `rel` is the db-relative path the journal
+    ! records.
+
+    ! The unit sqr holds on `rel` (-1 if none) and its record length: 0 for a
+    ! stream unit (blob), the record / page size for a direct unit (data, index).
+    subroutine held_unit(db, rel, u, recl)
+        class(db_t),      intent(in)  :: db
+        character(len=*), intent(in)  :: rel
+        integer,          intent(out) :: u, recl
+        integer :: ti, j
+        u = -1;  recl = 0
+        do ti = 1, db%ntables
+            associate (t => db%tables(ti))
+                if (t%unit /= -1 .and. rel == data_relpath(t%name)) then
+                    u = t%unit;  recl = t%record_size;  return
+                end if
+                if (t%blob_unit /= -1 .and. rel == blob_relpath(t%name)) then
+                    u = t%blob_unit;  recl = 0;  return
+                end if
+                do j = 1, t%nindices
+                    if (.not. idx_live(t%indices(j))) cycle
+                    if (t%indices(j)%bt%unit == -1) cycle
+                    if (rel == index_relpath(t%name, j)) then
+                        u = t%indices(j)%bt%unit;  recl = t%indices(j)%bt%page_size;  return
+                    end if
+                end do
+            end associate
+        end do
+    end subroutine
+
+    ! Read bytes(1:len(bytes)) from byte `offset` of a connected unit: stream
+    ! by position, direct record by record (a range need not align to records).
+    subroutine unit_read(u, recl, offset, bytes, ios)
+        integer,          intent(in)    :: u, recl
+        integer(int64),   intent(in)    :: offset
+        character(len=*), intent(inout) :: bytes
+        integer,          intent(out)   :: ios
+        character(len=:), allocatable :: rec
+        integer(int64) :: k, rstart, lo, hi, last
+        ios = 0
+        if (len(bytes) == 0) return
+        if (recl == 0) then
+            read(u, pos=offset, iostat=ios) bytes
+            return
+        end if
+        allocate(character(len=recl) :: rec)
+        last = offset + len(bytes) - 1
+        do k = (offset - 1) / recl + 1, (last - 1) / recl + 1
+            read(u, rec=k, iostat=ios) rec
+            if (ios /= 0) return
+            rstart = (k - 1) * recl + 1
+            lo = max(offset, rstart);  hi = min(last, rstart + recl - 1)
+            bytes(lo - offset + 1:hi - offset + 1) = rec(lo - rstart + 1:hi - rstart + 1)
+        end do
+    end subroutine
+
+    ! Write `bytes` at byte `offset` of a connected unit and flush it.  A direct
+    ! unit writes whole records: a record the range covers only partly is read
+    ! first and patched (read as zeros when it lies past the end of the file).
+    subroutine unit_write(u, recl, offset, bytes, ios)
+        integer,          intent(in)  :: u, recl
+        integer(int64),   intent(in)  :: offset
+        character(len=*), intent(in)  :: bytes
+        integer,          intent(out) :: ios
+        character(len=:), allocatable :: rec
+        integer(int64) :: k, rstart, lo, hi, last
+        integer :: rios
+        ios = 0
+        if (len(bytes) == 0) return
+        if (recl == 0) then
+            write(u, pos=offset, iostat=ios) bytes
+            if (ios == 0) flush(u, iostat=ios)
+            return
+        end if
+        allocate(character(len=recl) :: rec)
+        last = offset + len(bytes) - 1
+        do k = (offset - 1) / recl + 1, (last - 1) / recl + 1
+            rstart = (k - 1) * recl + 1
+            lo = max(offset, rstart);  hi = min(last, rstart + recl - 1)
+            if (lo > rstart .or. hi < rstart + recl - 1) then
+                read(u, rec=k, iostat=rios) rec
+                if (rios /= 0) rec = repeat(char(0), recl)
+            end if
+            rec(lo - rstart + 1:hi - rstart + 1) = bytes(lo - offset + 1:hi - offset + 1)
+            write(u, rec=k, iostat=ios) rec
+            if (ios /= 0) return
+        end do
+        flush(u, iostat=ios)
+    end subroutine
+
+    ! Read `length` bytes at `offset` of base file `rel`.  The length can be
+    ! derived from on-disk metadata (a history delta spans whatever the schema's
+    ! counters imply), so it is bounded before `int()` sees it: an int64 beyond
+    ! the int32 range truncates, and a negative result then reaches the
+    ! allocate as a wild size.  An unallocatable length is reported, never fatal.
+    subroutine read_region(db, rel, offset, length, bytes, ios)
+        class(db_t),                   intent(in)  :: db
+        character(len=*),              intent(in)  :: rel
         integer(int64),                intent(in)  :: offset, length
         character(len=:), allocatable, intent(out) :: bytes
         integer,                       intent(out) :: ios
-        integer :: u
+        integer :: u, recl
         if (length < 0_int64 .or. length > int(huge(0), int64)) then
             bytes = ''
             ios   = 1
@@ -1255,7 +1371,13 @@ contains
             ios   = 1
             return
         end if
-        open(newunit=u, file=path, access='stream', form='unformatted', &
+        call held_unit(db, rel, u, recl)
+        if (u /= -1) then
+            flush(u, iostat=ios)
+            call unit_read(u, recl, offset, bytes, ios)
+            return
+        end if
+        open(newunit=u, file=pathjoin(db%dir, rel), access='stream', form='unformatted', &
              status='old', action='read', iostat=ios)
         if (ios /= 0) return
         read(u, pos=offset, iostat=ios) bytes
@@ -1263,18 +1385,27 @@ contains
     end subroutine
 
     ! write_region for the undo path: the part of the region beyond the file's
-    ! end is dropped (see apply_undo).  The size is taken from the same unit
-    ! that performs the write, so nothing can change it in between — and it
-    ! costs no extra open, which matters because rollback runs this per
-    ! captured record.
-    subroutine restore_region(path, offset, bytes, ios)
-        character(len=*), intent(in)  :: path
+    ! end is dropped (see apply_undo).  On an unheld file the size is taken
+    ! from the same unit that performs the write, so nothing can change it in
+    ! between; a held unit is flushed and its on-disk size read by stat.
+    subroutine restore_region(db, rel, offset, bytes, ios)
+        class(db_t),      intent(in)  :: db
+        character(len=*), intent(in)  :: rel
         integer(int64),   intent(in)  :: offset
         character(len=*), intent(in)  :: bytes
         integer,          intent(out) :: ios
-        integer        :: u
+        integer        :: u, recl
         integer(int64) :: cursize, span
-        open(newunit=u, file=path, access='stream', form='unformatted', &
+        call held_unit(db, rel, u, recl)
+        if (u /= -1) then
+            flush(u, iostat=ios)
+            if (ios /= 0) return
+            cursize = file_len(pathjoin(db%dir, rel))
+            span = min(int(len(bytes), int64), cursize - offset + 1_int64)
+            if (span > 0_int64) call unit_write(u, recl, offset, bytes(1:int(span)), ios)
+            return
+        end if
+        open(newunit=u, file=pathjoin(db%dir, rel), access='stream', form='unformatted', &
              status='old', action='readwrite', iostat=ios)
         if (ios /= 0) return
         inquire(unit=u, size=cursize)
@@ -1286,13 +1417,20 @@ contains
         close(u)
     end subroutine
 
-    subroutine write_region(path, offset, bytes, ios)
-        character(len=*), intent(in)  :: path
+    ! Write `bytes` at `offset` of base file `rel` (history apply).
+    subroutine write_region(db, rel, offset, bytes, ios)
+        class(db_t),      intent(in)  :: db
+        character(len=*), intent(in)  :: rel
         integer(int64),   intent(in)  :: offset
         character(len=*), intent(in)  :: bytes
         integer,          intent(out) :: ios
-        integer :: u
-        open(newunit=u, file=path, access='stream', form='unformatted', &
+        integer :: u, recl
+        call held_unit(db, rel, u, recl)
+        if (u /= -1) then
+            call unit_write(u, recl, offset, bytes, ios)
+            return
+        end if
+        open(newunit=u, file=pathjoin(db%dir, rel), access='stream', form='unformatted', &
              status='old', action='readwrite', iostat=ios)
         if (ios /= 0) return
         write(u, pos=offset, iostat=ios) bytes
@@ -1463,7 +1601,7 @@ contains
         d%redo_len = file_len(full)
         if (d%undo_len < 0) d%undo_len = d%redo_len      ! no growth this gesture
         do k = 1, size(d%ranges)
-            call read_region(full, d%ranges(k)%offset, &
+            call read_region(db, d%path, d%ranges(k)%offset, &
                  int(len(d%ranges(k)%undo_bytes), int64), d%ranges(k)%redo_bytes, ios)
             call io_check(ios)
             if (ios /= 0) then
@@ -1474,7 +1612,7 @@ contains
         if (d%redo_len > d%undo_len) then
             call add_region(d, d%undo_len + 1, '')       ! pure tail: empty pre-image
             k = size(d%ranges)
-            call read_region(full, d%undo_len + 1, d%redo_len - d%undo_len, &
+            call read_region(db, d%path, d%undo_len + 1, d%redo_len - d%undo_len, &
                  d%ranges(k)%redo_bytes, ios)
             call io_check(ios)
             if (ios /= 0) then
@@ -1506,7 +1644,7 @@ contains
                         img = d%ranges(k)%undo_bytes
                     end if
                     if (len(img) > 0) then
-                        call write_region(full, d%ranges(k)%offset, img, ios)
+                        call write_region(db, d%path, d%ranges(k)%offset, img, ios)
                         call io_check(ios)
                         if (ios /= 0) st = SQR_ERR
                     end if

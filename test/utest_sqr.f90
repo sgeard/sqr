@@ -102,6 +102,28 @@ program utest_sqr
 
 contains
 
+    ! The in-process crash stand-in's file teardown: close every unit the
+    ! handle holds (data, blob, index trees, journal) WITHOUT flushing state
+    ! back through sqr, as a dead process's files are closed by the OS.  A
+    ! recovering open in this same process must not meet a file still
+    ! connected - a second connection is processor dependent (flang refuses).
+    subroutine crash_units(db)
+        type(db_t), intent(inout) :: db
+        integer :: ti, j, ios
+        do ti = 1, db%ntables
+            associate (t => db%tables(ti))
+                if (t%unit /= -1)      close(t%unit, iostat=ios)
+                if (t%blob_unit /= -1) close(t%blob_unit, iostat=ios)
+                t%unit = -1;  t%blob_unit = -1
+                do j = 1, t%nindices
+                    if (t%indices(j)%bt%unit /= -1) close(t%indices(j)%bt%unit, iostat=ios)
+                    t%indices(j)%bt%unit = -1
+                end do
+            end associate
+        end do
+        call jrnl_close_unit(db)
+    end subroutine crash_units
+
     subroutine check(cond, label)
         logical,          intent(in) :: cond
         character(len=*), intent(in) :: label
@@ -293,8 +315,10 @@ contains
         ! Simulate the crash faithfully: a dead process releases its advisory
         ! lock (the OS drops it), leaving only the hot journal on disk.  Drop
         ! the stale handle's lock so the recovering open below is not blocked
-        ! by this same-process stand-in for the crashed writer.
+        ! by this same-process stand-in for the crashed writer.  A dead process
+        ! also closes every file it held (crash_units).
         call c_lock_release(db%lock_tok)
+        call crash_units(db)
 
         ! A read-only open refuses while the journal is hot.
         call db_open(db2, TEST_DIR, stat=st, readonly=.true.)
@@ -1819,13 +1843,9 @@ contains
         end do insert_loop
         call check(rs == SQR_OK .and. rid == 5, 'crash: five rows inserted (last id 5)')
 
-        ! Force-close the data + index units WITHOUT db_close: the schema keeps
+        ! Force-close every unit WITHOUT db_close (crash_units): the schema keeps
         ! the stale next_id=1 written back at db_create_table.
-        if (db%tables(1)%unit /= -1) close(db%tables(1)%unit)
-        close_idx: do j = 1, db%tables(1)%nindices
-            if (db%tables(1)%indices(j)%bt%unit /= -1) &
-                close(db%tables(1)%indices(j)%bt%unit)
-        end do close_idx
+        call crash_units(db)
         ! A dead process also drops its advisory lock; release it here so the
         ! recovering open is not blocked by this same-process crash stand-in.
         call c_lock_release(db%lock_tok)
@@ -4711,10 +4731,16 @@ contains
         cols(1)%name = 'id'; cols(1)%dtype = DT_INT; cols(1)%csize = 4
 
         ! Create the database so a read-only open has something to attach to.
+        ! It ends table-free: every handle opens its tables' files at db_open,
+        ! and two handles in ONE process would then connect the same file to two
+        ! units, which is processor dependent (flang refuses).  The lock matrix
+        ! is a property of the lock file alone.  A create + drop writes the
+        ! catalog a read-only open requires.
         call db_open(a, LDIR, stat=rs)
         call check(rs == SQR_OK, 'lock: initial rw open succeeds')
         call db_create_table(a, 't', cols, rs)
-        call check(rs == SQR_OK, 'lock: create table')
+        call db_drop_table(a, 't', rs)
+        call check(rs == SQR_OK, 'lock: initialised, table-free')
 
         ! A second writer is refused while the first holds the exclusive lock.
         call db_open(b, LDIR, stat=rs)
@@ -4752,15 +4778,16 @@ contains
         character(len=*), parameter :: SDIR = 'utest_sqr_setro_db'
         type(db_t) :: a, b
         type(column_t) :: cols(1)
-        character(len=:), allocatable :: buf
         integer :: rs, ios
-        integer(int32) :: rid
         ios = c_rmtree(SDIR)
         cols(1)%name = 'id'; cols(1)%dtype = DT_INT; cols(1)%csize = 4
 
+        ! Table-free for the reason test_locking gives: the reader below attaches
+        ! in this same process, so no file may already be held by `a`.
         call db_open(a, SDIR, stat=rs)
         call db_create_table(a, 't', cols, rs)
-        call check(rs == SQR_OK, 'setro: rw open + table')
+        call db_drop_table(a, 't', rs)
+        call check(rs == SQR_OK, 'setro: rw open, initialised, table-free')
 
         ! Before the downgrade, a concurrent reader is blocked by the writer.
         call db_open(b, SDIR, stat=rs, readonly=.true.)
@@ -4770,9 +4797,7 @@ contains
         call db_set_readonly(a, rs)
         call check(rs == SQR_OK, 'setro: set_readonly succeeds')
         call check(a%readonly, 'setro: handle now read-only')
-        call row_alloc(buf, a%tables(1)%record_size)
-        call row_set_int(buf, a%tables(1)%cols(1), 1_int32)
-        call db_insert(a, 't', buf, rid, rs)
+        call db_create_table(a, 't', cols, rs)
         call check(rs == SQR_READONLY, 'setro: write refused after downgrade')
 
         ! With the lock downgraded to shared, a reader can now attach.

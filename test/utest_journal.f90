@@ -79,6 +79,7 @@ contains
         call jwrite_region(FULL, 5_int64, 'CCCC')     ! uncommitted base write
         call check(jrnl_hot(db), 'armed journal reads hot')
         call c_lock_release(db%lock_tok)              ! the crash: OS drops the lock
+        call jrnl_close_unit(db)                      ! ...and every open file with it
     end subroutine arm_hot
 
     ! Arm, perturb the journal, recover via a fresh read-write open, assert
