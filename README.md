@@ -49,7 +49,7 @@ crash, even at the cost of an `fsync` per write.
 - **Two front-ends:** `sqrsh`, a cmdgraph state-graph shell over the engine,
   and `sqlsh`, a small SQL subset (a separate `sql` front-end layer that
   only calls the public API — no SQL in the store). See below.
-- **Portable:** clean on `ifx` and `gfortran`, builds under `fpm`, and
+- **Portable:** clean on `ifx`, `gfortran` and LLVM `flang`, builds under `fpm`, and
   cross-builds to Windows (mingw-w64, wine-validated).
 
 ---
@@ -72,6 +72,7 @@ Compiler and build-mode selection:
 
 ```sh
 make F=gfortran all   # secondary compiler (gfortran)
+make F=flang all      # LLVM flang (23+)
 make F=ifx all        # default
 make debug=1 ...      # debug build
 make windows          # mingw-w64 cross-build (.exe)
@@ -419,8 +420,9 @@ architectural weight here:
 
 - **Compiler discipline.** The standard's strictness about argument
   intent, `pure` procedures and interface checking turns whole bug
-  classes into compile-time errors. The project builds warning-clean on
-  two compilers (ifx and gfortran), and the destruction harness runs
+  classes into compile-time errors. The project builds warning-clean and
+  passes every suite on three compilers (ifx, gfortran and LLVM flang), and
+  the destruction harness runs
   against a `-check all` build, so bounds and shape violations fail loudly
   in test rather than silently in production.
 
