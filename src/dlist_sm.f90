@@ -1,6 +1,6 @@
 !! SPDX-License-Identifier: MIT
 !! Copyright (c) 2026 Simon Geard
-!! Vendored into sqr from https://github.com/sgeard/cmdgraph (fortran/src) at svn r1883, 2026-07-09 (after its v1.3.1 release); kept in sync by hand.
+!! Vendored into sqr from https://github.com/sgeard/cmdgraph (fortran/src) at svn r1883, 2026-07-09 (after its v1.3.1 release); dlist_sm.f90 re-vendored 2026-09-30 (replace_ll gfortran 16 polymorphic-realloc fix); kept in sync by hand.
 !!
 submodule (dlist) dlist_sm
     implicit none
@@ -165,14 +165,17 @@ contains
             return ! index out of range ignored
         end if
 
-        ! Locate the node and reassign its data in place. Intrinsic assignment
-        ! to the allocatable polymorphic component re-fits it to data's dynamic
-        ! type, so a replacement of a different kind (e.g. int -> real) is fine.
+        ! Locate the node and re-allocate its data from the replacement.
+        ! Intrinsic assignment to the allocated polymorphic component would
+        ! suffice by the standard, but gfortran 16 copies a replacement of a
+        ! different dynamic type (e.g. int -> real) into the old, smaller
+        ! block; deallocate + sourced allocate is portable.
         this => lst%begin
         do i = 2, idx
             this => this%next
         end do
-        this%data = data
+        deallocate(this%data)
+        allocate(this%data, source=data)
 
     end subroutine replace_ll
 
