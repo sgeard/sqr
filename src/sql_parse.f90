@@ -12,6 +12,10 @@
 submodule (sql:sql_base) sql_parser
     implicit none
 
+    ! Starting sizes of buffers that double as they fill; not limits.
+    integer, parameter :: LITERAL_INIT_CAP = 64   ! bytes, body of a quoted literal
+    integer, parameter :: LIST_INIT_CAP    = 4    ! elements, the parser's growing lists
+
 contains
 
     ! ===== lexer =====
@@ -36,7 +40,7 @@ contains
             ch = text(i:i)
 
             ! whitespace
-            if (ch == ' ' .or. ch == char(9)) then
+            if (ch == ' ' .or. ch == CH_TAB) then
                 i = i + 1
                 cycle scan
             end if
@@ -174,7 +178,7 @@ contains
             ! Capacity-doubling buffer + length counter: appending one char
             ! at a time to an allocatable reallocates (and copies) the whole
             ! body per character — O(len^2) on a long literal.
-            allocate(character(len=64) :: body)
+            allocate(character(len=LITERAL_INIT_CAP) :: body)
             n = 0
             i = i + 1   ! past opening quote
             do
@@ -247,7 +251,7 @@ contains
         integer :: ntok, p, eofcol, lerr
         logical :: had_err
         character(len=:), allocatable :: emsg
-        character(len=160) :: lmsg
+        character(len=SQR_ERRMSG_LEN) :: lmsg
 
         if (present(stat)) stat = SQR_OK
         had_err = .false.
@@ -418,9 +422,9 @@ contains
             end if
             select case (lower(cur_text()))
             case ('integer', 'int')
-                col%dtype = DT_INT;  col%csize = 4;  call adv()
+                col%dtype = DT_INT;  col%csize = SQR_INT_SIZE;   call adv()
             case ('real')
-                col%dtype = DT_REAL; col%csize = 8;  call adv()
+                col%dtype = DT_REAL; col%csize = SQR_REAL_SIZE;  call adv()
             case ('text')
                 col%dtype = DT_TEXT; col%csize = SQR_TEXT_DESC; call adv()
             case ('char', 'character')
@@ -670,7 +674,7 @@ contains
         ! ---- SELECT ----
 
         subroutine parse_select()
-            character(len=SQR_NAME_LEN) :: cols(256)
+            character(len=SQR_NAME_LEN) :: cols(SQL_MAX_COLS)
             integer :: nc
             call adv()   ! SELECT
             stmt%kind = ST_SELECT
@@ -692,7 +696,7 @@ contains
         ! ---- INSERT ----
 
         subroutine parse_insert()
-            character(len=SQR_NAME_LEN) :: cols(256)
+            character(len=SQR_NAME_LEN) :: cols(SQL_MAX_COLS)
             integer :: nc, ncols, nrows
             type(sql_lit_t), allocatable :: flat(:)
             type(sql_lit_t) :: lit
@@ -821,7 +825,7 @@ contains
         end subroutine
 
         subroutine parse_create_table()
-            type(column_t) :: defs(256)
+            type(column_t) :: defs(SQL_MAX_COLS)
             integer :: nd
             stmt%kind = ST_CREATE_TABLE
             call take_name(stmt%table, 'table name')
@@ -848,7 +852,7 @@ contains
         end subroutine
 
         subroutine parse_create_index()
-            character(len=SQR_NAME_LEN) :: cols(64)
+            character(len=SQR_NAME_LEN) :: cols(SQL_MAX_INDEX_COLS)
             integer :: nc
             if (is_kw(tk(), 'unique')) then
                 call adv()
@@ -873,7 +877,7 @@ contains
         ! ---- DROP (TABLE | INDEX) ----
 
         subroutine parse_drop()
-            character(len=SQR_NAME_LEN) :: cols(64)
+            character(len=SQR_NAME_LEN) :: cols(SQL_MAX_INDEX_COLS)
             integer :: nc
             call adv()   ! DROP
             if (is_kw(tk(), 'table')) then
@@ -943,7 +947,7 @@ contains
             integer,                             intent(inout) :: n
             type(sql_cond_group_t),              intent(in)    :: elem
             type(sql_cond_group_t), allocatable :: tmp(:)
-            if (.not. allocated(arr)) allocate(arr(4))
+            if (.not. allocated(arr)) allocate(arr(LIST_INIT_CAP))
             if (n == size(arr)) then
                 allocate(tmp(2 * size(arr)))
                 tmp(1:n) = arr(1:n)
@@ -958,7 +962,7 @@ contains
             integer,                       intent(inout) :: n
             type(sql_cond_t),              intent(in)    :: elem
             type(sql_cond_t), allocatable :: tmp(:)
-            if (.not. allocated(arr)) allocate(arr(4))
+            if (.not. allocated(arr)) allocate(arr(LIST_INIT_CAP))
             if (n == size(arr)) then
                 allocate(tmp(2 * size(arr)))
                 tmp(1:n) = arr(1:n)
@@ -973,7 +977,7 @@ contains
             integer,                      intent(inout) :: n
             type(sql_lit_t),              intent(in)    :: elem
             type(sql_lit_t), allocatable :: tmp(:)
-            if (.not. allocated(arr)) allocate(arr(4))
+            if (.not. allocated(arr)) allocate(arr(LIST_INIT_CAP))
             if (n == size(arr)) then
                 allocate(tmp(2 * size(arr)))
                 tmp(1:n) = arr(1:n)
@@ -988,7 +992,7 @@ contains
             integer,                                  intent(inout) :: n
             character(len=*),                         intent(in)    :: elem
             character(len=SQR_NAME_LEN), allocatable :: tmp(:)
-            if (.not. allocated(arr)) allocate(arr(4))
+            if (.not. allocated(arr)) allocate(arr(LIST_INIT_CAP))
             if (n == size(arr)) then
                 allocate(tmp(2 * size(arr)))
                 tmp(1:n) = arr(1:n)

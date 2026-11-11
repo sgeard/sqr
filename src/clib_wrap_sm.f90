@@ -4,7 +4,8 @@ submodule (clib_wrap) clib_wrap_impl
     ! Path separators accepted when splitting a path: POSIX uses '/' only,
     ! Windows accepts either, and a POSIX name containing a backslash is
     ! pathological enough that treating it as a separator costs nothing.
-    character(len=*), parameter :: SEPARATORS = '/' // achar(92)
+    character(len=1), parameter :: BACKSLASH  = achar(92)
+    character(len=*), parameter :: SEPARATORS = '/' // BACKSLASH
 
 contains
 
@@ -170,7 +171,7 @@ contains
         parent = c_realpath(parent)
         if (len(parent) == 0) return              ! unresolvable parent
         if (parent(len(parent):len(parent)) == '/' .or. &
-            parent(len(parent):len(parent)) == achar(92)) then
+            parent(len(parent):len(parent)) == BACKSLASH) then
             abspath = parent // leaf
         else
             abspath = parent // '/' // leaf

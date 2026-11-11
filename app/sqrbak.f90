@@ -35,7 +35,9 @@
 program sqrbak
     use, intrinsic :: iso_fortran_env, only: output_unit, error_unit
     use, intrinsic :: iso_c_binding,   only: c_int64_t
+    use :: sqr,        only: SQR_MAX_DIR
     use :: sqr_net
+    use :: sqr_consts, only: INT_TEXT_LEN
     use :: clib_wrap, only: c_sock_connect, c_sock_close, c_abspath, c_exit, &
                             c_joincwd, c_realpath, c_path_exists
     implicit none
@@ -43,7 +45,7 @@ program sqrbak
     character(len=*), parameter :: DEFAULT_HOST = '127.0.0.1'
 
     type(net_conn_t) :: conn
-    character(len=4096) :: arg
+    character(len=SQR_MAX_DIR) :: arg
     character(len=:), allocatable :: cmd, host, file, payload, endpoint, wanted_dir, info_text
     integer(c_int64_t) :: sock
     integer :: port, nargs
@@ -115,7 +117,7 @@ contains
         end if
         if (len_trim(portpart) > 0 .and. verify(trim(portpart), '0123456789') == 0) then
             read(portpart, *, iostat=ios) port
-            if (ios /= 0 .or. port <= 0 .or. port > 65535) &
+            if (ios /= 0 .or. port <= 0 .or. port > NET_MAX_PORT) &
                 call die('sqrbak: bad port in "' // spec // '"')
             return
         end if
@@ -133,7 +135,8 @@ contains
         character(len=:), allocatable, intent(inout) :: host
         integer,                       intent(out)   :: port
         character(len=:), allocatable :: path, key, val
-        character(len=1024) :: line
+        integer, parameter :: LINE_LEN = 1024   ! longest line read from the port file
+        character(len=LINE_LEN) :: line
         integer :: u, ios, eq
         port = 0
         path = dir
@@ -164,7 +167,7 @@ contains
             end select
         end do read_keys
         close(u)
-        if (port <= 0 .or. port > 65535) call die('sqrbak: no usable port in ' // path)
+        if (port <= 0 .or. port > NET_MAX_PORT) call die('sqrbak: no usable port in ' // path)
     end subroutine
 
     !! Confirm the daemon we reached is serving the directory we asked for.
@@ -300,7 +303,7 @@ contains
     pure function itoa(v) result(s)
         integer, intent(in) :: v
         character(len=:), allocatable :: s
-        character(len=12) :: tmp
+        character(len=INT_TEXT_LEN) :: tmp
         write(tmp, '(i0)') v
         s = trim(tmp)
     end function

@@ -29,6 +29,7 @@ module sqr_net
 
     integer, parameter, public :: NET_MAX_LINE    = 1024     !! Header-line cap (bytes, excluding the LF)
     integer, parameter, public :: NET_MAX_PAYLOAD = 1048576  !! Payload cap (bytes, 1 MiB)
+    integer, parameter, public :: NET_MAX_PORT    = 65535    !! Highest TCP port number
 
     integer, parameter :: NET_BUFSIZE = 65536  ! per-connection receive buffer
 

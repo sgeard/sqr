@@ -234,7 +234,7 @@ contains
         integer,          intent(out), optional :: stat
         character(len=*), intent(inout), optional :: errmsg
         integer :: ti, j, rs
-        character(len=4) :: kbuf
+        character(len=I32_BYTES) :: kbuf
         call clear_last_err(db)
         row_id = 0
         call resolve_leading(db, table_name, col_name, DT_INT, ti, j, rs)
@@ -258,7 +258,7 @@ contains
         integer,          intent(out), optional :: stat
         character(len=*), intent(inout), optional :: errmsg
         integer :: ti, j, rs
-        character(len=8) :: kbuf
+        character(len=R64_BYTES) :: kbuf
         call clear_last_err(db)
         row_id = 0
         call resolve_leading(db, table_name, col_name, DT_REAL, ti, j, rs)
@@ -307,7 +307,7 @@ contains
         end if
         nc = min(lw, len_trim(key))     ! trailing blanks insignificant: match the canonical key
         allocate(character(len=lw) :: kbuf)
-        kbuf              = repeat(char(0), lw)
+        kbuf              = repeat(CH_NUL, lw)
         if (nc > 0) kbuf(1:nc) = key(1:nc)
         call find_leading(db, ti, j, kbuf, row_id, rs)
         call report(db, rs, stat, errmsg)
@@ -375,7 +375,7 @@ contains
             rv = ieee_value(rv, ieee_negative_inf)
             bytes = transfer(rv, bytes)
         case default                               ! DT_CHAR
-            bytes = repeat(char(0), width)
+            bytes = repeat(CH_NUL, width)
         end select
     end function
 
@@ -392,7 +392,7 @@ contains
             rv = ieee_value(rv, ieee_positive_inf)
             bytes = transfer(rv, bytes)
         case default                               ! DT_CHAR
-            bytes = repeat(char(255), width)
+            bytes = repeat(CH_HIGH, width)
         end select
     end function
 
@@ -519,7 +519,7 @@ contains
         integer,           intent(out), optional :: stat
         character(len=*), intent(inout), optional :: errmsg
         integer :: ti, j, rs
-        character(len=4) :: lb, hb
+        character(len=I32_BYTES) :: lb, hb
         call clear_last_err(db)
         call resolve_leading(db, table_name, col_name, DT_INT, ti, j, rs)
         if (rs /= SQR_OK) then
@@ -540,7 +540,7 @@ contains
         integer,           intent(out), optional :: stat
         character(len=*), intent(inout), optional :: errmsg
         integer :: ti, j, rs
-        character(len=8) :: lb, hb
+        character(len=R64_BYTES) :: lb, hb
         call clear_last_err(db)
         call resolve_leading(db, table_name, col_name, DT_REAL, ti, j, rs)
         if (rs /= SQR_OK) then
@@ -584,8 +584,8 @@ contains
             return
         end if
         allocate(character(len=lw) :: lb, hb)
-        lb = repeat(char(0), lw)
-        hb = repeat(char(0), lw)
+        lb = repeat(CH_NUL, lw)
+        hb = repeat(CH_NUL, lw)
         ! Trim trailing blanks from the bounds: they are insignificant padding
         ! (see the len_trim reject above) and the stored keys are canonicalised
         ! blank-free by extract_key, so a blank-padded bound would miss them.

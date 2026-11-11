@@ -45,6 +45,8 @@ program utest_sql
     call test_errmsg_content()
     call test_render()
     call test_functional_example()
+    call test_strip_bom()
+    call test_limits()
 
     call cleanup_dir()
 
@@ -63,6 +65,99 @@ contains
             fail = fail + 1
             print '(a,a)', '  FAIL ', label
         end if
+    end subroutine
+
+    ! The SQL layer's column-list limits: exactly the limit is accepted, one
+    ! more is a parse error that says so.
+    subroutine test_limits()
+        type(sql_stmt_t) :: stmt = sql_stmt_t()   ! initialised: gfortran -Wmaybe-uninitialized false positive otherwise
+        integer :: rs
+        character(len=SQR_ERRMSG_LEN) :: em
+
+        em = ''
+        call sql_parse('CREATE TABLE w (' // col_list(SQL_MAX_COLS, ' INTEGER') // ')', stmt, rs, em)
+        call check(rs == SQR_OK .and. size(stmt%coldefs) == SQL_MAX_COLS, 'limits: SQL_MAX_COLS columns accepted')
+        em = ''
+        call sql_parse('CREATE TABLE w (' // col_list(SQL_MAX_COLS + 1, ' INTEGER') // ')', stmt, rs, em)
+        call check(rs == SQR_INVALID .and. index(em, 'too many') > 0, 'limits: SQL_MAX_COLS + 1 columns rejected')
+
+        em = ''
+        call sql_parse('SELECT ' // col_list(SQL_MAX_COLS + 1, '') // ' FROM w', stmt, rs, em)
+        call check(rs == SQR_INVALID .and. index(em, 'too many') > 0, 'limits: over-long projection rejected')
+
+        em = ''
+        call sql_parse('CREATE INDEX ON w (' // col_list(SQL_MAX_INDEX_COLS, '') // ')', stmt, rs, em)
+        call check(rs == SQR_OK .and. size(stmt%names) == SQL_MAX_INDEX_COLS, 'limits: SQL_MAX_INDEX_COLS index columns accepted')
+        em = ''
+        call sql_parse('CREATE INDEX ON w (' // col_list(SQL_MAX_INDEX_COLS + 1, '') // ')', stmt, rs, em)
+        call check(rs == SQR_INVALID .and. index(em, 'too many') > 0, 'limits: SQL_MAX_INDEX_COLS + 1 index columns rejected')
+    end subroutine
+
+    ! "c1<suffix>, c2<suffix>, ... cn<suffix>"
+    pure function col_list(n, suffix) result(s)
+        integer,          intent(in) :: n
+        character(len=*), intent(in) :: suffix
+        character(len=:), allocatable :: s
+        character(len=12) :: num
+        integer :: i
+        s = ''
+        cols: do i = 1, n
+            write(num, '(i0)') i
+            if (i > 1) s = s // ', '
+            s = s // 'c' // trim(num) // suffix
+        end do cols
+    end function
+
+    ! sql_strip_bom: the byte-order mark on the first line of input.
+    subroutine test_strip_bom()
+        character(len=*), parameter :: U8  = char(int(z'EF')) // char(int(z'BB')) // char(int(z'BF'))
+        character(len=*), parameter :: ULE = char(int(z'FF')) // char(int(z'FE'))
+        character(len=*), parameter :: UBE = char(int(z'FE')) // char(int(z'FF'))
+        character(len=:), allocatable :: s
+        type(sql_token_t), allocatable :: toks(:)
+        integer :: enc, ntok, rs
+
+        s = 'SELECT * FROM t'
+        call sql_strip_bom(s, enc)
+        call check(enc == SQL_ENC_PLAIN .and. s == 'SELECT * FROM t', 'bom: plain text untouched')
+
+        s = U8 // 'SELECT * FROM t'
+        call sql_strip_bom(s, enc)
+        call check(enc == SQL_ENC_UTF8 .and. s == 'SELECT * FROM t', 'bom: UTF-8 mark removed')
+        call sql_lex(s, toks, ntok, rs)
+        call check(rs == SQR_OK .and. ntok == 4, 'bom: stripped line lexes')
+
+        s = U8
+        call sql_strip_bom(s, enc)
+        call check(enc == SQL_ENC_UTF8 .and. len(s) == 0, 'bom: UTF-8 mark alone leaves an empty line')
+
+        s = ULE // 'S' // char(0)
+        call sql_strip_bom(s, enc)
+        call check(enc == SQL_ENC_UTF16 .and. len(s) == 4, 'bom: UTF-16LE reported, text left alone')
+
+        s = UBE // char(0) // 'S'
+        call sql_strip_bom(s, enc)
+        call check(enc == SQL_ENC_UTF16, 'bom: UTF-16BE reported')
+
+        ! Shorter than any mark, and a mark's first byte alone, are plain.
+        s = ''
+        call sql_strip_bom(s, enc)
+        call check(enc == SQL_ENC_PLAIN, 'bom: empty line is plain')
+        s = U8(1:2)
+        call sql_strip_bom(s, enc)
+        call check(enc == SQL_ENC_PLAIN .and. len(s) == 2, 'bom: partial UTF-8 mark is plain')
+        s = ULE(1:1)
+        call sql_strip_bom(s, enc)
+        call check(enc == SQL_ENC_PLAIN, 'bom: lone 0xFF is plain')
+
+        ! A mark anywhere but the start is data, not a mark.
+        s = 'x' // U8
+        call sql_strip_bom(s, enc)
+        call check(enc == SQL_ENC_PLAIN .and. len(s) == 4, 'bom: mark not at the start is data')
+
+        deallocate(s)
+        call sql_strip_bom(s, enc)
+        call check(enc == SQL_ENC_PLAIN .and. .not. allocated(s), 'bom: unallocated text is plain')
     end subroutine
 
     subroutine cleanup_dir()

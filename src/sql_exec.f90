@@ -17,6 +17,9 @@ submodule (sql:sql_base) sql_executor
                                              ieee_negative_inf, ieee_positive_inf
     implicit none
 
+    ! Rows the gather buffers start with; they double as they fill.
+    integer, parameter :: GATHER_INIT_CAP = 16
+
     !! Gathering context for a `db_scan` (and reused by the cursor path): the
     !! table's column metadata (a `db_describe` snapshot — valid for the
     !! statement, since no DDL can interleave), the WHERE clause to apply,
@@ -44,7 +47,7 @@ contains
         logical,            intent(in),   optional  :: binary_cells
         type(sql_stmt_t) :: stmt
         integer :: rs
-        character(len=200) :: emsg
+        character(len=SQR_ERRMSG_LEN) :: emsg
         if (present(stat)) stat = SQR_OK
         emsg = ''
         call sql_parse(text, stmt, rs, emsg)
@@ -109,7 +112,7 @@ contains
         integer,            intent(out),  optional :: stat
         character(len=*),   intent(inout), optional :: errmsg
         integer :: rs
-        character(len=160) :: em
+        character(len=SQR_ERRMSG_LEN) :: em
         em = ''
         call db_create_table(db, trim(stmt%table), stmt%coldefs, rs, em)
         if (rs /= SQR_OK) then
@@ -142,7 +145,7 @@ contains
         integer,            intent(out),  optional :: stat
         character(len=*),   intent(inout), optional :: errmsg
         integer :: rs
-        character(len=160) :: em
+        character(len=SQR_ERRMSG_LEN) :: em
         em = ''
         call db_add_column(db, trim(stmt%table), stmt%coldefs(1), rs, em)
         if (rs /= SQR_OK) then
@@ -161,7 +164,7 @@ contains
         integer,            intent(out),  optional :: stat
         character(len=*),   intent(inout), optional :: errmsg
         integer :: rs
-        character(len=160) :: em
+        character(len=SQR_ERRMSG_LEN) :: em
         em = ''
         rs = SQR_OK                          ! every arm below sets it; satisfies -Wall
         select case (stmt%kind)
@@ -223,7 +226,7 @@ contains
         character(len=:), allocatable :: buf
         integer(int32) :: rid
         logical :: own
-        character(len=160) :: em
+        character(len=SQR_ERRMSG_LEN) :: em
 
         ti = require_table(db, stmt%table, stat, errmsg)
         if (ti == 0) return
@@ -367,7 +370,7 @@ contains
         type(column_t), allocatable :: cols(:)
         character(len=:), allocatable :: buf
         logical :: own
-        character(len=160) :: em
+        character(len=SQR_ERRMSG_LEN) :: em
 
         ti = require_table(db, stmt%table, stat, errmsg)
         if (ti == 0) return
@@ -635,7 +638,7 @@ contains
                 if (c%op == OP_BETWEEN .and. c%lit2%ltype /= LIT_STR) return
                 block
                     character(len=:), allocatable :: slo, shi
-                    ! '' trims to the all-NUL minimum; char(255)×width is
+                    ! '' trims to the all-NUL minimum; CH_HIGH×width is
                     ! member_max's byte-lexicographic maximum.
                     select case (c%op)
                     case (OP_EQ)
@@ -643,7 +646,7 @@ contains
                     case (OP_BETWEEN)
                         slo = c%lit%sval;  shi = c%lit2%sval
                     case (OP_GT, OP_GE)
-                        slo = c%lit%sval;  shi = repeat(char(255), col%csize)
+                        slo = c%lit%sval;  shi = repeat(CH_HIGH, col%csize)
                     case default                      ! OP_LT, OP_LE
                         slo = '';          shi = c%lit%sval
                     end select
@@ -705,8 +708,8 @@ contains
         integer(int32),   allocatable :: tr(:)
         character(len=:), allocatable :: tb(:)
         if (.not. allocated(g%rids)) then
-            allocate(g%rids(16))
-            allocate(character(len=g%reclen) :: g%bufs(16))
+            allocate(g%rids(GATHER_INIT_CAP))
+            allocate(character(len=g%reclen) :: g%bufs(GATHER_INIT_CAP))
         else if (g%n == size(g%rids)) then
             newcap = 2 * size(g%rids)
             allocate(tr(newcap)); tr(1:g%n) = g%rids(1:g%n); call move_alloc(tr, g%rids)
@@ -755,7 +758,7 @@ contains
         type(column_t),   intent(in) :: col
         integer :: clen, k
         associate (n => col%csize, off => col%offset)
-            k = scan(buf(off : off + n - 1), char(0))
+            k = scan(buf(off : off + n - 1), CH_NUL)
             if (k == 0) then
                 clen = len_trim(buf(off : off + n - 1))
             else
@@ -1032,9 +1035,9 @@ contains
         character(len=*), intent(in)    :: buf
         logical,          intent(in)    :: binary
         type(sql_cell_t), intent(out)   :: cell
-        character(len=32) :: nb
-        character(len=4)  :: b4
-        character(len=8)  :: b8
+        character(len=NUM_TEXT_LEN) :: nb
+        character(len=I32_BYTES) :: b4
+        character(len=R64_BYTES) :: b8
         integer :: rs
         if (row_is_null(buf, col)) then
             cell%is_null = .true.

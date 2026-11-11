@@ -24,7 +24,8 @@
 ! file that a crash, a bad disk or a hostile edit may have changed, so each is
 ! checked before it can steer an access:
 !   file length    == page_size * npages                     (bt_open)
-!   root, first_leaf in 2..npages, maxk >= 32, key_len match (bt_open)
+!   root, first_leaf in 2..npages, maxk >= MIN_FANOUT,
+!   key_len match                                            (bt_open)
 !   node kind      == K_LEAF or K_INT                        (check_node)
 !   nkeys          in 0..MAXK                                (check_node)
 !   leaf next id   == 0 or in 2..npages                      (check_node)
@@ -61,6 +62,52 @@ submodule (b_tree) b_tree_sm
     integer(int32), parameter :: BT_BOM      = int(z'01020304', int32)
     integer(int32), parameter :: BT_BOM_SWAP = int(z'04030201', int32)
 
+    ! ----- Scalar widths (bytes) -----
+    integer, parameter :: I32_BYTES     = storage_size(0_int32) / 8
+    integer, parameter :: I64_BYTES     = storage_size(0_int64) / 8
+    integer, parameter :: KIND_BYTES    = 1           ! node-kind tag (K_LEAF / K_INT)
+    integer, parameter :: PID_BYTES     = I32_BYTES   ! a page id: child pointer, leaf chain
+    integer, parameter :: PAYLOAD_BYTES = I32_BYTES   ! the payload stored beside each key
+
+    ! ----- Page ids -----
+    integer, parameter :: META_PID       = 1   ! the meta page
+    integer, parameter :: FIRST_BODY_PID = 2   ! lowest leaf / internal page id
+    integer, parameter :: NO_PAGE        = 0   ! "none": end of leaf chain, empty free list
+
+    ! ----- Meta page layout (1-based byte offsets; each field follows the last) -----
+    integer, parameter :: META_MAGIC_OFF      = 1
+    integer, parameter :: META_BOM_OFF        = META_MAGIC_OFF      + len(BT_MAGIC)
+    integer, parameter :: META_VERSION_OFF    = META_BOM_OFF        + I32_BYTES
+    integer, parameter :: META_PAGE_SIZE_OFF  = META_VERSION_OFF    + I32_BYTES
+    integer, parameter :: META_KEY_LEN_OFF    = META_PAGE_SIZE_OFF  + I32_BYTES
+    integer, parameter :: META_ROOT_OFF       = META_KEY_LEN_OFF    + I32_BYTES
+    integer, parameter :: META_FREE_HEAD_OFF  = META_ROOT_OFF       + I32_BYTES
+    integer, parameter :: META_NPAGES_OFF     = META_FREE_HEAD_OFF  + I32_BYTES
+    integer, parameter :: META_FIRST_LEAF_OFF = META_NPAGES_OFF     + I32_BYTES
+    integer, parameter :: META_NENTRIES_OFF   = META_FIRST_LEAF_OFF + I32_BYTES
+    integer, parameter :: META_BYTES          = META_NENTRIES_OFF   + I64_BYTES - 1
+
+    ! ----- Node page layout -----
+    ! Every node starts (kind, nkeys); a leaf follows that with its next-leaf
+    ! id, an internal node with its child-id area.
+    integer, parameter :: KIND_OFF       = 1
+    integer, parameter :: NKEYS_OFF      = KIND_OFF + KIND_BYTES
+    integer, parameter :: NODE_HDR_BYTES = KIND_BYTES + I32_BYTES
+    integer, parameter :: LEAF_NEXT_OFF  = NODE_HDR_BYTES + 1
+    integer, parameter :: LEAF_HDR_BYTES = NODE_HDR_BYTES + PID_BYTES
+
+    ! A split builds the over-full node in place before dividing it, so every
+    ! slot area is this many slots wider than the stable capacity MAXK.
+    integer, parameter :: SPLIT_SLACK = 1
+
+    ! ----- Page sizing -----
+    integer, parameter :: MIN_FANOUT    = 32     ! smallest MAXK a tree may have
+    integer, parameter :: MIN_PAGE_SIZE = 4096   ! page size for all but very large keys
+    integer, parameter :: PAGE_ALIGN    = 512    ! page size is a multiple of this
+    ! Coarse floor on a stored page_size, cheap to test first; the binding
+    ! bound is MAXK >= MIN_FANOUT.
+    integer, parameter :: PAGE_SIZE_FLOOR = 64
+
 contains
 
     ! ===== Scalar <-> byte helpers (1-based offsets) =====
@@ -69,66 +116,105 @@ contains
         character(len=*), intent(in) :: pg
         integer,          intent(in) :: off
         integer(int32) :: v
-        v = transfer(pg(off:off+3), v)
+        v = transfer(pg(off : off + I32_BYTES - 1), v)
     end function
 
     pure subroutine put_i32(pg, off, v)
         character(len=*), intent(inout) :: pg
         integer,          intent(in)    :: off
         integer(int32),   intent(in)    :: v
-        pg(off:off+3) = transfer(v, pg(off:off+3))   ! mold supplies type/len only
+        associate (hi => off + I32_BYTES - 1)
+            pg(off:hi) = transfer(v, pg(off:hi))   ! mold supplies type/len only
+        end associate
     end subroutine
 
     pure function get_i64(pg, off) result(v)
         character(len=*), intent(in) :: pg
         integer,          intent(in) :: off
         integer(int64) :: v
-        v = transfer(pg(off:off+7), v)
+        v = transfer(pg(off : off + I64_BYTES - 1), v)
     end function
 
     pure subroutine put_i64(pg, off, v)
         character(len=*), intent(inout) :: pg
         integer,          intent(in)    :: off
         integer(int64),   intent(in)    :: v
-        pg(off:off+7) = transfer(v, pg(off:off+7))   ! mold supplies type/len only
+        associate (hi => off + I64_BYTES - 1)
+            pg(off:hi) = transfer(v, pg(off:hi))   ! mold supplies type/len only
+        end associate
     end subroutine
 
     ! ===== Geometry (derived from key_len, stored in the meta page) =====
 
+    ! Bytes of one stored entry: a leaf entry or an internal separator.
+    pure function entry_bytes(key_len) result(n)
+        integer, intent(in) :: key_len
+        integer :: n
+        n = key_len + PAYLOAD_BYTES
+    end function
+
+    ! Page bytes that do not scale with MAXK in an internal node: the header
+    ! plus the slots that exist whatever the fan-out. A node of K separators
+    ! has K+1 children, and the split slack adds SPLIT_SLACK more of each.
+    pure function fixed_bytes(key_len) result(n)
+        integer, intent(in) :: key_len
+        integer :: n
+        n = NODE_HDR_BYTES + (1 + SPLIT_SLACK) * PID_BYTES &
+            + SPLIT_SLACK * entry_bytes(key_len)
+    end function
+
+    ! Page bytes each unit of MAXK costs an internal node: one separator and
+    ! one child id.
+    pure function per_key_bytes(key_len) result(n)
+        integer, intent(in) :: key_len
+        integer :: n
+        n = entry_bytes(key_len) + PID_BYTES
+    end function
+
     ! Stable max separators per internal node == max entries per leaf,
     ! using one MAXK for both with the tighter (internal) bound. A split
     ! builds the over-full node *in place* before dividing it, so a node
-    ! transiently holds one more than MAXK: a leaf MAXK+1 entries; an
-    ! internal node MAXK+1 separators (key_len+4 each) AND MAXK+2 child
-    ! pointers (4 each). The page is sized for that peak, so the binding
-    ! (internal) constraint is
-    !     page_size >= 5 + (MAXK+2)*4 + (MAXK+1)*(key_len+4),
+    ! transiently holds SPLIT_SLACK more than MAXK: a leaf MAXK+1 entries; an
+    ! internal node MAXK+1 separators AND MAXK+2 child ids. The page is sized
+    ! for that peak, so the binding (internal) constraint is
+    !     page_size >= NODE_HDR_BYTES + (MAXK+2)*PID_BYTES
+    !                                 + (MAXK+1)*entry_bytes
+    !               == fixed_bytes + MAXK*per_key_bytes,
     ! which inverts to the MAXK below. The leaf peak
-    ! (9 + (MAXK+1)*(key_len+4)) is looser and always fits.
+    ! (LEAF_HDR_BYTES + (MAXK+1)*entry_bytes) is looser and always fits.
     pure function maxk(bt) result(k)
         type(btree_t), intent(in) :: bt
         integer :: k
-        k = (bt%page_size - bt%key_len - 17) / (bt%key_len + 8)
+        k = (bt%page_size - fixed_bytes(bt%key_len)) / per_key_bytes(bt%key_len)
+    end function
+
+    ! Smallest page that gives MAXK >= MIN_FANOUT: the constraint above, taken
+    ! at MAXK == MIN_FANOUT.
+    pure function min_page_bytes(key_len) result(n)
+        integer, intent(in) :: key_len
+        integer :: n
+        n = fixed_bytes(key_len) + MIN_FANOUT * per_key_bytes(key_len)
     end function
 
     pure function leaf_entry_base(bt, j) result(b)   ! 1-based, entry j (1..)
         type(btree_t), intent(in) :: bt
         integer,       intent(in) :: j
         integer :: b
-        b = 10 + (j - 1) * (bt%key_len + 4)
+        b = LEAF_HDR_BYTES + 1 + (j - 1) * entry_bytes(bt%key_len)
     end function
 
     pure function child_off(j) result(o)             ! 1-based, child j (1..)
         integer, intent(in) :: j
         integer :: o
-        o = 6 + (j - 1) * 4
+        o = NODE_HDR_BYTES + 1 + (j - 1) * PID_BYTES
     end function
 
     pure function sep_base(bt, j) result(b)          ! 1-based, separator j (1..)
         type(btree_t), intent(in) :: bt
         integer,       intent(in) :: j
         integer :: b
-        b = 6 + (maxk(bt) + 2) * 4 + (j - 1) * (bt%key_len + 4)
+        b = NODE_HDR_BYTES + 1 + (maxk(bt) + 1 + SPLIT_SLACK) * PID_BYTES &
+            + (j - 1) * entry_bytes(bt%key_len)
     end function
 
     ! ===== Raw page I/O =====
@@ -172,8 +258,8 @@ contains
             nk = n_keys(pg)
             if (nk < 0 .or. nk > maxk(bt)) return
             if (nkind == K_LEAF) then
-                nx = leaf_next(pg)                 ! 0 terminates the chain
-                if (nx /= 0 .and. (nx < 2 .or. nx > bt%npages)) return
+                nx = leaf_next(pg)                 ! NO_PAGE terminates the chain
+                if (nx /= NO_PAGE .and. (nx < FIRST_BODY_PID .or. nx > bt%npages)) return
             end if
         end associate
         stat = BT_OK
@@ -188,7 +274,7 @@ contains
         integer,          intent(out) :: pid
         integer,          intent(out) :: stat
         pid  = int_child(pg, j)
-        stat = merge(BT_OK, BT_CORRUPT, pid >= 2 .and. pid <= bt%npages)
+        stat = merge(BT_OK, BT_CORRUPT, pid >= FIRST_BODY_PID .and. pid <= bt%npages)
     end subroutine
 
     subroutine write_page(bt, pid, pg, stat)
@@ -251,17 +337,17 @@ contains
         character(len=:), allocatable :: pg
         allocate(character(len=bt%page_size) :: pg)
         pg = repeat(char(0), bt%page_size)
-        pg(1:4) = BT_MAGIC
-        call put_i32(pg, 5,  BT_BOM)
-        call put_i32(pg, 9,  int(BT_FORMAT_VERSION, int32))
-        call put_i32(pg, 13, int(bt%page_size,  int32))
-        call put_i32(pg, 17, int(bt%key_len,    int32))
-        call put_i32(pg, 21, int(bt%root,       int32))
-        call put_i32(pg, 25, int(bt%free_head,  int32))
-        call put_i32(pg, 29, int(bt%npages,     int32))
-        call put_i32(pg, 33, int(bt%first_leaf, int32))
-        call put_i64(pg, 37, bt%nentries)
-        call write_page(bt, 1, pg, stat)
+        pg(META_MAGIC_OFF : META_BOM_OFF - 1) = BT_MAGIC
+        call put_i32(pg, META_BOM_OFF,        BT_BOM)
+        call put_i32(pg, META_VERSION_OFF,    int(BT_FORMAT_VERSION, int32))
+        call put_i32(pg, META_PAGE_SIZE_OFF,  int(bt%page_size,  int32))
+        call put_i32(pg, META_KEY_LEN_OFF,    int(bt%key_len,    int32))
+        call put_i32(pg, META_ROOT_OFF,       int(bt%root,       int32))
+        call put_i32(pg, META_FREE_HEAD_OFF,  int(bt%free_head,  int32))
+        call put_i32(pg, META_NPAGES_OFF,     int(bt%npages,     int32))
+        call put_i32(pg, META_FIRST_LEAF_OFF, int(bt%first_leaf, int32))
+        call put_i64(pg, META_NENTRIES_OFF,   bt%nentries)
+        call write_page(bt, META_PID, pg, stat)
     end subroutine
 
     ! Allocate a fresh page id. Lazy delete never frees pages and
@@ -278,21 +364,21 @@ contains
     pure function node_kind(pg) result(k)
         character(len=*), intent(in) :: pg
         integer(int8) :: k
-        k = int(iachar(pg(1:1)), int8)
+        k = int(iachar(pg(KIND_OFF:KIND_OFF)), int8)
     end function
 
     pure subroutine set_node(pg, k, nkeys)
         character(len=*), intent(inout) :: pg
         integer(int8),    intent(in)    :: k
         integer(int32),   intent(in)    :: nkeys
-        pg(1:1) = achar(int(k))
-        call put_i32(pg, 2, nkeys)
+        pg(KIND_OFF:KIND_OFF) = achar(int(k))
+        call put_i32(pg, NKEYS_OFF, nkeys)
     end subroutine
 
     pure function n_keys(pg) result(n)
         character(len=*), intent(in) :: pg
         integer :: n
-        n = int(get_i32(pg, 2))
+        n = int(get_i32(pg, NKEYS_OFF))
     end function
 
     ! ----- leaf -----
@@ -300,13 +386,13 @@ contains
     pure function leaf_next(pg) result(nx)
         character(len=*), intent(in) :: pg
         integer :: nx
-        nx = int(get_i32(pg, 6))
+        nx = int(get_i32(pg, LEAF_NEXT_OFF))
     end function
 
     pure subroutine set_leaf_next(pg, nx)
         character(len=*), intent(inout) :: pg
         integer,          intent(in)    :: nx
-        call put_i32(pg, 6, int(nx, int32))
+        call put_i32(pg, LEAF_NEXT_OFF, int(nx, int32))
     end subroutine
 
     pure function leaf_key(bt, pg, j) result(k)
@@ -494,7 +580,7 @@ contains
         logical,          intent(in)  :: writable
         logical,          intent(in)  :: create
         integer,          intent(out) :: stat
-        integer :: u, ios, ps, entry, need
+        integer :: u, ios, ps
         integer(int64) :: fsize
         character(len=9) :: act
         character(len=:), allocatable :: pg
@@ -514,12 +600,12 @@ contains
                 return
             end if
             ! Page must hold a healthy fan-out even for very large keys;
-            ! size so MAXK >= 32 under the split-aware geometry above
-            ! (page_size - key_len - 17 >= 32*(key_len+8)), rounded up to
-            ! a 512-byte multiple, never below 4096.
-            entry = key_len + 8
-            need  = 33 * entry + 9
-            ps    = max(4096, ((need + 511) / 512) * 512)
+            ! size so MAXK >= MIN_FANOUT under the split-aware geometry above
+            ! (min_page_bytes), rounded up to a PAGE_ALIGN multiple, never
+            ! below MIN_PAGE_SIZE.
+            associate (need => min_page_bytes(key_len))
+                ps = max(MIN_PAGE_SIZE, ((need + PAGE_ALIGN - 1) / PAGE_ALIGN) * PAGE_ALIGN)
+            end associate
             open(newunit=u, file=path, access='direct', form='unformatted', &
                  recl=ps, status='replace', action='readwrite', iostat=ios)
             if (ios /= 0) then
@@ -529,8 +615,8 @@ contains
             bt%unit       = u
             bt%page_size  = ps
             bt%key_len    = key_len
-            bt%free_head  = 0
-            bt%npages     = 1
+            bt%free_head  = NO_PAGE
+            bt%npages     = META_PID
             bt%nentries   = 0_int64
             bt%writable   = .true.
             ! One empty leaf as the root.
@@ -539,7 +625,7 @@ contains
             allocate(character(len=ps) :: pg)
             pg = repeat(char(0), ps)
             call set_node(pg, K_LEAF, 0_int32)
-            call set_leaf_next(pg, 0)
+            call set_leaf_next(pg, NO_PAGE)
             call write_page(bt, bt%root, pg, stat)
             if (stat /= BT_OK) return
             call write_meta(bt, stat)
@@ -553,7 +639,7 @@ contains
             return
         end if
         read_meta: block
-            character(len=44) :: hdr
+            character(len=META_BYTES) :: hdr
             integer(int32)    :: bom
             read(u, iostat=ios) hdr
             inquire(unit=u, size=fsize)
@@ -562,40 +648,50 @@ contains
                 stat = BT_ERR
                 return
             end if
-            if (hdr(1:4) /= BT_MAGIC) then
+            if (hdr(META_MAGIC_OFF : META_BOM_OFF - 1) /= BT_MAGIC) then
                 stat = BT_CORRUPT
                 return
             end if
             ! Byte-order mark: checked before any other scalar, since a
             ! wrong-endian file misreads every int field below.
-            bom = get_i32(hdr, 5)
+            bom = get_i32(hdr, META_BOM_OFF)
             if (bom /= BT_BOM) then
                 stat = merge(BT_VERSION, BT_CORRUPT, bom == BT_BOM_SWAP)
                 return
             end if
-            if (get_i32(hdr, 9) /= BT_FORMAT_VERSION) then
+            if (get_i32(hdr, META_VERSION_OFF) /= BT_FORMAT_VERSION) then
                 stat = BT_VERSION
                 return
             end if
-            bt%page_size  = int(get_i32(hdr, 13))
-            bt%key_len    = int(get_i32(hdr, 17))
-            bt%root       = int(get_i32(hdr, 21))
-            bt%free_head  = int(get_i32(hdr, 25))
-            bt%npages     = int(get_i32(hdr, 29))
-            bt%first_leaf = int(get_i32(hdr, 33))
-            bt%nentries   = get_i64(hdr, 37)
+            bt%page_size  = int(get_i32(hdr, META_PAGE_SIZE_OFF))
+            bt%key_len    = int(get_i32(hdr, META_KEY_LEN_OFF))
+            bt%root       = int(get_i32(hdr, META_ROOT_OFF))
+            bt%free_head  = int(get_i32(hdr, META_FREE_HEAD_OFF))
+            bt%npages     = int(get_i32(hdr, META_NPAGES_OFF))
+            bt%first_leaf = int(get_i32(hdr, META_FIRST_LEAF_OFF))
+            bt%nentries   = get_i64(hdr, META_NENTRIES_OFF)
         end block read_meta
         ! Geometry must be self-consistent, not merely individually plausible.
-        ! page_size >= 64 is not enough: a page too small for the (matching)
+        ! page_size >= PAGE_SIZE_FLOOR is not enough: a page too small for the (matching)
         ! key_len drives maxk <= 0, after which the first split writes slots
         ! past the page buffer — the silent out-of-bounds class the 2026-06-08
         ! CRITICAL fix closed, reachable again via a corrupt meta page. Mirror
-        ! the create-time bound (MAXK >= 32). first_leaf <= npages and
+        ! the create-time bound (MAXK >= MIN_FANOUT). first_leaf <= npages and
         ! nentries >= 0 are free corruption catches while we are here.
-        if (bt%key_len /= key_len .or. bt%page_size < 64 .or.        &
-            bt%root < 2 .or. bt%npages < bt%root .or.               &
-            bt%first_leaf < 2 .or. bt%first_leaf > bt%npages .or.   &
-            maxk(bt) < 32 .or. bt%nentries < 0) then
+        !
+        ! key_len is tested on its own first. maxk divides by a quantity
+        ! derived from it, and .or. does not short-circuit, so a corrupt
+        ! stored key_len must be out of the way before maxk is evaluated;
+        ! once it equals the caller's key_len (>= 1, checked on entry) the
+        ! divisor is positive.
+        if (bt%key_len /= key_len) then
+            stat = BT_CORRUPT
+            return
+        end if
+        if (bt%page_size < PAGE_SIZE_FLOOR .or.                                &
+            bt%root < FIRST_BODY_PID .or. bt%npages < bt%root .or.             &
+            bt%first_leaf < FIRST_BODY_PID .or. bt%first_leaf > bt%npages .or. &
+            maxk(bt) < MIN_FANOUT .or. bt%nentries < 0) then
             stat = BT_CORRUPT
             return
         end if
@@ -672,24 +768,25 @@ contains
             return
         end if
         allocate(character(len=bt%page_size) :: pg)
-        call read_page(bt, 1, pg, stat)
+        call read_page(bt, META_PID, pg, stat)
         if (stat /= BT_OK) return
-        if (pg(1:4) /= BT_MAGIC .or. get_i32(pg, 5) /= BT_BOM .or. &
-            get_i32(pg, 9) /= int(BT_FORMAT_VERSION, int32) .or.   &
-            int(get_i32(pg, 13)) /= bt%page_size .or.              &
-            int(get_i32(pg, 17)) /= bt%key_len) then
+        if (pg(META_MAGIC_OFF : META_BOM_OFF - 1) /= BT_MAGIC .or.              &
+            get_i32(pg, META_BOM_OFF) /= BT_BOM .or.                            &
+            get_i32(pg, META_VERSION_OFF) /= int(BT_FORMAT_VERSION, int32) .or. &
+            int(get_i32(pg, META_PAGE_SIZE_OFF)) /= bt%page_size .or.           &
+            int(get_i32(pg, META_KEY_LEN_OFF)) /= bt%key_len) then
             stat = BT_CORRUPT
             return
         end if
-        bt%root       = int(get_i32(pg, 21))
-        bt%free_head  = int(get_i32(pg, 25))
-        bt%npages     = int(get_i32(pg, 29))
-        bt%first_leaf = int(get_i32(pg, 33))
-        bt%nentries   = get_i64(pg, 37)
+        bt%root       = int(get_i32(pg, META_ROOT_OFF))
+        bt%free_head  = int(get_i32(pg, META_FREE_HEAD_OFF))
+        bt%npages     = int(get_i32(pg, META_NPAGES_OFF))
+        bt%first_leaf = int(get_i32(pg, META_FIRST_LEAF_OFF))
+        bt%nentries   = get_i64(pg, META_NENTRIES_OFF)
         ! Same self-consistency bound bt_open enforces on a freshly read tree.
-        if (bt%root < 2 .or. bt%npages < bt%root .or.            &
-            bt%first_leaf < 2 .or. bt%first_leaf > bt%npages .or. &
-            maxk(bt) < 32 .or. bt%nentries < 0) then
+        if (bt%root < FIRST_BODY_PID .or. bt%npages < bt%root .or.             &
+            bt%first_leaf < FIRST_BODY_PID .or. bt%first_leaf > bt%npages .or. &
+            maxk(bt) < MIN_FANOUT .or. bt%nentries < 0) then
             stat = BT_CORRUPT
             return
         end if
@@ -722,7 +819,7 @@ contains
         integer(int32) :: cpay
 
         split = .false.
-        right_pid = 0
+        right_pid = NO_PAGE
         up_pay = 0_int32
         ! A child id cycling back up the tree would otherwise recurse until the
         ! stack ran out; no path from the root can be longer than the page count.
@@ -950,7 +1047,7 @@ contains
         integer :: pid, slot, hops
 
         cur%valid = .false.
-        cur%leaf  = 0
+        cur%leaf  = NO_PAGE
         cur%slot  = 0
         allocate(character(len=bt%page_size) :: pg)
         pid  = bt%root
@@ -992,7 +1089,7 @@ contains
         ok      = .false.
         payload = 0_int32
         stat    = BT_OK
-        if (.not. cur%valid .or. cur%leaf == 0) return
+        if (.not. cur%valid .or. cur%leaf == NO_PAGE) return
         advance: do
             ! Serve the current leaf from the cursor's one-page cache: a range
             ! scan yields many keys from the same leaf, so this reads that page
@@ -1015,7 +1112,7 @@ contains
             end if
             cur%leaf = leaf_next(cur%cpg)
             cur%slot = 0
-            if (cur%leaf == 0) then
+            if (cur%leaf == NO_PAGE) then
                 cur%valid = .false.
                 return
             end if
@@ -1053,7 +1150,7 @@ contains
         n  = size(keys)
         mk = maxk(bt)
         ! Reset to just the meta page; everything is rewritten below.
-        bt%npages   = 1
+        bt%npages   = META_PID
         bt%nentries = int(n, int64)
         allocate(character(len=bt%page_size) :: pg)
 
@@ -1062,7 +1159,7 @@ contains
             bt%first_leaf = bt%root
             pg = repeat(char(0), bt%page_size)
             call set_node(pg, K_LEAF, 0_int32)
-            call set_leaf_next(pg, 0)
+            call set_leaf_next(pg, NO_PAGE)
             call write_page(bt, bt%root, pg, stat)
             if (stat /= BT_OK) return
             call write_meta(bt, stat)
@@ -1100,7 +1197,7 @@ contains
             if (i < nleaf) then
                 call set_leaf_next(pg, lev_id(i) + 1)  ! next leaf is the next page
             else
-                call set_leaf_next(pg, 0)
+                call set_leaf_next(pg, NO_PAGE)
             end if
             call write_page(bt, lev_id(i), pg, stat)
             if (stat /= BT_OK) return

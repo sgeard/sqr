@@ -3127,6 +3127,22 @@ contains
         call db_create_table(db, 'huge', big, rs, emsg)
         call check(rs == SQR_INVALID, 'cov: oversized record rejected')
 
+        ! One CHAR column a byte wider than SQR_MAX_CHAR; the message quotes
+        ! the limit.
+        char_width: block
+            type(column_t) :: wide(1)
+            wide(1)%name  = 'c'
+            wide(1)%dtype = DT_CHAR
+            wide(1)%csize = SQR_MAX_CHAR + 1
+            emsg = ''
+            call db_create_table(db, 'wide', wide, rs, emsg)
+            call check(rs == SQR_INVALID, 'cov: CHAR wider than SQR_MAX_CHAR rejected')
+            call check(index(emsg, '1..65536') > 0, 'cov: CHAR width message quotes the limit')
+            wide(1)%csize = SQR_MAX_CHAR
+            call db_create_table(db, 'widest', wide, rs, emsg)
+            call check(rs == SQR_OK, 'cov: CHAR of exactly SQR_MAX_CHAR accepted')
+        end block char_width
+
         ! A negative buffer size: repeat()'s ncopies must be non-negative, so
         ! this was a runtime abort rather than a buffer that plainly cannot
         ! hold a row (which the write paths then reject on length).

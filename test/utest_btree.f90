@@ -441,6 +441,19 @@ contains
         call bt_open(bt, 'utest_btree_8.bt', 4, .false., .false., st)
         call check(st == BT_CORRUPT, 'geom: undersized page_size rejected (BT_CORRUPT)')
         call fresh('utest_btree_8.bt')
+
+        ! A stored key_len of -8 makes the per-key divisor in maxk
+        ! (key_len + payload + child id) exactly zero. The key_len mismatch
+        ! must be rejected before maxk is evaluated: Fortran does not
+        ! short-circuit .or., so with both tests in one condition this open
+        ! could die on an integer divide by zero instead of returning.
+        call bt_open(bt, 'utest_btree_8.bt', 4, .true., .true., st)
+        call check(st == BT_OK, 'geom: re-create')
+        call bt_close(bt, st)
+        call poke_i32('utest_btree_8.bt', 17, -8_int32)   ! meta key_len field
+        call bt_open(bt, 'utest_btree_8.bt', 4, .false., .false., st)
+        call check(st == BT_CORRUPT, 'geom: zero-divisor key_len rejected (BT_CORRUPT)')
+        call fresh('utest_btree_8.bt')
     end subroutine
 
     ! The journal hook is plumbing only here (no real journal): install a

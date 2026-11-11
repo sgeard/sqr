@@ -255,7 +255,7 @@ contains
         character(len=:), allocatable :: names(:)
         integer(int64), allocatable   :: sizes(:), offs(:)
         integer(int64)   :: total, pos
-        character(len=4) :: magic
+        character(len=len(PACK_MAGIC)) :: magic
         integer(int32)   :: ver, bom, nfiles, cks
         integer          :: u, ios, i, namelen, maxlen, rs
 
@@ -318,14 +318,14 @@ contains
             total = 0_int64
             rewind_toc: block
                 integer(int64) :: hdr
-                hdr = 4_int64 + 4_int64 + 4_int64 + 4_int64 + 4_int64   ! magic+ver+bom+nfiles+cks
+                hdr = int(len(PACK_MAGIC) + 4 * I32_BYTES, int64)   ! magic + ver, bom, nfiles, cks
                 pos = hdr + 1_int64
                 second_toc: do i = 1, nfiles
                     read(u, pos=pos, iostat=ios) namelen
-                    pos = pos + 4_int64
+                    pos = pos + int(I32_BYTES, int64)
                     allocate(character(len=namelen) :: nm)
                     read(u, pos=pos, iostat=ios) nm
-                    pos = pos + int(namelen, int64) + 16_int64   ! name + size + offset
+                    pos = pos + int(namelen + 2 * I64_BYTES, int64)   ! name + size + offset
                     names(i) = nm
                     deallocate(nm)
                     if (offs(i) /= total) then
@@ -429,9 +429,9 @@ contains
         character(len=*), intent(in) :: name
         logical :: ok
         ok = len_trim(name) > 0                          .and. &
-             scan(name, '/' // char(92)) == 0            .and. &  ! '/' or '\'
+             scan(name, PATH_SEPS) == 0                  .and. &
              index(name, '..') == 0                      .and. &
-             index(name, char(0)) == 0
+             index(name, CH_NUL) == 0
     end function
 
     ! The directory part of a path ('.' if none, '/' for a root-level path).
@@ -439,7 +439,7 @@ contains
         character(len=*), intent(in)  :: path
         character(len=:), allocatable :: d
         integer :: k
-        k = scan(path, '/' // char(92), back=.true.)
+        k = scan(path, PATH_SEPS, back=.true.)
         if (k == 0) then
             d = '.'
         else if (k == 1) then

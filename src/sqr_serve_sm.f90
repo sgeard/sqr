@@ -10,11 +10,15 @@ submodule (sqr_serve) sqr_serve_impl
                       ST_SELECT, ST_BEGIN, ST_COMMIT, ST_ROLLBACK
     use :: sqr_net, only: net_attach, net_close, net_send_line, net_send_payload, &
                           net_recv_line, net_recv_payload, NET_OK
+    use :: sqr_consts, only: I32_BYTES, CH_LF, PATH_SEPS, INT_TEXT_LEN
     use :: clib_wrap, only: c_sock_listen, c_sock_port, c_sock_accept, c_sock_poll, c_sock_close, &
                             c_realpath, c_joincwd
     implicit none
 
-    character(len=*), parameter :: LF = achar(10)
+    character(len=*), parameter :: LF = CH_LF
+
+    ! Bytes a reply buffer starts with; it doubles as it fills.
+    integer, parameter :: REPLY_INIT_CAP = 1024
 
     ! Response accumulator: a whole ROWS/catalogue response is built here and
     ! sent with one socket write.  Amortised doubling keeps the per-cell
@@ -509,7 +513,7 @@ contains
         character(len=:), allocatable :: tmp
         integer :: need, cap
         need = b%n + len(piece)
-        if (.not. allocated(b%s)) allocate(character(len=max(1024, need)) :: b%s)
+        if (.not. allocated(b%s)) allocate(character(len=max(REPLY_INIT_CAP, need)) :: b%s)
         if (need > len(b%s)) then
             cap = len(b%s)
             grow: do while (cap < need)
@@ -526,7 +530,7 @@ contains
     pure function itoa(v) result(s)
         integer, intent(in) :: v
         character(len=:), allocatable :: s
-        character(len=12) :: tmp
+        character(len=INT_TEXT_LEN) :: tmp
         write(tmp, '(i0)') v
         s = trim(tmp)
     end function
@@ -549,10 +553,10 @@ contains
         logical :: yes
         yes = .false.
         if (len(path) == 0) return
-        if (path(1:1) == '/' .or. path(1:1) == achar(92)) then
+        if (scan(path(1:1), PATH_SEPS) > 0) then
             yes = .true.
         else if (len(path) >= 3) then
-            yes = path(2:2) == ':' .and. (path(3:3) == achar(92) .or. path(3:3) == '/')
+            yes = path(2:2) == ':' .and. scan(path(3:3), PATH_SEPS) > 0
         end if
     end function
 
@@ -567,7 +571,7 @@ contains
         yes = .false.
         if (n == 0 .or. len(path) <= n) return
         if (path(1:n) /= dir) return
-        yes = path(n + 1:n + 1) == '/' .or. path(n + 1:n + 1) == achar(92)
+        yes = scan(path(n + 1:n + 1), PATH_SEPS) > 0
     end function
 
     pure function type_token(dtype) result(tok)
@@ -591,7 +595,7 @@ contains
     ! form of an INT cell.
     pure function bin4(v) result(s)
         integer, intent(in) :: v
-        character(len=4)    :: s
+        character(len=I32_BYTES) :: s
         s = transfer(int(v, int32), s)
     end function
 
@@ -633,10 +637,10 @@ contains
         integer :: e, k
         e = len_trim(path)
         trailing: do while (e > 1)
-            if (path(e:e) /= '/' .and. path(e:e) /= achar(92)) exit trailing
+            if (scan(path(e:e), PATH_SEPS) == 0) exit trailing
             e = e - 1
         end do trailing
-        name = path(scan(path(1:e), '/' // achar(92), back=.true.) + 1:e)
+        name = path(scan(path(1:e), PATH_SEPS, back=.true.) + 1:e)
         do k = 1, len(name)
             if (name(k:k) == ' ') name(k:k) = '_'
         end do

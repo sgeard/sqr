@@ -211,9 +211,12 @@ foreach fname [lsort $visited] {
         }
     }
 
-    # 'use' dependencies on locally-defined modules
+    # 'use' dependencies on locally-defined modules. A module the file itself
+    # provides is skipped: a test program appended to its own module (e.g.
+    # under #ifdef TEST_X) would otherwise make foo.o depend on foo.mod, a
+    # cycle with the grouped foo.o/foo.mod rule.
     foreach mname $uses($fname) {
-        if {[info exists mod_provider($mname)]} {
+        if {[info exists mod_provider($mname)] && $mod_provider($mname) ne $fname} {
             set dep "\$(ODIR)/${mname}.mod"
             if {$dep ni $deps} { lappend deps $dep }
         }

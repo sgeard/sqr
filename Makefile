@@ -1,4 +1,4 @@
-.PHONY: all clean veryclean distclean utest sqlttest sqrdtest calctest install uninstall install-calc faulttest run-faulttest proctest bench run-bench destruct run-destruct coverage coverage-gcov coverage-clean docs docs-clean help windows win-build sqrsh-regex test-regex
+.PHONY: all clean veryclean distclean utest sqlttest shelltest sqrdtest calctest install uninstall install-calc faulttest run-faulttest proctest bench run-bench destruct run-destruct coverage coverage-gcov coverage-clean docs docs-clean help windows win-build sqrsh-regex test-regex
 .SUFFIXES:
 .DEFAULT_GOAL := all
 
@@ -22,6 +22,9 @@ FAULT ?= off
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 
+# Sibling cmdgraph (for the interactive shell).
+CMDGRAPH_DIR := ../cmdgraph/fortran
+
 # Per-compiler extras consumed by foptions_$(F).mk
 F_EXTRA_GF  := -Wno-unused-dummy-argument
 F_EXTRA_IFX := -assume byterecl -diag-disable=7712
@@ -40,7 +43,10 @@ $(OPTIONS_FNAME): generate_fopts.tcl
 
 -include $(OPTIONS_FNAME)
 
-F_OPTS := $(F_BASE) $(F_BUILD) $(MOD_OPTS) -I$(SRC_DIR)
+CMDGRAPH_ODIR := $(CMDGRAPH_DIR)/$(ODIR)
+CMDGRAPH_LIB  := $(CMDGRAPH_ODIR)/libcmdgraph.a
+
+F_OPTS := $(F_BASE) $(F_BUILD) $(MOD_OPTS) -I$(SRC_DIR) -I$(CMDGRAPH_ODIR)
 LFLAGS := $(F_LOPTS)
 
 # C shim (osshim.c) — the OS/platform split lives in C, where the C
@@ -58,10 +64,7 @@ CFLAGS ?= -O2 -Wall -Wextra -D_FILE_OFFSET_BITS=64
 # The sql_* modules are a front-end layer (lexer/parser/executor) that only
 # call sqr's public API; they depend on sqr, never the reverse. Bundled in the
 # same archive purely for convenience (fpm globs all of src/ regardless).
-# cmdgraph + dlist are vendored from github.com/sgeard/cmdgraph (fortran/src) so
-# the shell builds out-of-the-box with no sibling checkout; they go into libsqr.a
-# alongside the engine (the linker pulls cmdgraph objects only into sqrsh).
-LIB_SRC := clib_wrap.f90 clib_wrap_sm.f90 b_tree.f90 b_tree_sm.f90 sqr_fault.f90 sqr.f90 sqr_base.f90 sqr_table.f90 sqr_record.f90 sqr_index.f90 sqr_admin.f90 sqr_rowbuf.f90 sqr_journal.f90 sqr_pack.f90 sql.f90 sql_base.f90 sql_parse.f90 sql_exec.f90 sqr_net.f90 sqr_net_sm.f90 sqr_serve.f90 sqr_serve_sm.f90 dlist.f90 dlist_sm.f90 cmdgraph.f90 cmdgraph_sm.f90
+LIB_SRC := clib_wrap.f90 clib_wrap_sm.f90 b_tree.f90 b_tree_sm.f90 sqr_fault.f90 sqr_consts.f90 sqr.f90 sqr_base.f90 sqr_table.f90 sqr_record.f90 sqr_index.f90 sqr_admin.f90 sqr_rowbuf.f90 sqr_journal.f90 sqr_pack.f90 sql.f90 sql_base.f90 sql_parse.f90 sql_exec.f90 sqr_net.f90 sqr_net_sm.f90 sqr_serve.f90 sqr_serve_sm.f90
 
 # Selected fault submodule: off -> $(SRC_DIR) (production, fpm-shared);
 # on -> $(FAULT_DIR) (Make-only coverage/faulttest, never seen by fpm).
@@ -128,7 +131,12 @@ $(ODIR)/b_tree.o $(ODIR)/b_tree.mod &: $(SRC_DIR)/b_tree.f90 | $(ODIR)
 $(ODIR)/b_tree_sm.o: $(SRC_DIR)/b_tree_sm.f90 $(ODIR)/b_tree.mod | $(ODIR)
 	$(F) -c $(F_OPTS) -o $@ $<
 
-$(ODIR)/sqr.o $(ODIR)/sqr.mod &: $(SRC_DIR)/sqr.f90 $(ODIR)/b_tree.mod | $(ODIR)
+# Shared named constants: parameters only, so a module with no submodule.
+$(ODIR)/sqr_consts.o $(ODIR)/sqr_consts.mod &: $(SRC_DIR)/sqr_consts.f90 | $(ODIR)
+	$(F) -c $(F_OPTS) -o $(ODIR)/sqr_consts.o $<
+	@touch $(ODIR)/sqr_consts.mod
+
+$(ODIR)/sqr.o $(ODIR)/sqr.mod &: $(SRC_DIR)/sqr.f90 $(ODIR)/b_tree.mod $(ODIR)/sqr_consts.mod | $(ODIR)
 	$(F) -c $(F_OPTS) -o $(ODIR)/sqr.o $<
 	@touch $(ODIR)/sqr.mod
 
@@ -180,7 +188,7 @@ $(ODIR)/sql.o $(ODIR)/sql.mod &: $(SRC_DIR)/sql.f90 $(ODIR)/sqr.mod | $(ODIR)
 	$(F) -c $(F_OPTS) -o $(ODIR)/sql.o $<
 	@touch $(ODIR)/sql.mod
 
-$(ODIR)/sql_base.o: $(SRC_DIR)/sql_base.f90 $(ODIR)/sql.mod $(ODIR)/sqr.mod | $(ODIR)
+$(ODIR)/sql_base.o: $(SRC_DIR)/sql_base.f90 $(ODIR)/sql.mod $(ODIR)/sqr.mod $(ODIR)/sqr_consts.mod | $(ODIR)
 	$(F) -c $(F_OPTS) -o $@ $<
 
 $(ODIR)/sql_parse.o: $(SRC_DIR)/sql_parse.f90 $(ODIR)/sql.mod $(ODIR)/sql_base.o | $(ODIR)
@@ -196,30 +204,14 @@ $(ODIR)/sqr_net.o $(ODIR)/sqr_net.mod &: $(SRC_DIR)/sqr_net.f90 $(ODIR)/clib_wra
 	$(F) -c $(F_OPTS) -o $(ODIR)/sqr_net.o $<
 	@touch $(ODIR)/sqr_net.mod
 
-$(ODIR)/sqr_net_sm.o: $(SRC_DIR)/sqr_net_sm.f90 $(ODIR)/sqr_net.mod | $(ODIR)
+$(ODIR)/sqr_net_sm.o: $(SRC_DIR)/sqr_net_sm.f90 $(ODIR)/sqr_net.mod $(ODIR)/sqr_consts.mod | $(ODIR)
 	$(F) -c $(F_OPTS) -o $@ $<
 
 $(ODIR)/sqr_serve.o $(ODIR)/sqr_serve.mod &: $(SRC_DIR)/sqr_serve.f90 $(ODIR)/sqr.mod $(ODIR)/sqr_net.mod | $(ODIR)
 	$(F) -c $(F_OPTS) -o $(ODIR)/sqr_serve.o $<
 	@touch $(ODIR)/sqr_serve.mod
 
-$(ODIR)/sqr_serve_sm.o: $(SRC_DIR)/sqr_serve_sm.f90 $(ODIR)/sqr_serve.mod $(ODIR)/sql.mod $(ODIR)/clib_wrap.mod | $(ODIR)
-	$(F) -c $(F_OPTS) -o $@ $<
-
-# --- Vendored cmdgraph engine (github.com/sgeard/cmdgraph). dlist is the
-# doubly-linked list cmdgraph uses; cmdgraph `use`s dlist, so dlist builds first.
-$(ODIR)/dlist.o $(ODIR)/dlist.mod &: $(SRC_DIR)/dlist.f90 | $(ODIR)
-	$(F) -c $(F_OPTS) -o $(ODIR)/dlist.o $<
-	@touch $(ODIR)/dlist.mod
-
-$(ODIR)/dlist_sm.o: $(SRC_DIR)/dlist_sm.f90 $(ODIR)/dlist.mod | $(ODIR)
-	$(F) -c $(F_OPTS) -o $@ $<
-
-$(ODIR)/cmdgraph.o $(ODIR)/cmdgraph.mod &: $(SRC_DIR)/cmdgraph.f90 $(ODIR)/dlist.mod | $(ODIR)
-	$(F) -c $(F_OPTS) -o $(ODIR)/cmdgraph.o $<
-	@touch $(ODIR)/cmdgraph.mod
-
-$(ODIR)/cmdgraph_sm.o: $(SRC_DIR)/cmdgraph_sm.f90 $(ODIR)/cmdgraph.mod | $(ODIR)
+$(ODIR)/sqr_serve_sm.o: $(SRC_DIR)/sqr_serve_sm.f90 $(ODIR)/sqr_serve.mod $(ODIR)/sql.mod $(ODIR)/clib_wrap.mod $(ODIR)/sqr_consts.mod | $(ODIR)
 	$(F) -c $(F_OPTS) -o $@ $<
 
 # Progress feedback for long loops. Depends on nothing but iso_fortran_env,
@@ -241,9 +233,13 @@ $(LIB): $(LIB_OBJ) | $(ODIR)
 $(ODIR)/utest_%$(EXT): $(TEST_DIR)/utest_%.f90 $(LIB) | $(ODIR)
 	$(F) $(F_OPTS) -o $@ $< $(LIB) $(LFLAGS)
 
-# Shell — the cmdgraph engine is vendored into libsqr.a, so just link the lib.
-$(ODIR)/sqrsh$(EXT): $(APP_DIR)/sqrsh.f90 $(LIB) | $(ODIR)
-	$(F) $(F_OPTS) -o $@ $< $(LIB) $(LFLAGS)
+# Build cmdgraph if not already built (recursive make).
+$(CMDGRAPH_LIB):
+	$(MAKE) -C $(CMDGRAPH_DIR) F=$(F)
+
+# Shell — links against cmdgraph.
+$(ODIR)/sqrsh$(EXT): $(APP_DIR)/sqrsh.f90 $(LIB) $(CMDGRAPH_LIB) | $(ODIR)
+	$(F) $(F_OPTS) -o $@ $< $(LIB) $(CMDGRAPH_LIB) $(LFLAGS)
 
 # SQL REPL — links the library only (the sql_* front-end is in libsqr); no
 # cmdgraph dependency.
@@ -277,10 +273,10 @@ TCLRE_LIB  ?= $(TCLRE_ODIR)/libtclInterface.a
 $(TCLRE_LIB):
 	$(MAKE) -C $(TCLRE_DIR) F=$(F)
 
-sqrsh-regex: $(OPTIONS_FNAME) $(LIB) $(TCLRE_LIB) | $(ODIR)
+sqrsh-regex: $(OPTIONS_FNAME) $(LIB) $(CMDGRAPH_LIB) $(TCLRE_LIB) | $(ODIR)
 	$(F) $(F_OPTS) -DSQR_WITH_REGEX -I$(TCLRE_ODIR) -o $(ODIR)/sqrsh$(EXT) \
 	    $(APP_DIR)/sqrsh.f90 $(REGEX_DIR)/sqrsh_regex.f90 \
-	    $(LIB) $(TCLRE_LIB) $(LFLAGS)
+	    $(LIB) $(CMDGRAPH_LIB) $(TCLRE_LIB) $(LFLAGS)
 	@echo "Built $(ODIR)/sqrsh$(EXT) with regex search (match command)"
 
 # Functional test for the regex search (opt-in, links tcl_re).
@@ -303,6 +299,11 @@ SQLT_DIR    := sqlt
 SQLT_TESTS  := $(wildcard $(SQLT_DIR)/tests/*.test)
 sqlttest: $(ODIR)/sqlsh$(EXT)
 	tclsh $(SQLT_DIR)/run_sqlt.tcl $(ODIR)/sqlsh$(EXT) $(SQLT_TESTS)
+
+# Shell-level behaviour of sqlsh that is neither SQL nor reachable from the
+# Fortran unit tests: meta-commands and the encoding of the input stream.
+shelltest: $(ODIR)/sqlsh$(EXT)
+	tclsh $(SQLT_DIR)/run_shell.tcl $(ODIR)/sqlsh$(EXT)
 
 # Functional test of the sqrd wire service: a Tcl client (an independent
 # protocol implementation — see test/run_sqrd.tcl) drives a real spawned
@@ -486,7 +487,7 @@ WIN_CFLAGS := -O2 -Wall -Wextra
 # -lws2_32: Winsock, pulled in by the socket shim now in osshim.c/clib_wrap.
 WIN_LINK   := -static -Wl,-u,__strcpy_chk -lssp -lws2_32
 # Module/submodule order matters (parents before submodules).
-WIN_SRC   := clib_wrap b_tree sqr_fault sqr clib_wrap_sm b_tree_sm sqr_fault_off_sm sqr_base sqr_table sqr_record sqr_index sqr_admin sqr_rowbuf sqr_journal sql sql_base sql_parse sql_exec sqr_net sqr_net_sm sqr_serve sqr_serve_sm
+WIN_SRC   := clib_wrap b_tree sqr_fault sqr_consts sqr clib_wrap_sm b_tree_sm sqr_fault_off_sm sqr_base sqr_table sqr_record sqr_index sqr_admin sqr_rowbuf sqr_journal sql sql_base sql_parse sql_exec sqr_net sqr_net_sm sqr_serve sqr_serve_sm
 WIN_TESTS := utest_btree utest_sqr utest_sql
 
 windows:
@@ -508,7 +509,7 @@ windows:
 	@for t in $(WIN_TESTS); do echo "    $(WIN_ODIR)/$$t.exe"; done
 
 help:
-	@echo "Targets : all, utest, sqlttest, sqrdtest, calctest, faulttest, destruct, bench"
+	@echo "Targets : all, utest, sqlttest, shelltest, sqrdtest, calctest, faulttest, destruct, bench"
 	@echo "          install, uninstall (PREFIX=$(PREFIX)), install-calc"
 	@echo "          clean, veryclean, distclean"
 	@echo "          coverage, coverage-gcov, coverage-clean, docs, docs-clean, windows"

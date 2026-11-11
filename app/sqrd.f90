@@ -18,14 +18,18 @@ program sqrd
     use, intrinsic :: iso_fortran_env, only: output_unit, error_unit
     use :: sqr
     use :: sqr_serve
+    use :: sqr_net,   only: NET_MAX_PORT
     use :: clib_wrap, only: c_exit, c_getpid
     implicit none
 
     type(db_t), target, save :: db
     type(server_t) :: srv
-    character(len=4096) :: dirarg
-    character(len=32)   :: portarg
-    character(len=256)  :: emsg
+    integer, parameter :: PORT_ARG_LEN = 32     ! buffer for the port argument
+    integer, parameter :: POLL_MS      = 1000   ! serve_step poll timeout (ms)
+
+    character(len=SQR_MAX_DIR)    :: dirarg
+    character(len=PORT_ARG_LEN)   :: portarg
+    character(len=SQR_ERRMSG_LEN) :: emsg
     integer :: rs, port, nev, ios
 
     ! Fatal paths exit through c_exit, not `stop 1`: the diagnostic just
@@ -39,7 +43,7 @@ program sqrd
     call get_command_argument(1, dirarg)
     call get_command_argument(2, portarg)
     read(portarg, *, iostat=ios) port
-    if (ios /= 0 .or. port < 0 .or. port > 65535) then
+    if (ios /= 0 .or. port < 0 .or. port > NET_MAX_PORT) then
         write(error_unit, '(2a)') 'sqrd: bad port: ', trim(portarg)
         call die()
     end if
@@ -70,7 +74,7 @@ program sqrd
     write(error_unit, '(5a)') 'sqrd: serving "', srv%dbname, '" from ', srv%dbpath, ', kill to stop'
 
     serve: do
-        call serve_step(srv, 1000, nev)
+        call serve_step(srv, POLL_MS, nev)
     end do serve
 
 contains

@@ -1258,8 +1258,8 @@ contains
         type(column_t),   intent(in)  :: oldcols(:), newcols(:)
         integer,          intent(in)  :: src(:)
         integer :: nj, oj
-        nbuf = repeat(char(0), len(nbuf))
-        nbuf(1:1) = obuf(1:1)                       ! status byte
+        nbuf = repeat(CH_NUL, len(nbuf))
+        nbuf(ROW_STATUS_OFF:ROW_STATUS_OFF) = obuf(ROW_STATUS_OFF:ROW_STATUS_OFF)
         cols: do nj = 1, size(newcols)
             oj = src(nj)
             if (oj == 0) then

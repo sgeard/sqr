@@ -22,9 +22,10 @@ contains
     ! Decode a dlist node to a printable string regardless of its kind.
     pure function node_as_char(node) result(s)
         use dlist
+        use sqr_consts, only: NUM_TEXT_LEN
         class(dlist_node_data_t), intent(in) :: node
         character(len=:), allocatable        :: s
-        character(len=64) :: buf
+        character(len=NUM_TEXT_LEN) :: buf
         select type (node)
         type is (dlist_node_integer)
             write(buf, '(i0)') node%data
@@ -76,12 +77,13 @@ contains
     end subroutine
 
     pure function lower(s) result(r)
+        use :: sqr_consts, only: ASCII_CASE_OFFSET
         character(len=*), intent(in) :: s
         character(len=len(s)) :: r
         integer :: k, c
         do k = 1, len(s)
             c = iachar(s(k:k))
-            if (c >= iachar('A') .and. c <= iachar('Z')) c = c + 32
+            if (c >= iachar('A') .and. c <= iachar('Z')) c = c + ASCII_CASE_OFFSET
             r(k:k) = achar(c)
         end do
     end function
@@ -157,7 +159,7 @@ contains
         type(action_result_t) :: rv
         class(dlist_node_data_t), allocatable :: n
         character(len=:), allocatable :: dir
-        character(len=128) :: emsg
+        character(len=SQR_ERRMSG_LEN) :: emsg
         integer :: rs
         if (args%size() /= 1) then
             write(*,'(a)') 'usage: open <directory>'
@@ -410,9 +412,9 @@ contains
         n = args%get(base + 1); ctype = node_as_char(n)
         select case (ctype)
         case ('int', 'i')
-            csize = 4;             cn = DT_INT
+            csize = SQR_INT_SIZE;  cn = DT_INT
         case ('real', 'r')
-            csize = 8;             cn = DT_REAL
+            csize = SQR_REAL_SIZE; cn = DT_REAL
         case ('text', 't')
             csize = SQR_TEXT_DESC; cn = DT_TEXT
         case ('char', 'c')
@@ -460,7 +462,7 @@ contains
         character(len=*), intent(in) :: ctx
         type(action_result_t) :: rv
         integer :: rs
-        character(len=128) :: emsg
+        character(len=SQR_ERRMSG_LEN) :: emsg
         if (pending_ncols == 0) then
             write(*,'(a)') 'no columns defined — add some with `col` or `cancel`'
             rv%errored = .true.
@@ -738,7 +740,7 @@ contains
         character(len=*), intent(in) :: ctx
         type(action_result_t) :: rv
         integer :: ti, rs
-        character(len=128) :: emsg
+        character(len=SQR_ERRMSG_LEN) :: emsg
         if (.not. require_ctx_table(ctx, ti, rv)) return
         if (args%size() /= 0) then
             write(*,'(a)') 'usage: verify'
@@ -789,7 +791,7 @@ contains
         type(action_result_t) :: rv
         type(column_t) :: col
         integer :: ti, rs
-        character(len=128) :: emsg
+        character(len=SQR_ERRMSG_LEN) :: emsg
         logical :: ok
         if (.not. require_ctx_table(ctx, ti, rv)) return
         call parse_col_spec(args, 1, 'addcolumn', col, ok)
@@ -817,7 +819,7 @@ contains
         class(dlist_node_data_t), allocatable :: n
         character(len=:), allocatable :: cname
         integer :: ti, rs
-        character(len=128) :: emsg
+        character(len=SQR_ERRMSG_LEN) :: emsg
         if (.not. require_ctx_table(ctx, ti, rv)) return
         if (args%size() /= 1) then
             write(*,'(a)') 'usage: dropcolumn <name>'
@@ -1165,7 +1167,7 @@ program sqrsh
     implicit none
 
     type(engine_t) :: ui
-    character(len=4096) :: arg   ! generous path buffer, matches sqlsh
+    character(len=SQR_MAX_DIR) :: arg
 
 #ifdef SQR_WITH_REGEX
     ! The regex `match` command is supplied as an external procedure by the
@@ -1263,7 +1265,7 @@ contains
     subroutine open_initial(dir)
         character(len=*), intent(in) :: dir
         integer :: rs
-        character(len=128) :: emsg
+        character(len=SQR_ERRMSG_LEN) :: emsg
         emsg = ''
         call db_open(db, dir, rs, emsg)
         if (rs /= SQR_OK) then

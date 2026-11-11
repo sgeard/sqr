@@ -59,24 +59,34 @@ submodule (sqr) sqr_base
     character(len=*), parameter :: CATALOG_FILE  = '_catalog.dat'
     character(len=*), parameter :: LOCK_FILE     = '_lock'
 
-    ! Upper bound on a database directory path (Linux PATH_MAX).
-    integer, parameter :: SQR_MAX_DIR = 4096
+    ! checksum_fold: a polynomial fold, acc = (acc*CKSUM_MULT + byte) mod
+    ! CKSUM_MOD. The result is stored in journal and pack files, so both
+    ! values are part of the on-disk format. CKSUM_MOD is 2^31-1 (a Mersenne
+    ! prime), which also keeps the int64 accumulator from overflowing.
+    integer(int64), parameter :: CKSUM_MULT = 31_int64
+    integer(int64), parameter :: CKSUM_MOD  = 2147483647_int64
 
     ! SQR_BOM (public, in the sqr module) byte-swapped: the value the mark
     ! reads back as on a host of the opposite endianness, so a wrong-byte-
     ! order database can be reported as such rather than as generic corruption.
     integer(int32), parameter :: SQR_BOM_SWAP = int(z'04030201', int32)
 
+    ! Record layout (1-based byte offsets): the status byte, then the NULL
+    ! bitmap, then the column data (see layout_columns).
+    integer, parameter :: ROW_STATUS_OFF   = 1
+    integer, parameter :: ROW_STATUS_BYTES = 1
+    integer, parameter :: ROW_BITMAP_OFF   = ROW_STATUS_OFF + ROW_STATUS_BYTES
+
 contains
 
     ! Byte position (1-based) and bit (0..7) of a column's NULL flag within the
     ! bitmap that follows the status byte. Bit `null_bit` lives in byte
-    ! 2 + null_bit/8 (see layout_columns).
+    ! ROW_BITMAP_OFF + null_bit/BITS_PER_BYTE (see layout_columns).
     pure subroutine null_bit_pos(col, bytepos, bit)
         type(column_t), intent(in)  :: col
         integer,        intent(out) :: bytepos, bit
-        bytepos = 2 + col%null_bit / 8
-        bit     = mod(col%null_bit, 8)
+        bytepos = ROW_BITMAP_OFF + col%null_bit / BITS_PER_BYTE
+        bit     = mod(col%null_bit, BITS_PER_BYTE)
     end subroutine
 
     ! ===== Path helpers =====
@@ -104,7 +114,7 @@ contains
         integer :: k
         out = path
         do k = 1, len(out)
-            if (out(k:k) == char(92)) out(k:k) = '/'
+            if (out(k:k) == CH_BACKSLASH) out(k:k) = '/'
         end do
     end function
 
@@ -174,7 +184,7 @@ contains
         character(len=*), intent(in)  :: table_name
         integer,          intent(in)  :: slot
         character(len=:), allocatable :: rel
-        character(len=16) :: s
+        character(len=INT_TEXT_LEN) :: s
         write(s, '(i0)') slot
         rel = trim(table_name) // '__i' // trim(s) // '.idx'
     end function
@@ -229,7 +239,7 @@ contains
         integer        :: i
         acc = int(seed, int64)
         do i = 1, len(buf)
-            acc = mod(acc * 31_int64 + iachar(buf(i:i)), 2147483647_int64)
+            acc = mod(acc * CKSUM_MULT + iachar(buf(i:i)), CKSUM_MOD)
         end do
         c = int(acc)
     end function
@@ -335,7 +345,7 @@ contains
         if (.not. ok) return
         ! No control characters anywhere.
         ctrl_scan: do k = 1, n
-            if (iachar(name(k:k)) < 32 .or. iachar(name(k:k)) == 127) then
+            if (iachar(name(k:k)) < ASCII_FIRST_PRINTABLE .or. name(k:k) == CH_DEL) then
                 ok = .false.
                 return
             end if
@@ -369,13 +379,13 @@ contains
         integer :: n, k
         n = len_trim(name)
         ok = n > 0 .and. n <= SQR_NAME_LEN                        &
-             .and. scan(name(1:n), '/' // char(92)) == 0           &
+             .and. scan(name(1:n), PATH_SEPS) == 0                  &
              .and. index(name(1:n), '..') == 0
         ! Reject control characters (0..31) and DEL (127). A scalar loop avoids
         ! the logical array temporary an all([...]) constructor would create.
         if (ok) then
             scan_ctrl: do k = 1, n
-                if (iachar(name(k:k)) < 32 .or. iachar(name(k:k)) == 127) then
+                if (iachar(name(k:k)) < ASCII_FIRST_PRINTABLE .or. name(k:k) == CH_DEL) then
                     ok = .false.
                     exit scan_ctrl
                 end if
@@ -388,6 +398,7 @@ contains
         integer,           intent(out)             :: stat
         character(len=*),  intent(inout), optional :: errmsg
         integer :: i, j, total
+        character(len=INT_TEXT_LEN) :: maxtxt
         stat = SQR_INVALID
         if (size(cols) == 0) then
             if (present(errmsg)) errmsg = 'table must have at least one column'
@@ -402,18 +413,22 @@ contains
                 end if
                 select case (c%dtype)
                 case (DT_INT)
-                    if (c%csize /= 4) then
+                    if (c%csize /= SQR_INT_SIZE) then
                         if (present(errmsg)) errmsg = 'DT_INT column "' // trim(c%name) // '" must have csize=4'
                         return
                     end if
                 case (DT_REAL)
-                    if (c%csize /= 8) then
+                    if (c%csize /= SQR_REAL_SIZE) then
                         if (present(errmsg)) errmsg = 'DT_REAL column "' // trim(c%name) // '" must have csize=8'
                         return
                     end if
                 case (DT_CHAR)
-                    if (c%csize <= 0 .or. c%csize > 65536) then
-                        if (present(errmsg)) errmsg = 'DT_CHAR column "' // trim(c%name) // '" csize must be 1..65536'
+                    if (c%csize <= 0 .or. c%csize > SQR_MAX_CHAR) then
+                        if (present(errmsg)) then
+                            write(maxtxt, '(i0)') SQR_MAX_CHAR
+                            errmsg = 'DT_CHAR column "' // trim(c%name) // &
+                                     '" csize must be 1..' // trim(maxtxt)
+                        end if
                         return
                     end if
                 case (DT_TEXT)
@@ -446,18 +461,18 @@ contains
 
     ! Bytes of NULL bitmap for a table of `ncols` columns: one bit per column,
     ! rounded up. The bitmap sits between the status byte and the column data,
-    ! so the first column starts at offset 2 + null_bytes(ncols).
+    ! so the first column starts at offset ROW_BITMAP_OFF + null_bytes(ncols).
     pure function null_bytes(ncols) result(nb)
         integer, intent(in) :: ncols
         integer :: nb
-        nb = (ncols + 7) / 8
+        nb = (ncols + BITS_PER_BYTE - 1) / BITS_PER_BYTE
     end function
 
     pure subroutine layout_columns(cols, record_size)
         type(column_t), intent(inout) :: cols(:)
         integer,        intent(out)   :: record_size
         integer :: i, off
-        off = 2 + null_bytes(size(cols))     ! byte 1 = status, then NULL bitmap
+        off = ROW_BITMAP_OFF + null_bytes(size(cols))   ! status byte, then NULL bitmap
         layout_loop: do i = 1, size(cols)
             associate (c => cols(i))
                 c%offset   = off
@@ -518,7 +533,7 @@ contains
         integer,                                  intent(out) :: stat
         integer :: u, ios, i, ver
         integer(int32) :: bom
-        character(len=4) :: magic
+        character(len=len(CATALOG_MAGIC)) :: magic
         n = 0
         allocate(names(0))
         if (.not. file_exists(catalog_path(db))) then
@@ -638,7 +653,7 @@ contains
         type(db_t), intent(inout) :: db
         integer,    intent(out)   :: stat
         integer :: u, ios, i
-        character(len=4) :: magic
+        character(len=len(CATALOG_MAGIC)) :: magic
         character(len=SQR_NAME_LEN) :: nm
         character(len=:), allocatable :: final, tmp
         magic = CATALOG_MAGIC
@@ -721,7 +736,7 @@ contains
         character(len=*), intent(in)  :: path
         integer,          intent(out) :: stat
         integer :: u, ios, i, m
-        character(len=4) :: magic
+        character(len=len(SQR_MAGIC)) :: magic
         character(len=SQR_NAME_LEN) :: nm
         magic = SQR_MAGIC
         open(newunit=u, file=path, access='stream', form='unformatted', &
@@ -787,7 +802,7 @@ contains
         character(len=*),            intent(inout), optional :: errmsg
         integer :: u, ios, i
         integer(int32)              :: bom
-        character(len=4)            :: magic
+        character(len=len(SQR_MAGIC)) :: magic
         character(len=SQR_NAME_LEN) :: nm
         tbl%name = name
         open(newunit=u, file=schema_path(db, name), access='stream', form='unformatted', &
@@ -875,7 +890,7 @@ contains
         ! inconsistent on disk, not merely an unknown version.
         check_cols: block
             integer :: off
-            off = 2 + null_bytes(tbl%ncols)
+            off = ROW_BITMAP_OFF + null_bytes(tbl%ncols)
             cols_chk: do i = 1, tbl%ncols
                 associate (c => tbl%cols(i))
                     if (c%csize < 1 .or. c%offset /= off) exit cols_chk
@@ -1401,8 +1416,8 @@ contains
         real(real64)   :: ra, rb
         select case (dtype)
         case (DT_INT)
-            ia = transfer(a(1:4), ia)
-            ib = transfer(b(1:4), ib)
+            ia = transfer(a(1:I32_BYTES), ia)
+            ib = transfer(b(1:I32_BYTES), ib)
             if (ia < ib) then
                 r = -1
             else if (ia > ib) then
@@ -1411,8 +1426,8 @@ contains
                 r = 0
             end if
         case (DT_REAL)
-            ra = transfer(a(1:8), ra)
-            rb = transfer(b(1:8), rb)
+            ra = transfer(a(1:R64_BYTES), ra)
+            rb = transfer(b(1:R64_BYTES), rb)
             if (ra < rb) then
                 r = -1
             else if (ra > rb) then
@@ -1449,7 +1464,7 @@ contains
                     ! 'a  ' must yield one identical key — trim, then NUL-pad. Keeps
                     ! the index and the scan in agreement on CHAR identity.
                     associate (mb => rowbuf(c%offset : c%offset + c%csize - 1))
-                        k = scan(mb, char(0))
+                        k = scan(mb, CH_NUL)
                         if (k == 0) then
                             vlen = len_trim(mb)
                         else
@@ -1461,7 +1476,7 @@ contains
                     lo = ix%key_off(m)
                     if (vlen > 0) key(lo : lo + vlen - 1) = rowbuf(c%offset : c%offset + vlen - 1)
                     do k = lo + vlen, lo + c%csize - 1
-                        key(k:k) = char(0)
+                        key(k:k) = CH_NUL
                     end do
                 else
                     key(ix%key_off(m) : ix%key_off(m) + c%csize - 1) = &
@@ -1489,7 +1504,7 @@ contains
             associate (c => t%cols(ix%col_idx(m)))
                 if (c%dtype == DT_REAL) then
                     lo = ix%key_off(m)
-                    rv = transfer(key(lo:lo + 7), rv)
+                    rv = transfer(key(lo : lo + R64_BYTES - 1), rv)
                     if (ieee_is_nan(rv)) then
                         bad = .true.
                         return
@@ -1652,12 +1667,14 @@ contains
         type(column_t),   intent(in)    :: col
         integer(int64),   intent(in)    :: off
         integer(int32),   intent(in)    :: length
-        character(len=8) :: a
-        character(len=4) :: b
+        character(len=I64_BYTES) :: a
+        character(len=I32_BYTES) :: b
         a = transfer(off, a)
         b = transfer(length, b)
-        buf(col%offset     : col%offset + 7)  = a
-        buf(col%offset + 8 : col%offset + 11) = b
+        associate (lo => col%offset, mid => col%offset + I64_BYTES)
+            buf(lo  : mid - 1)                = a
+            buf(mid : lo + SQR_TEXT_DESC - 1) = b
+        end associate
     end subroutine
 
     pure subroutine row_get_text_desc(buf, col, off, length)
@@ -1665,8 +1682,10 @@ contains
         type(column_t),   intent(in)  :: col
         integer(int64),   intent(out) :: off
         integer(int32),   intent(out) :: length
-        off    = transfer(buf(col%offset     : col%offset + 7),  off)
-        length = transfer(buf(col%offset + 8 : col%offset + 11), length)
+        associate (lo => col%offset, mid => col%offset + I64_BYTES)
+            off    = transfer(buf(lo  : mid - 1),                off)
+            length = transfer(buf(mid : lo + SQR_TEXT_DESC - 1), length)
+        end associate
     end subroutine
 
     ! ===== Uniqueness check =====

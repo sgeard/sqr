@@ -183,7 +183,17 @@ module sql
         character(len=:), allocatable :: message
     end type
 
+    ! --- Limits of the SQL layer (the engine itself has no column-count cap) ---
+    integer, parameter, public :: SQL_MAX_COLS       = 256  !! Columns in a `CREATE TABLE`, a projection or an `INSERT` column list
+    integer, parameter, public :: SQL_MAX_INDEX_COLS = 64   !! Columns in a `CREATE` / `DROP INDEX` column list
+
+    ! --- Input-text encodings reported by `sql_strip_bom` ---
+    integer, parameter, public :: SQL_ENC_PLAIN = 0  !! No byte-order mark: taken as UTF-8 (ASCII included)
+    integer, parameter, public :: SQL_ENC_UTF8  = 1  !! UTF-8 byte-order mark found and removed
+    integer, parameter, public :: SQL_ENC_UTF16 = 2  !! UTF-16 byte-order mark found: the text is not usable
+
     ! --- Public entry points ---
+    public :: sql_strip_bom !! first line of input -> encoding, UTF-8 BOM removed
     public :: sql_lex      !! source line  -> token stream
     public :: sql_parse    !! source line  -> one statement AST
     public :: sql_exec     !! statement AST -> result (drives the engine)
@@ -191,6 +201,26 @@ module sql
     public :: sql_render   !! result        -> printed to a unit (the REPL renderer)
 
     interface
+        !! Classify the start of an input stream by its byte-order mark and
+        !! make it lexable.  sqr text is UTF-8 handled as bytes, so:
+        !!
+        !! - a UTF-8 mark (`EF BB BF`, written by e.g. Windows PowerShell 5.1
+        !!   `Out-File -Encoding utf8`) is removed from `text` and `enc` is
+        !!   `SQL_ENC_UTF8`;
+        !! - a UTF-16 mark (`FF FE` or `FE FF`, the default of Windows
+        !!   PowerShell 5.1 `>` redirection) leaves `text` alone and sets `enc`
+        !!   to `SQL_ENC_UTF16` — the caller should refuse the input, since
+        !!   neither the lexer nor `DT_CHAR` storage can hold UTF-16 (UTF-32LE
+        !!   begins with the same two bytes and is reported the same way);
+        !! - anything else is `SQL_ENC_PLAIN`, `text` untouched.
+        !!
+        !! Call it on the **first** line of a stream only.  An unallocated
+        !! `text` is `SQL_ENC_PLAIN`.
+        pure module subroutine sql_strip_bom(text, enc)
+            character(len=:), allocatable, intent(inout) :: text  !! First input line
+            integer,                       intent(out)   :: enc   !! `SQL_ENC_PLAIN` / `SQL_ENC_UTF8` / `SQL_ENC_UTF16`
+        end subroutine
+
         !! Tokenise one source line.  Always succeeds for well-formed tokens;
         !! reports `SQR_INVALID` with `errmsg` (carrying the offending column)
         !! for an unterminated string or a stray character.  `toks(1:ntok)` are

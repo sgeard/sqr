@@ -38,6 +38,7 @@ module sqr
     use, intrinsic :: iso_fortran_env, only: int8, int32, int64, real64
     use, intrinsic :: iso_c_binding, only: c_int64_t
     use :: b_tree, only: btree_t, bt_cursor_t
+    use :: sqr_consts
     implicit none
     private
 
@@ -53,9 +54,15 @@ module sqr
     integer, parameter, public :: DT_CHAR = 3
     integer, parameter, public :: DT_TEXT = 4  !! Arbitrary-length text; bytes in `<table>.blob`
 
+    !! In-row size (`csize`) of a `DT_INT` column.
+    integer, parameter, public :: SQR_INT_SIZE  = I32_BYTES
+    !! In-row size (`csize`) of a `DT_REAL` column.
+    integer, parameter, public :: SQR_REAL_SIZE = R64_BYTES
+    !! Largest `csize` a `DT_CHAR` column may declare (bytes).
+    integer, parameter, public :: SQR_MAX_CHAR  = 65536
     !! In-row descriptor size for a `DT_TEXT` column: int64 blob offset +
     !! int32 length.
-    integer, parameter, public :: SQR_TEXT_DESC = 12
+    integer, parameter, public :: SQR_TEXT_DESC = I64_BYTES + I32_BYTES
 
     ! --- Return codes ---
     integer, parameter, public :: SQR_OK        = 0  !! Success
@@ -97,9 +104,18 @@ module sqr
     !! guard when reading a schema back from disk.
     integer, parameter, public :: SQR_MAX_RECORD = 1024*1024
 
-    !! Capacity of the handle's sticky error-detail buffer (`db_last_error`);
+    !! Capacity of the handle's sticky error-detail buffer (`db_last_error`),
+    !! and the length to give any `errmsg` buffer passed to this library;
     !! longer messages are truncated.
     integer, parameter, public :: SQR_ERRMSG_LEN = 256
+
+    !! Upper bound on a database directory path (Linux `PATH_MAX`); also the
+    !! size to give a buffer that receives a path from the command line.
+    integer, parameter, public :: SQR_MAX_DIR = 4096
+
+    !! Undo steps a handle's history retains unless told otherwise
+    !! (`history_t%cap`).
+    integer, parameter, public :: SQR_HISTORY_DEFAULT = 100
 
     ! --- Types ---
 
@@ -267,7 +283,7 @@ module sqr
     type, public :: history_t
         type(hist_stack_t) :: undo  !! Committed steps (newest on top)
         type(hist_stack_t) :: redo  !! Undone steps (newest on top)
-        integer        :: cap        = 100        !! Max retained undo steps (oldest dropped)
+        integer        :: cap        = SQR_HISTORY_DEFAULT  !! Max retained undo steps (oldest dropped)
         logical        :: capturing  = .false.    !! The in-flight explicit txn is a labelled gesture
         character(len=:), allocatable :: pending_label  !! Label stashed by db_begin until commit
     end type

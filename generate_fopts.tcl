@@ -11,6 +11,21 @@ MOD_OPTS := -J$(ODIR) -I$(ODIR)
 F_BASE   := -cpp -Wall $(F_EXTRA_GF)
 ifdef debug
     F_BUILD := -ggdb -fbounds-check -ffpe-trap=denormal,invalid -fPIC
+    # GCC 16.1 at -O0 only (15.2 and -O1+ are fine):
+    #  - assigning a constant of exactly 64 characters to a deferred-length
+    #    allocatable drops the copy (the inline memmove expansion for lengths
+    #    in (32,64] emits no stores), leaving the new buffer uninitialised.
+    #    Expanding string moves as library calls avoids it (x86 option).
+    #  - -Wmaybe-uninitialized fires on the bounds reads guarding an
+    #    intent(out) deallocation of an unallocated allocatable array whose
+    #    type has allocatable components (the reads sit behind data /= null).
+    #    Release builds keep the warning.
+    ifeq ($(firstword $(subst ., ,$(shell $(F) -dumpversion))),16)
+        F_BUILD += -Wno-maybe-uninitialized
+        ifeq ($(shell uname -m),x86_64)
+            F_BUILD += -mstringop-strategy=libcall
+        endif
+    endif
 else
     F_BUILD := -O3 -fPIC
 endif
@@ -85,9 +100,12 @@ ifeq ($(shell uname -m),x86_64)
     # absolute relocations are rejected in a PIE (R_X86_64_32). ifx and gfortran
     # do not force PIE; match them. Android (the aarch64 branch below) MUST stay
     # PIE, so this is x86_64-only.
-    F_LOPTS  := -no-pie -L/usr/lib/gcc/x86_64-mageia-linux/12 -B/usr/lib/gcc/x86_64-mageia-linux/12
+    #
+    # No -L/-B for the gcc runtime: the local LLVM finds the system gcc through
+    # /usr/local/bin/flang.cfg (--gcc-triple=x86_64-mageia-linux).
+    F_LOPTS  := -no-pie
     # A shared object is position independent by nature: no -no-pie
-    F_SOOPTS := -shared -L/usr/lib/gcc/x86_64-mageia-linux/12 -B/usr/lib/gcc/x86_64-mageia-linux/12
+    F_SOOPTS := -shared
 else
     F_LOPTS  := -L/data/data/com.termux/files/usr/lib/clang/21/lib
     F_SOOPTS := -shared -L/data/data/com.termux/files/usr/lib/clang/21/lib

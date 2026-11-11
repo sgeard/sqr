@@ -41,10 +41,23 @@ submodule (sqr:sqr_base) sqr_journal
     integer,          parameter :: UNDO_EXTEND = 2        ! original length captured
     integer(int64),   parameter :: JHEADER     = 64_int64 ! reserved header size
     integer(int64),   parameter :: JPRESIZE    = 131072_int64  ! 128 KiB pre-allocation
-    ! Smallest a serialised undo record can be: kind(4) + pathlen(4) +
-    ! orig_len(8) + offset(8) + length(8) + byteslen(8), with an empty path and
-    ! no bytes. The header's record count is bounded by payload_len / this.
-    integer,          parameter :: MIN_REC     = 40
+    ! Fixed parts of a serialised undo record. The variable-length path sits
+    ! between them and the captured bytes follow the tail:
+    !   head = kind + pathlen                       (int32 each)
+    !   tail = orig_len + offset + length + byteslen (int64 each)
+    integer,          parameter :: REC_HEAD_BYTES = 2 * I32_BYTES
+    integer,          parameter :: REC_TAIL_BYTES = 4 * I64_BYTES
+    ! Smallest a serialised undo record can be: head + tail, with an empty
+    ! path and no bytes. The header's record count is bounded by
+    ! payload_len / this.
+    integer,          parameter :: MIN_REC     = REC_HEAD_BYTES + REC_TAIL_BYTES
+
+    ! Starting sizes of arrays that double as they fill; not limits.
+    integer,          parameter :: RECS_INIT_CAP  = 4    ! undo records
+    integer,          parameter :: FILES_INIT_CAP = 8    ! distinct files met at commit
+    ! Slots in the dedup hash when first built. Must be a power of two: the
+    ! probe masks with (size - 1).
+    integer,          parameter :: HASH_INIT_CAP  = 64
 
 contains
 
@@ -434,7 +447,7 @@ contains
         integer,    intent(out), optional :: stat
         type(undo_rec_t), allocatable :: recs(:)
         character(len=:), allocatable :: payload
-        character(len=4) :: magic
+        character(len=len(JMAGIC)) :: magic
         integer          :: u, ios, fmt, state, nrec, cksum, i, st
         integer(int64)   :: plen, fsize
         logical          :: held
@@ -539,7 +552,7 @@ contains
         class(db_t), intent(in) :: db
         logical                 :: hot
         character(len=:), allocatable :: jpath
-        character(len=4) :: magic
+        character(len=len(JMAGIC)) :: magic
         integer          :: u, ios, fmt, state
         hot = .false.
         ! Probe only — never mutates db (db%jrnl%path may not be set yet).
@@ -636,7 +649,7 @@ contains
             integer, allocatable :: first(:), tmp(:)
             integer :: nseen, m
             nseen = 0
-            allocate(first(8))
+            allocate(first(FILES_INIT_CAP))
             do i = 1, db%jrnl%nrec
                 dup = .false.
                 seen: do m = 1, nseen
@@ -872,7 +885,7 @@ contains
         character(len=:), allocatable :: zeros
         integer :: u, ios
         allocate(character(len=int(JPRESIZE)) :: zeros)
-        zeros = repeat(char(0), int(JPRESIZE))
+        zeros = repeat(CH_NUL, int(JPRESIZE))
         ! A unit may already be connected (recovery voided a leftover journal
         ! through it at open): a replace-open of a connected file is an error,
         ! so let it go first.  The replaced file is then held open for the
@@ -972,15 +985,20 @@ contains
         integer(int64),   intent(in) :: offset, length
         integer,          intent(in) :: mask
         integer(int64), parameter :: M = 2147483647_int64   ! 2^31-1 (Mersenne prime)
+        ! Seed and multiplier borrowed from 32-bit FNV (its offset basis and
+        ! prime) for their mixing; the fold itself is the modular polynomial
+        ! below, not FNV. In-memory only — never stored.
+        integer(int64), parameter :: HASH_SEED = 2166136261_int64
+        integer(int64), parameter :: HASH_MULT = 16777619_int64
         integer(int64) :: acc
         integer :: i
-        acc = 2166136261_int64
+        acc = HASH_SEED
         do i = 1, len(path)
-            acc = modulo(acc * 16777619_int64 + int(iachar(path(i:i)), int64), M)
+            acc = modulo(acc * HASH_MULT + int(iachar(path(i:i)), int64), M)
         end do
-        acc = modulo(acc * 16777619_int64 + int(kind, int64),   M)
-        acc = modulo(acc * 16777619_int64 + modulo(offset, M),  M)
-        acc = modulo(acc * 16777619_int64 + modulo(length, M),  M)
+        acc = modulo(acc * HASH_MULT + int(kind, int64),   M)
+        acc = modulo(acc * HASH_MULT + modulo(offset, M),  M)
+        acc = modulo(acc * HASH_MULT + modulo(length, M),  M)
         h = int(iand(acc, int(mask, int64)))
     end function
 
@@ -1052,15 +1070,15 @@ contains
         type(undo_rec_t),intent(in)    :: r
         type(undo_rec_t), allocatable :: tmp(:)
         if (j%nrec == size(j%recs)) then
-            allocate(tmp(max(4, 2 * j%nrec)))
+            allocate(tmp(max(RECS_INIT_CAP, 2 * j%nrec)))
             tmp(1:j%nrec) = j%recs(1:j%nrec)
             call move_alloc(tmp, j%recs)
         end if
         j%nrec = j%nrec + 1
         j%recs(j%nrec) = r
-        ! Keep the dedup hash at load < 1/2 (first size 64), then index the row.
+        ! Keep the dedup hash at load < 1/2 (first size HASH_INIT_CAP), then index the row.
         if (.not. allocated(j%hslot)) then
-            call rehash(j, 64)
+            call rehash(j, HASH_INIT_CAP)
         else if (j%hcount + 1 > size(j%hslot) / 2) then
             call rehash(j, size(j%hslot) * 2)
         end if
@@ -1111,7 +1129,7 @@ contains
         if (len(p) == 0) return
         if (scan(p, '/\') /= 0) return          ! no directory component
         if (p(1:1) == '.') return               ! no '.', '..', hidden names
-        if (scan(p, char(0)) /= 0) return       ! no truncation at a NUL
+        if (scan(p, CH_NUL) /= 0) return         ! no truncation at a NUL
         ok = .true.
     end function
 
@@ -1122,7 +1140,7 @@ contains
         integer(int64) :: blen
         blen = 0_int64
         if (r%kind == UNDO_REGION) blen = int(len(r%bytes), int64)
-        n = 40_int64 + int(len(r%path), int64) + blen
+        n = int(MIN_REC, int64) + int(len(r%path), int64) + blen
     end function
 
     ! Write one serialised record into buf starting at 1-based position p,
@@ -1136,13 +1154,13 @@ contains
         blen = 0_int64
         if (r%kind == UNDO_REGION) blen = int(len(r%bytes), int64)
         plen = len(r%path)
-        buf(p:p+3) = i32b(r%kind);                     p = p + 4
-        buf(p:p+3) = i32b(plen);                       p = p + 4
+        call put_i32(buf, p, r%kind)
+        call put_i32(buf, p, plen)
         if (plen > 0) then; buf(p:p+plen-1) = r%path;  p = p + plen; end if
-        buf(p:p+7) = i64b(r%orig_len);                 p = p + 8
-        buf(p:p+7) = i64b(r%offset);                   p = p + 8
-        buf(p:p+7) = i64b(r%length);                   p = p + 8
-        buf(p:p+7) = i64b(blen);                       p = p + 8
+        call put_i64(buf, p, r%orig_len)
+        call put_i64(buf, p, r%offset)
+        call put_i64(buf, p, r%length)
+        call put_i64(buf, p, blen)
         if (blen > 0) then; buf(p:p+int(blen)-1) = r%bytes; p = p + int(blen); end if
     end subroutine
 
@@ -1196,16 +1214,16 @@ contains
         end if
         p = 1
         do i = 1, nrec
-            if (len(buf) - p + 1 < 8) then; ios = 1; return; end if
-            recs(i)%kind = b32(buf(p:p+3));     p = p + 4
-            pathlen      = b32(buf(p:p+3));      p = p + 4
+            if (len(buf) - p + 1 < REC_HEAD_BYTES) then; ios = 1; return; end if
+            call take_i32(buf, p, recs(i)%kind)
+            call take_i32(buf, p, pathlen)
             if (pathlen < 0 .or. pathlen > len(buf) - p + 1) then; ios = 1; return; end if
             recs(i)%path = buf(p:p+pathlen-1);   p = p + pathlen
-            if (len(buf) - p + 1 < 32) then; ios = 1; return; end if
-            recs(i)%orig_len = b64(buf(p:p+7));  p = p + 8
-            recs(i)%offset   = b64(buf(p:p+7));  p = p + 8
-            recs(i)%length   = b64(buf(p:p+7));  p = p + 8
-            blen             = b64(buf(p:p+7));  p = p + 8
+            if (len(buf) - p + 1 < REC_TAIL_BYTES) then; ios = 1; return; end if
+            call take_i64(buf, p, recs(i)%orig_len)
+            call take_i64(buf, p, recs(i)%offset)
+            call take_i64(buf, p, recs(i)%length)
+            call take_i64(buf, p, blen)
             if (blen < 0_int64 .or. blen > int(len(buf) - p + 1, int64)) then
                 ios = 1
                 return
@@ -1220,28 +1238,61 @@ contains
 
     ! ---- byte (de)serialisation of scalars (native order) ----
 
+    ! Store / fetch one scalar at buf(p:), advancing p past it.
+    pure subroutine put_i32(buf, p, i)
+        character(len=*), intent(inout) :: buf
+        integer,          intent(inout) :: p
+        integer,          intent(in)    :: i
+        buf(p : p + I32_BYTES - 1) = i32b(i)
+        p = p + I32_BYTES
+    end subroutine
+
+    pure subroutine put_i64(buf, p, i)
+        character(len=*), intent(inout) :: buf
+        integer,          intent(inout) :: p
+        integer(int64),   intent(in)    :: i
+        buf(p : p + I64_BYTES - 1) = i64b(i)
+        p = p + I64_BYTES
+    end subroutine
+
+    pure subroutine take_i32(buf, p, i)
+        character(len=*), intent(in)    :: buf
+        integer,          intent(inout) :: p
+        integer,          intent(out)   :: i
+        i = b32(buf(p : p + I32_BYTES - 1))
+        p = p + I32_BYTES
+    end subroutine
+
+    pure subroutine take_i64(buf, p, i)
+        character(len=*), intent(in)    :: buf
+        integer,          intent(inout) :: p
+        integer(int64),   intent(out)   :: i
+        i = b64(buf(p : p + I64_BYTES - 1))
+        p = p + I64_BYTES
+    end subroutine
+
     pure function i32b(i) result(s)
         integer, intent(in) :: i
-        character(len=4) :: s
+        character(len=I32_BYTES) :: s
         s = transfer(int(i, int32), s)
     end function
 
     pure function i64b(i) result(s)
         integer(int64), intent(in) :: i
-        character(len=8) :: s
+        character(len=I64_BYTES) :: s
         s = transfer(i, s)
     end function
 
     pure integer function b32(s) result(i)
         character(len=*), intent(in) :: s
         integer(int32) :: v
-        v = transfer(s(1:4), v)
+        v = transfer(s(1:I32_BYTES), v)
         i = int(v)
     end function
 
     pure integer(int64) function b64(s) result(i)
         character(len=*), intent(in) :: s
-        i = transfer(s(1:8), i)
+        i = transfer(s(1:I64_BYTES), i)
     end function
 
     ! Order-sensitive rolling checksum over the record payload.
@@ -1345,7 +1396,7 @@ contains
             lo = max(offset, rstart);  hi = min(last, rstart + recl - 1)
             if (lo > rstart .or. hi < rstart + recl - 1) then
                 read(u, rec=k, iostat=rios) rec
-                if (rios /= 0) rec = repeat(char(0), recl)
+                if (rios /= 0) rec = repeat(CH_NUL, recl)
             end if
             rec(lo - rstart + 1:hi - rstart + 1) = bytes(lo - offset + 1:hi - offset + 1)
             write(u, rec=k, iostat=ios) rec

@@ -1,5 +1,6 @@
 submodule (sqr_net) sqr_net_impl
-    use :: clib_wrap, only: c_sock_recv, c_sock_send, c_sock_close
+    use :: clib_wrap,  only: c_sock_recv, c_sock_send, c_sock_close
+    use :: sqr_consts, only: CH_LF, CH_CR
     implicit none
 
 contains
@@ -55,7 +56,7 @@ contains
         character(len=*), intent(in)    :: line
         integer                         :: ierr
         ierr = NET_OK
-        if (c_sock_send(conn%sock, line // achar(10)) /= 0) ierr = NET_ERR
+        if (c_sock_send(conn%sock, line // CH_LF) /= 0) ierr = NET_ERR
     end function
 
     module function net_send_payload(conn, bytes) result(ierr)
@@ -73,7 +74,7 @@ contains
         integer :: p, n
         scan: do
             if (conn%rhi >= conn%rlo) then
-                p = index(conn%rbuf(conn%rlo:conn%rhi), achar(10))
+                p = index(conn%rbuf(conn%rlo:conn%rhi), CH_LF)
                 if (p > 0) then
                     n = p - 1
                     if (n > NET_MAX_LINE) then
@@ -83,7 +84,7 @@ contains
                     line = conn%rbuf(conn%rlo:conn%rlo + n - 1)
                     conn%rlo = conn%rlo + p
                     if (n > 0) then
-                        if (line(n:n) == achar(13)) line = line(1:n - 1)
+                        if (line(n:n) == CH_CR) line = line(1:n - 1)
                     end if
                     ierr = NET_OK
                     return

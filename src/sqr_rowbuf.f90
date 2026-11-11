@@ -17,18 +17,18 @@ contains
     pure module subroutine row_alloc(buf, n)
         character(len=:), allocatable, intent(out) :: buf
         integer,                       intent(in)  :: n
-        buf = repeat(char(0), max(0, n))
+        buf = repeat(CH_NUL, max(0, n))
     end subroutine
 
     pure module subroutine row_clear(buf)
         character(len=*), intent(inout) :: buf
-        buf = repeat(char(0), len(buf))
+        buf = repeat(CH_NUL, len(buf))
     end subroutine
 
     pure module function row_status(buf) result(s)
         character(len=*), intent(in) :: buf
         integer(int8) :: s
-        s = transfer(buf(1:1), s)
+        s = transfer(buf(ROW_STATUS_OFF:ROW_STATUS_OFF), s)
     end function
 
     pure module subroutine row_set_status(buf, s)
@@ -36,7 +36,7 @@ contains
         integer(int8),    intent(in)    :: s
         character(len=1) :: c
         c = transfer(s, c)
-        buf(1:1) = c
+        buf(ROW_STATUS_OFF:ROW_STATUS_OFF) = c
     end subroutine
 
     pure module subroutine row_set_null(buf, col)
@@ -80,9 +80,9 @@ contains
         character(len=*), intent(inout) :: buf
         type(column_t),   intent(in)    :: col
         integer(int32),   intent(in)    :: val
-        character(len=4) :: c
+        character(len=I32_BYTES) :: c
         c = transfer(val, c)
-        buf(col%offset : col%offset + 3) = c
+        buf(col%offset : col%offset + I32_BYTES - 1) = c
         call row_clear_null(buf, col)   ! a stored value is not NULL
     end subroutine
 
@@ -90,16 +90,16 @@ contains
         character(len=*), intent(in) :: buf
         type(column_t),   intent(in) :: col
         integer(int32) :: val
-        val = transfer(buf(col%offset : col%offset + 3), val)
+        val = transfer(buf(col%offset : col%offset + I32_BYTES - 1), val)
     end function
 
     pure module subroutine row_set_real(buf, col, val)
         character(len=*), intent(inout) :: buf
         type(column_t),   intent(in)    :: col
         real(real64),     intent(in)    :: val
-        character(len=8) :: c
+        character(len=R64_BYTES) :: c
         c = transfer(val, c)
-        buf(col%offset : col%offset + 7) = c
+        buf(col%offset : col%offset + R64_BYTES - 1) = c
         call row_clear_null(buf, col)   ! a stored value is not NULL
     end subroutine
 
@@ -107,7 +107,7 @@ contains
         character(len=*), intent(in) :: buf
         type(column_t),   intent(in) :: col
         real(real64) :: val
-        val = transfer(buf(col%offset : col%offset + 7), val)
+        val = transfer(buf(col%offset : col%offset + R64_BYTES - 1), val)
     end function
 
     pure module subroutine row_set_char(buf, col, val)
@@ -117,7 +117,7 @@ contains
         integer :: nc
         associate (n => col%csize, off => col%offset)
             nc = min(n, len(val))
-            buf(off : off + n - 1)  = repeat(char(0), n)
+            buf(off : off + n - 1)  = repeat(CH_NUL, n)
             if (nc > 0) buf(off : off + nc - 1) = val(1:nc)
         end associate
         call row_clear_null(buf, col)   ! a stored value is not NULL
@@ -129,7 +129,7 @@ contains
         character(len=:), allocatable :: val
         integer :: k
         associate (n => col%csize, off => col%offset)
-            k = scan(buf(off : off + n - 1), char(0))
+            k = scan(buf(off : off + n - 1), CH_NUL)
             if (k == 0) then
                 val = buf(off : off + n - 1)
             else

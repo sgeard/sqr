@@ -14,12 +14,12 @@ program sqlsh
     use, intrinsic :: iso_fortran_env, only: output_unit, error_unit, iostat_end
     use :: sqr
     use :: sql
-    use :: clib_wrap, only: c_isatty_stdin
+    use :: clib_wrap, only: c_isatty_stdin, c_exit
     implicit none
 
     type(db_t), save :: db
     character(len=:), allocatable :: line
-    logical :: interactive
+    logical :: interactive, first_line
     integer :: nargs
 
     interactive = is_a_tty()       ! prompt only when reading from a terminal
@@ -29,10 +29,15 @@ program sqlsh
 
     if (interactive) call banner()
 
+    first_line = .true.
     repl: do
         call prompt()
         call read_line(line)
         if (.not. allocated(line)) exit repl       ! EOF
+        if (first_line) then
+            first_line = .false.
+            call check_encoding(line)
+        end if
         if (len_trim(line) == 0) cycle repl
         if (line(1:1) == '.') then
             if (meta(line)) exit repl               ! .quit / .exit
@@ -48,9 +53,9 @@ contains
     ! ---- start-up ----
 
     subroutine open_arg_db()
-        character(len=4096) :: arg
+        character(len=SQR_MAX_DIR) :: arg
         integer :: rs
-        character(len=256) :: emsg
+        character(len=SQR_ERRMSG_LEN) :: emsg
         call get_command_argument(1, arg)
         emsg = ''
         call db_open(db, trim(arg), rs, emsg)
@@ -72,11 +77,28 @@ contains
 
     ! ---- input ----
 
+    !! Deal with a byte-order mark on the first line of input: a UTF-8 mark is
+    !! dropped; UTF-16 cannot be read at all, so say so and end with status 1
+    !! rather than report a syntax error on every line.
+    subroutine check_encoding(line)
+        character(len=:), allocatable, intent(inout) :: line
+        integer :: enc
+        call sql_strip_bom(line, enc)
+        if (enc /= SQL_ENC_UTF16) return
+        write(error_unit,'(a)') 'sqlsh: input is UTF-16; sqlsh reads UTF-8.'
+        write(error_unit,'(a)') '       Re-save the script as UTF-8 (Windows PowerShell 5.1: ' // &
+                                'Out-File -Encoding utf8 instead of ">").'
+        if (db%opened) call db_close(db)
+        flush(error_unit)
+        call c_exit(1)
+    end subroutine
+
     !! Read one logical line of arbitrary length from stdin into `line`.
     !! Leaves `line` unallocated on end-of-file.
     subroutine read_line(line)
         character(len=:), allocatable, intent(out) :: line
-        character(len=512) :: chunk
+        integer, parameter :: CHUNK_LEN = 512   ! bytes read per non-advancing read
+        character(len=CHUNK_LEN) :: chunk
         integer :: ios, n
         line = ''
         do
@@ -97,7 +119,7 @@ contains
         character(len=*), intent(in) :: text
         type(sql_result_t) :: res
         integer :: rs
-        character(len=256) :: emsg
+        character(len=SQR_ERRMSG_LEN) :: emsg
         emsg = ''
         call sql_run(db, text, res, rs, emsg)
         if (rs /= SQR_OK) then
@@ -161,7 +183,7 @@ contains
     subroutine meta_open(dir)
         character(len=*), intent(in) :: dir
         integer :: rs
-        character(len=256) :: emsg
+        character(len=SQR_ERRMSG_LEN) :: emsg
         if (len_trim(dir) == 0) then
             write(error_unit,'(a)') 'usage: .open <dir>'
             return
@@ -197,7 +219,7 @@ contains
             block
                 type(column_t), allocatable :: cols(:)
                 call db_describe(db, trim(names(i)), cols)
-                write(output_unit,'(3a,2(i0,a))') trim(names(i)), &
+                write(output_unit,'(2a,2(i0,a))') trim(names(i)), &
                     '  (', db_row_count(db, trim(names(i))), ' rows, ', size(cols), ' cols)'
             end block
         end do
@@ -237,9 +259,10 @@ contains
     end subroutine
 
     pure function type_text(dtype, csize) result(s)
+        use :: sqr_consts, only: INT_TEXT_LEN
         integer, intent(in) :: dtype, csize
         character(len=:), allocatable :: s
-        character(len=16) :: buf
+        character(len=INT_TEXT_LEN) :: buf
         select case (dtype)
         case (DT_INT);  s = 'INTEGER'
         case (DT_REAL); s = 'REAL'
@@ -313,12 +336,13 @@ contains
     end function
 
     pure function lower(s) result(r)
+        use :: sqr_consts, only: ASCII_CASE_OFFSET
         character(len=*), intent(in) :: s
         character(len=len(s)) :: r
         integer :: k, c
         do k = 1, len(s)
             c = iachar(s(k:k))
-            if (c >= iachar('A') .and. c <= iachar('Z')) c = c + 32
+            if (c >= iachar('A') .and. c <= iachar('Z')) c = c + ASCII_CASE_OFFSET
             r(k:k) = achar(c)
         end do
     end function

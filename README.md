@@ -192,6 +192,15 @@ sqlsh mydb                     # interactive (prompts/errors on stderr)
 Meta-commands: `.open <dir>`, `.close`, `.tables`, `.schema [table]`,
 `.help`, `.quit`. Everything else is SQL:
 
+**Input encoding.** `sqlsh` reads UTF-8 (plain ASCII included). Text is
+stored and compared as bytes, so UTF-8 values round-trip and sort in
+code-point order; `CHAR(n)` counts bytes, not characters, and a non-ASCII
+table or column name must be double-quoted. A UTF-8 byte-order mark at the
+start of the input is ignored. UTF-16 is not supported: a script that
+starts with a UTF-16 byte-order mark — what `>` produces in Windows
+PowerShell 5.1 — is refused with a message and exit status 1. Re-save it as
+UTF-8 (`Out-File -Encoding utf8`, or use PowerShell 7).
+
 ```sql
 CREATE TABLE employee (id INTEGER, name CHAR(20), dept CHAR(12), salary REAL);
 CREATE INDEX ON employee (dept);

@@ -10,9 +10,40 @@
 !! exactly `sql_lex`'s signature.  Co-locating caller and callee sidesteps it.
 
 submodule (sql) sql_base
+    use :: sqr_consts, only: I32_BYTES, R64_BYTES, CH_NUL, CH_TAB, CH_HIGH, ASCII_CASE_OFFSET, &
+                             INT_TEXT_LEN, NUM_TEXT_LEN
     implicit none
 
+    ! Byte-order marks, as the bytes that open a file.
+    character(len=*), parameter :: BOM_UTF8    = char(int(z'EF')) // char(int(z'BB')) // char(int(z'BF'))
+    character(len=*), parameter :: BOM_UTF16LE = char(int(z'FF')) // char(int(z'FE'))
+    character(len=*), parameter :: BOM_UTF16BE = char(int(z'FE')) // char(int(z'FF'))
+
 contains
+
+    ! ===== input encoding =====
+
+    !! `.true.` if `text` begins with `prefix`.
+    pure function starts_with(text, prefix) result(yes)
+        character(len=*), intent(in) :: text, prefix
+        logical :: yes
+        yes = .false.
+        if (len(text) < len(prefix)) return
+        yes = text(1:len(prefix)) == prefix
+    end function
+
+    pure module subroutine sql_strip_bom(text, enc)
+        character(len=:), allocatable, intent(inout) :: text
+        integer,                       intent(out)   :: enc
+        enc = SQL_ENC_PLAIN
+        if (.not. allocated(text)) return
+        if (starts_with(text, BOM_UTF8)) then
+            enc  = SQL_ENC_UTF8
+            text = text(len(BOM_UTF8) + 1:)
+        else if (starts_with(text, BOM_UTF16LE) .or. starts_with(text, BOM_UTF16BE)) then
+            enc = SQL_ENC_UTF16
+        end if
+    end subroutine
 
     ! ===== shared helpers (host-associated by sql_parse / sql_exec) =====
 
@@ -23,7 +54,7 @@ contains
         integer :: k, c
         do k = 1, len(s)
             c = iachar(s(k:k))
-            if (c >= iachar('A') .and. c <= iachar('Z')) c = c + 32
+            if (c >= iachar('A') .and. c <= iachar('Z')) c = c + ASCII_CASE_OFFSET
             r(k:k) = achar(c)
         end do
     end function
@@ -65,7 +96,7 @@ contains
     pure function itoa(i) result(s)
         integer, intent(in) :: i
         character(len=:), allocatable :: s
-        character(len=12) :: buf
+        character(len=INT_TEXT_LEN) :: buf
         write(buf, '(i0)') i
         s = trim(buf)
     end function

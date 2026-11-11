@@ -257,7 +257,7 @@ contains
         integer(int32) :: rid
         integer(int64) :: fsize
         character(len=:), allocatable :: rbuf
-        character(len=128) :: detail
+        character(len=SQR_ERRMSG_LEN) :: detail
         call clear_last_err(db)
         vrs = SQR_OK
         detail = ''
