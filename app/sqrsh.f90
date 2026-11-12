@@ -1165,29 +1165,13 @@ program sqrsh
     use sqr
     use sqrsh_state
     use sqrsh_actions
+    use sqrsh_extras, only: add_extra_commands
     use :: clib_wrap, only: c_exit
     implicit none
 
     type(engine_t) :: ui
     character(len=SQR_MAX_DIR) :: arg
     integer :: run_stat
-
-#ifdef SQR_WITH_REGEX
-    ! The regex `match` command is supplied as an external procedure by the
-    ! tcl_re-backed module regex/sqrsh_regex.f90, linked only by
-    ! `make sqrsh-regex`. Declaring it external here — rather than `use`-ing
-    ! that module — keeps this file free of any reference to tcl_re, which fpm
-    ! cannot build and whose dependency scanner does not honour this #ifdef.
-    interface
-        function act_match(args, ctx) result(rv)
-            use cmdgraph, only: action_result_t
-            use dlist,    only: dlist_t
-            type(dlist_t),    intent(in) :: args
-            character(len=*), intent(in) :: ctx
-            type(action_result_t)        :: rv
-        end function act_match
-    end interface
-#endif
 
     ! root state — database-level commands
     call ui%add_state("root", prompt="sqr> ")
@@ -1239,10 +1223,7 @@ program sqrsh
     call ui%add_command("table", "f(ind)",   EDGE_ACTION, proc=act_find,   help="find <col> <value>")
     call ui%add_command("table", "r(ange)",  EDGE_ACTION, proc=act_range, &
          help="range <col> <lo> <hi> (indexed rows in [lo,hi], ascending)")
-#ifdef SQR_WITH_REGEX
-    call ui%add_command("table", "m(atch)",  EDGE_ACTION, proc=act_match, &
-         help="match <col> <regex> (char column, regex scan)")
-#endif
+    call add_extra_commands(ui)
     call ui%add_command("table", "getk",     EDGE_ACTION, proc=act_getk, &
          help="getk <col> <val> [<col> <val> ...] (by unique key)")
     call ui%add_command("table", "delk",     EDGE_ACTION, proc=act_delk, &

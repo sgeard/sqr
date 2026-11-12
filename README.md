@@ -89,7 +89,8 @@ fpm run sqlsh        # the SQL-subset REPL (front-end over the same API)
 
 > Note: the regex-dependent `match` action and its test link the external
 > `tcl_re` binding and are built via `make sqrsh-regex` / `make test-regex`,
-> not through `fpm`.
+> not through `fpm`. The command is chosen at link time (an alternative
+> submodule of `sqrsh_extras`), not by a preprocessor symbol.
 
 ---
 

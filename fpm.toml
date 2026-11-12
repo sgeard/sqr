@@ -19,15 +19,6 @@ copyright = "Copyright 2026, sgeard"
    implicit-external = false
    source-form = "free"
 
-# app/sqrsh.f90 uses #ifdef SQR_WITH_REGEX to gate the opt-in regex search.
-# fpm does not preprocess lowercase .f90 by default; enable cpp so the guarded
-# (off-by-default) source compiles. The OS/platform split no longer needs any
-# preprocessing here: it lives in src/osshim.c, which fpm compiles
-# automatically. The code's `//` concatenations survive cpp, as before.
-[preprocess]
-[preprocess.cpp]
-   suffixes = [".f90", ".F90"]
-
 # The cmdgraph engine (driving sqrsh) is vendored into src/ from
 # github.com/sgeard/cmdgraph, so there is no external dependency to resolve —
 # a fresh clone builds with `fpm test` / `fpm run sqrsh` out of the box.

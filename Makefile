@@ -1,4 +1,4 @@
-.PHONY: all clean veryclean distclean utest sqlttest shelltest sqrdtest calctest install uninstall install-calc faulttest run-faulttest proctest bench run-bench destruct run-destruct coverage coverage-gcov coverage-clean docs docs-clean help windows win-build sqrsh-regex test-regex
+.PHONY: all check depcheck clean veryclean distclean utest sqlttest shelltest sqrdtest calctest install uninstall install-calc faulttest run-faulttest proctest bench run-bench destruct run-destruct coverage coverage-gcov coverage-clean docs docs-clean help windows win-build sqrsh-regex test-regex
 .SUFFIXES:
 .DEFAULT_GOAL := all
 
@@ -39,6 +39,18 @@ $(OPTIONS_FNAME): generate_fopts.tcl
 	tclsh generate_fopts.tcl $(F) $(OPTIONS_FNAME)
 
 -include $(OPTIONS_FNAME)
+
+# Sibling tcl_re (opt-in regex search only: sqrsh-regex, test-regex). Its
+# self-contained static engine, libtclInterface.a, bundles the regex engine
+# (no libtcl). tcl_re shares the standardised build, so its ODIR matches
+# $(ODIR). Built on demand if missing.
+TCLRE_DIR  ?= ../tcl_re
+TCLRE_ODIR ?= $(TCLRE_DIR)/$(ODIR)
+TCLRE_LIB  ?= $(TCLRE_ODIR)/libtclInterface.a
+TF_EXT_tcl_frx := $(TCLRE_ODIR)/tcl_frx.mod
+
+$(TCLRE_LIB) $(TF_EXT_tcl_frx):
+	$(MAKE) -C $(TCLRE_DIR) F=$(F)
 
 F_OPTS := $(F_BASE) $(F_BUILD) $(MOD_OPTS) -I$(SRC_DIR)
 LFLAGS := $(F_LOPTS)
@@ -102,137 +114,52 @@ APP_BIN := $(patsubst $(APP_DIR)/%.f90,$(ODIR)/%$(EXT),$(APP_SRC))
 
 all: $(OPTIONS_FNAME) $(LIB) $(TEST_BIN) $(APP_BIN)
 
-# --- Module dependencies (auto-generated) ---
-depends.mk: fortran_deps.tcl $(addprefix $(SRC_DIR)/,$(LIB_SRC)) $(TEST_SRC) $(APP_SRC)
-	tclsh $< $(SRC_DIR) $@ $(LIB_SRC) $(notdir $(TEST_SRC)) $(notdir $(APP_SRC))
+# --- Module dependencies: depends.mk, written by tf_bld.tcl ---
+# The master in ../common/tf_bld, run in place; a standalone mirror (no
+# ../common) carries its own copy beside this Makefile. The Makefile names
+# the sources: the library's (both fault submodules, so depends.mk is the
+# same for FAULT=off and on) and every program's. No entry points: every
+# program links libsqr.a.
+TF_BLD  ?= $(firstword $(wildcard ../common/tf_bld/tf_bld.tcl) tf_bld.tcl)
+TF_SRCS := $(addprefix $(SRC_DIR)/,$(LIB_SRC)) \
+           $(SRC_DIR)/sqr_fault_off_sm.f90 $(FAULT_DIR)/sqr_fault_on_sm.f90 \
+           $(TEST_SRC) $(TEST_DIR)/proctest.f90 $(FAULT_TEST_SRC) \
+           $(APP_SRC) $(APP_DIR)/sqrsh_extras.f90 $(APP_DIR)/sqrsh_extras_off_sm.f90 \
+           $(wildcard $(REGEX_DIR)/*.f90 $(BENCH_DIR)/*.f90 $(DESTRUCT_DIR)/*.f90)
 
--include depends.mk
+ifeq ($(filter clean veryclean distclean help depcheck docs docs-clean coverage-clean windows,$(MAKECMDGOALS)),)
+include depends.mk
+endif
 
-# --- Compilation rules ---
-$(ODIR)/clib_wrap.o $(ODIR)/clib_wrap.mod &: $(SRC_DIR)/clib_wrap.f90 | $(ODIR)
-	$(F) -c $(F_OPTS) -o $(ODIR)/clib_wrap.o $<
-	@touch $(ODIR)/clib_wrap.mod
+# Each TF_EXT_m hook declares a sibling's module
+TF_ARGS = $(TF_SRCS) \
+    $(addprefix -ext ,$(patsubst TF_EXT_%,%,$(filter TF_EXT_%,$(.VARIABLES))))
 
-$(ODIR)/clib_wrap_sm.o: $(SRC_DIR)/clib_wrap_sm.f90 $(ODIR)/clib_wrap.mod | $(ODIR)
-	$(F) -c $(F_OPTS) -o $@ $<
+# After the include: TF_SOURCES (every file the last scan read) comes from it
+depends.mk: $(TF_BLD) Makefile $(TF_SRCS) $(TF_SOURCES)
+	tclsh $(TF_BLD) -o $@ $(TF_ARGS)
+
+# The same scan with warnings as errors: a forgotten source or an
+# unimplemented separate procedure fails here, not at the link
+depcheck:
+	tclsh $(TF_BLD) -Werror -o depends.mk $(TF_ARGS)
+
+# --- Compilation: one pattern rule; depends.mk supplies the prerequisites
+# (and the vpath). Per-file extras come from <stem>_OPTS.
+$(ODIR)/%.o: %.f90 | $(ODIR)
+	$(F) -c $(F_OPTS) $($*_OPTS) -o $@ $<
+
+# The regex sources compile against tcl_re's module
+sqrsh_regex_OPTS := -I$(TCLRE_ODIR)
+utest_match_OPTS := -I$(TCLRE_ODIR)
 
 # Platform shim (C). No Fortran module dependencies; the bind(c) interfaces in
 # clib_wrap resolve to these symbols at link time.
 $(ODIR)/osshim.o: $(SRC_DIR)/osshim.c | $(ODIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-$(ODIR)/b_tree.o $(ODIR)/b_tree.mod &: $(SRC_DIR)/b_tree.f90 | $(ODIR)
-	$(F) -c $(F_OPTS) -o $(ODIR)/b_tree.o $<
-	@touch $(ODIR)/b_tree.mod
-
-$(ODIR)/b_tree_sm.o: $(SRC_DIR)/b_tree_sm.f90 $(ODIR)/b_tree.mod | $(ODIR)
-	$(F) -c $(F_OPTS) -o $@ $<
-
-# Shared named constants: parameters only, so a module with no submodule.
-$(ODIR)/sqr_consts.o $(ODIR)/sqr_consts.mod &: $(SRC_DIR)/sqr_consts.f90 | $(ODIR)
-	$(F) -c $(F_OPTS) -o $(ODIR)/sqr_consts.o $<
-	@touch $(ODIR)/sqr_consts.mod
-
-$(ODIR)/sqr.o $(ODIR)/sqr.mod &: $(SRC_DIR)/sqr.f90 $(ODIR)/b_tree.mod $(ODIR)/sqr_consts.mod | $(ODIR)
-	$(F) -c $(F_OPTS) -o $(ODIR)/sqr.o $<
-	@touch $(ODIR)/sqr.mod
-
-$(ODIR)/sqr_fault.o $(ODIR)/sqr_fault.mod &: $(SRC_DIR)/sqr_fault.f90 | $(ODIR)
-	$(F) -c $(F_OPTS) -o $(ODIR)/sqr_fault.o $<
-	@touch $(ODIR)/sqr_fault.mod
-
-$(ODIR)/sqr_fault_off_sm.o: $(SRC_DIR)/sqr_fault_off_sm.f90 $(ODIR)/sqr_fault.mod | $(ODIR)
-	$(F) -c $(F_OPTS) -o $@ $<
-
-$(ODIR)/sqr_fault_on_sm.o: $(FAULT_DIR)/sqr_fault_on_sm.f90 $(ODIR)/sqr_fault.mod | $(ODIR)
-	$(F) -c $(F_OPTS) -o $@ $<
-
-# sqr_base is the intermediate submodule of sqr holding shared engine
-# internals; the feature submodules are its descendants and consume
-# its submodule .smod (compiler-specific name, e.g. sqr@sqr_base.smod), so they
-# must compile after sqr_base. The .o prerequisite enforces that order portably
-# without naming the .smod.
-$(ODIR)/sqr_base.o: $(SRC_DIR)/sqr_base.f90 $(ODIR)/sqr.mod $(ODIR)/b_tree.mod $(ODIR)/clib_wrap.mod $(ODIR)/sqr_fault.mod | $(ODIR)
-	$(F) -c $(F_OPTS) -o $@ $<
-
-$(ODIR)/sqr_admin.o: $(SRC_DIR)/sqr_admin.f90 $(ODIR)/sqr.mod $(ODIR)/sqr_base.o | $(ODIR)
-	$(F) -c $(F_OPTS) -o $@ $<
-
-$(ODIR)/sqr_table.o: $(SRC_DIR)/sqr_table.f90 $(ODIR)/sqr.mod $(ODIR)/clib_wrap.mod $(ODIR)/sqr_base.o | $(ODIR)
-	$(F) -c $(F_OPTS) -o $@ $<
-
-$(ODIR)/sqr_record.o: $(SRC_DIR)/sqr_record.f90 $(ODIR)/sqr.mod $(ODIR)/sqr_base.o | $(ODIR)
-	$(F) -c $(F_OPTS) -o $@ $<
-
-$(ODIR)/sqr_index.o: $(SRC_DIR)/sqr_index.f90 $(ODIR)/sqr.mod $(ODIR)/sqr_base.o | $(ODIR)
-	$(F) -c $(F_OPTS) -o $@ $<
-
-$(ODIR)/sqr_rowbuf.o: $(SRC_DIR)/sqr_rowbuf.f90 $(ODIR)/sqr.mod $(ODIR)/sqr_base.o | $(ODIR)
-	$(F) -c $(F_OPTS) -o $@ $<
-
-$(ODIR)/sqr_journal.o: $(SRC_DIR)/sqr_journal.f90 $(ODIR)/sqr.mod $(ODIR)/clib_wrap.mod $(ODIR)/sqr_base.o | $(ODIR)
-	$(F) -c $(F_OPTS) -o $@ $<
-
-$(ODIR)/sqr_pack.o: $(SRC_DIR)/sqr_pack.f90 $(ODIR)/sqr.mod $(ODIR)/clib_wrap.mod $(ODIR)/sqr_base.o | $(ODIR)
-	$(F) -c $(F_OPTS) -o $@ $<
-
-# --- SQL front-end layer (lexer/parser/executor; depends on sqr, not vice
-# versa). sql_base is the intermediate submodule holding shared helpers + the
-# lexer; sql_parse / sql_exec are its descendants and consume its submodule
-# .smod, so they compile after sql_base (enforced via the .o prerequisite, as
-# with sqr_base).
-$(ODIR)/sql.o $(ODIR)/sql.mod &: $(SRC_DIR)/sql.f90 $(ODIR)/sqr.mod | $(ODIR)
-	$(F) -c $(F_OPTS) -o $(ODIR)/sql.o $<
-	@touch $(ODIR)/sql.mod
-
-$(ODIR)/sql_base.o: $(SRC_DIR)/sql_base.f90 $(ODIR)/sql.mod $(ODIR)/sqr.mod $(ODIR)/sqr_consts.mod | $(ODIR)
-	$(F) -c $(F_OPTS) -o $@ $<
-
-$(ODIR)/sql_parse.o: $(SRC_DIR)/sql_parse.f90 $(ODIR)/sql.mod $(ODIR)/sql_base.o | $(ODIR)
-	$(F) -c $(F_OPTS) -o $@ $<
-
-$(ODIR)/sql_exec.o: $(SRC_DIR)/sql_exec.f90 $(ODIR)/sql.mod $(ODIR)/sqr.mod $(ODIR)/sql_base.o | $(ODIR)
-	$(F) -c $(F_OPTS) -o $@ $<
-
-# --- Wire-service layer (sqrd): framing over the socket shim, then the
-# server core (sessions/dispatch/encoding) on top of sqr + sql. Both are
-# ordinary module + submodule pairs.
-$(ODIR)/sqr_net.o $(ODIR)/sqr_net.mod &: $(SRC_DIR)/sqr_net.f90 $(ODIR)/clib_wrap.mod | $(ODIR)
-	$(F) -c $(F_OPTS) -o $(ODIR)/sqr_net.o $<
-	@touch $(ODIR)/sqr_net.mod
-
-$(ODIR)/sqr_net_sm.o: $(SRC_DIR)/sqr_net_sm.f90 $(ODIR)/sqr_net.mod $(ODIR)/sqr_consts.mod | $(ODIR)
-	$(F) -c $(F_OPTS) -o $@ $<
-
-$(ODIR)/sqr_serve.o $(ODIR)/sqr_serve.mod &: $(SRC_DIR)/sqr_serve.f90 $(ODIR)/sqr.mod $(ODIR)/sqr_net.mod | $(ODIR)
-	$(F) -c $(F_OPTS) -o $(ODIR)/sqr_serve.o $<
-	@touch $(ODIR)/sqr_serve.mod
-
-$(ODIR)/sqr_serve_sm.o: $(SRC_DIR)/sqr_serve_sm.f90 $(ODIR)/sqr_serve.mod $(ODIR)/sql.mod $(ODIR)/clib_wrap.mod $(ODIR)/sqr_consts.mod | $(ODIR)
-	$(F) -c $(F_OPTS) -o $@ $<
-
-# --- Vendored cmdgraph engine (github.com/sgeard/cmdgraph). dlist is the
-# doubly-linked list cmdgraph uses; cmdgraph `use`s dlist, so dlist builds first.
-$(ODIR)/dlist.o $(ODIR)/dlist.mod &: $(SRC_DIR)/dlist.f90 | $(ODIR)
-	$(F) -c $(F_OPTS) -o $(ODIR)/dlist.o $<
-	@touch $(ODIR)/dlist.mod
-
-$(ODIR)/dlist_sm.o: $(SRC_DIR)/dlist_sm.f90 $(ODIR)/dlist.mod | $(ODIR)
-	$(F) -c $(F_OPTS) -o $@ $<
-
-$(ODIR)/cmdgraph.o $(ODIR)/cmdgraph.mod &: $(SRC_DIR)/cmdgraph.f90 $(ODIR)/dlist.mod | $(ODIR)
-	$(F) -c $(F_OPTS) -o $(ODIR)/cmdgraph.o $<
-	@touch $(ODIR)/cmdgraph.mod
-
-$(ODIR)/cmdgraph_sm.o: $(SRC_DIR)/cmdgraph_sm.f90 $(ODIR)/cmdgraph.mod | $(ODIR)
-	$(F) -c $(F_OPTS) -o $@ $<
-
-# Progress feedback for long loops. Depends on nothing but iso_fortran_env,
-# and nothing in the library depends on it — it lives in $(BENCH_DIR) with its
+# fb_monitor (progress feedback for long loops) lives in $(BENCH_DIR) with its
 # only consumer, so it is neither archived into libsqr nor globbed by fpm.
-$(ODIR)/fb_monitor.o $(ODIR)/fb_monitor.mod &: $(BENCH_DIR)/fb_monitor.f90 | $(ODIR)
-	$(F) -c $(F_OPTS) -o $(ODIR)/fb_monitor.o $<
-	@touch $(ODIR)/fb_monitor.mod
 
 # Library archive. Rebuilt from scratch (not `ar r` onto a stale archive):
 # the FAULT=off and FAULT=on fault submodules have distinct object names, so
@@ -242,57 +169,44 @@ $(LIB): $(LIB_OBJ) | $(ODIR)
 	@rm -f $@
 	$(AR) rcs $@ $(LIB_OBJ)
 
-# Tests
-$(ODIR)/utest_%$(EXT): $(TEST_DIR)/utest_%.f90 $(LIB) | $(ODIR)
+# Tests: each links its own object and the library
+$(TEST_BIN): $(ODIR)/%$(EXT): $(ODIR)/%.o $(LIB)
 	$(F) $(F_OPTS) -o $@ $< $(LIB) $(LFLAGS)
 
-# Shell — the cmdgraph engine is vendored into libsqr.a, so just link the lib.
-$(ODIR)/sqrsh$(EXT): $(APP_DIR)/sqrsh.f90 $(LIB) | $(ODIR)
-	$(F) $(F_OPTS) -o $@ $< $(LIB) $(LFLAGS)
+# Shell — the cmdgraph engine is vendored into libsqr.a, so the library is all
+# it links, with the default (empty) optional-command set; sqrsh-regex below
+# links the regex one instead.
+SQRSH_OBJ := $(ODIR)/sqrsh.o $(ODIR)/sqrsh_extras.o
+$(ODIR)/sqrsh$(EXT): $(SQRSH_OBJ) $(ODIR)/sqrsh_extras_off_sm.o $(LIB)
+	$(F) $(F_OPTS) -o $@ $(SQRSH_OBJ) $(ODIR)/sqrsh_extras_off_sm.o $(LIB) $(LFLAGS)
 
-# SQL REPL — links the library only (the sql_* front-end is in libsqr); no
-# cmdgraph dependency.
-$(ODIR)/sqlsh$(EXT): $(APP_DIR)/sqlsh.f90 $(LIB) | $(ODIR)
-	$(F) $(F_OPTS) -o $@ $< $(LIB) $(LFLAGS)
-
-# Wire-protocol server — links the library only (sqr_net/sqr_serve are in
-# libsqr).
-$(ODIR)/sqrd$(EXT): $(APP_DIR)/sqrd.f90 $(LIB) | $(ODIR)
-	$(F) $(F_OPTS) -o $@ $< $(LIB) $(LFLAGS)
-
-# Backup/enquiry client for a running sqrd — INFO reports the served
-# directory, PACK writes a container without closing the database.
-$(ODIR)/sqrbak$(EXT): $(APP_DIR)/sqrbak.f90 $(LIB) | $(ODIR)
+# The others link the library only: sqlsh, the SQL REPL (the sql_* front-end
+# is in libsqr); sqrd, the wire-protocol server (sqr_net/sqr_serve are in
+# libsqr); sqrbak, the backup/enquiry client for a running sqrd (INFO reports
+# the served directory, PACK writes a container without closing the database).
+$(ODIR)/sqlsh$(EXT) $(ODIR)/sqrd$(EXT) $(ODIR)/sqrbak$(EXT): $(ODIR)/%$(EXT): $(ODIR)/%.o $(LIB)
 	$(F) $(F_OPTS) -o $@ $< $(LIB) $(LFLAGS)
 
 # --- Optional regex-search shell (opt-in) ---------------------------------
-# `make sqrsh-regex` rebuilds the shell with the `match <col> <regex>` command
-# (regex scan over DT_CHAR columns). The match action lives in
-# $(REGEX_DIR)/sqrsh_regex.f90 and is linked in here; app/sqrsh.f90 calls it as
-# an external procedure under #ifdef SQR_WITH_REGEX. It links the sibling
-# tcl_re project's self-contained static engine (libtclInterface.a — bundles
-# the regex engine, no libtcl). All of $(REGEX_DIR) is kept out of the default
-# build and out of the dirs fpm globs, so fpm and the Windows cross-build stay
-# dependency-free; tcl_re cannot be built by fpm in any case.
-# tcl_re shares the standardised build, so its ODIR matches $(ODIR).
-TCLRE_DIR  ?= ../tcl_re
-TCLRE_ODIR ?= $(TCLRE_DIR)/$(ODIR)
-TCLRE_LIB  ?= $(TCLRE_ODIR)/libtclInterface.a
-
-$(TCLRE_LIB):
-	$(MAKE) -C $(TCLRE_DIR) F=$(F)
-
-sqrsh-regex: $(OPTIONS_FNAME) $(LIB) $(TCLRE_LIB) | $(ODIR)
-	$(F) $(F_OPTS) -DSQR_WITH_REGEX -I$(TCLRE_ODIR) -o $(ODIR)/sqrsh$(EXT) \
-	    $(APP_DIR)/sqrsh.f90 $(REGEX_DIR)/sqrsh_regex.f90 \
+# `make sqrsh-regex` relinks the shell with the `match <col> <regex>` command
+# (regex scan over DT_CHAR columns). The command is the alternative
+# implementation of module sqrsh_extras, $(REGEX_DIR)/sqrsh_regex.f90, linked
+# in place of the default empty one: the selection is made here, at the link,
+# and the app/ sources are the same either way. It links the sibling
+# tcl_re project's static engine. All of $(REGEX_DIR) is kept out of the
+# default build and out of the dirs fpm globs, so fpm and the Windows
+# cross-build stay dependency-free; tcl_re cannot be built by fpm in any case.
+sqrsh-regex: $(OPTIONS_FNAME) $(SQRSH_OBJ) $(ODIR)/sqrsh_regex.o $(LIB) $(TCLRE_LIB)
+	$(F) $(F_OPTS) -o $(ODIR)/sqrsh$(EXT) $(SQRSH_OBJ) $(ODIR)/sqrsh_regex.o \
 	    $(LIB) $(TCLRE_LIB) $(LFLAGS)
 	@echo "Built $(ODIR)/sqrsh$(EXT) with regex search (match command)"
 
 # Functional test for the regex search (opt-in, links tcl_re).
 REGEX_TEST_BIN := $(ODIR)/utest_match$(EXT)
-test-regex: $(OPTIONS_FNAME) $(LIB) $(TCLRE_LIB) | $(ODIR)
-	$(F) $(F_OPTS) -I$(TCLRE_ODIR) -o $(REGEX_TEST_BIN) \
-	    $(REGEX_DIR)/utest_match.f90 $(LIB) $(TCLRE_LIB) $(LFLAGS)
+$(REGEX_TEST_BIN): $(ODIR)/utest_match.o $(LIB) $(TCLRE_LIB)
+	$(F) $(F_OPTS) -o $@ $< $(LIB) $(TCLRE_LIB) $(LFLAGS)
+
+test-regex: $(OPTIONS_FNAME) $(REGEX_TEST_BIN)
 	@echo "==> $(REGEX_TEST_BIN)" && $(REGEX_TEST_BIN)
 
 $(ODIR):
@@ -300,6 +214,10 @@ $(ODIR):
 
 utest: $(TEST_BIN)
 	@for t in $(TEST_BIN); do echo "==> $$t" && $$t || exit 1; done
+
+# The quick gate: the dependency scan with warnings as errors, the unit
+# tests and the two shell-level suites.
+check: depcheck utest sqlttest shelltest
 
 # sqllogictest-subset functional tests: a Tcl harness (no tcllib; uses the
 # system md5sum) replays sqlt/tests/*.test records through the sqlsh REPL and
@@ -356,7 +274,7 @@ install-calc:
 # Fault-injection sweep. Built only here (and by coverage), always with
 # FAULT=on, into a debug ODIR so the production release archive is never
 # overwritten with the on submodule.
-$(FAULT_TEST_BIN): $(FAULT_TEST_SRC) $(LIB) | $(ODIR)
+$(FAULT_TEST_BIN): $(ODIR)/utest_fault.o $(LIB)
 	$(F) $(F_OPTS) -o $@ $< $(LIB) $(LFLAGS)
 
 faulttest:
@@ -375,7 +293,7 @@ PROC_SHIM_OBJ  := $(ODIR)/procshim.o
 $(PROC_SHIM_OBJ): $(TEST_DIR)/procshim.c | $(ODIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-$(PROC_TEST_BIN): $(TEST_DIR)/proctest.f90 $(LIB) $(PROC_SHIM_OBJ) | $(ODIR)
+$(PROC_TEST_BIN): $(ODIR)/proctest.o $(LIB) $(PROC_SHIM_OBJ)
 	$(F) $(F_OPTS) -o $@ $< $(PROC_SHIM_OBJ) $(LIB) $(LFLAGS)
 
 proctest: $(PROC_TEST_BIN)
@@ -384,7 +302,7 @@ proctest: $(PROC_TEST_BIN)
 # Performance benchmark. Always the production (FAULT=off) library and
 # the default optimised build — never debug — so timings are
 # representative. Recursive make pins F through unchanged.
-$(BENCH_BIN): $(BENCH_SRC) $(ODIR)/fb_monitor.o $(LIB) | $(ODIR)
+$(BENCH_BIN): $(ODIR)/bench_sqr.o $(ODIR)/fb_monitor.o $(LIB)
 	$(F) $(F_OPTS) -o $@ $< $(ODIR)/fb_monitor.o $(LIB) $(LFLAGS)
 
 bench:
@@ -407,7 +325,7 @@ DESTRUCT_RUN  := $(ODIR)/destruct-run
 DESTRUCT_SEED ?= 20260806
 
 $(ODIR)/mkdb$(EXT) $(ODIR)/hammer$(EXT) $(ODIR)/unpack_probe$(EXT) $(ODIR)/apiabuse$(EXT): \
-  $(ODIR)/%$(EXT): $(DESTRUCT_DIR)/%.f90 $(LIB) | $(ODIR)
+  $(ODIR)/%$(EXT): $(ODIR)/%.o $(LIB)
 	$(F) $(F_OPTS) -o $@ $< $(LIB) $(LFLAGS)
 
 destruct:
@@ -463,7 +381,7 @@ docs-clean:
 	@rm -vfr $(DOCS_DIR)
 
 clean:
-	@rm -vf $(ODIR)/*.o $(ODIR)/*.mod $(ODIR)/*.smod $(LIB) $(TEST_BIN) $(FAULT_TEST_BIN) $(PROC_TEST_BIN) $(PROC_SHIM_OBJ) $(BENCH_BIN) $(DESTRUCT_BINS) $(APP_BIN) depends.mk $(OPTIONS_FNAME) *~ *.mod *.smod
+	@rm -vf $(ODIR)/*.o $(ODIR)/*.mod $(ODIR)/*.smod $(LIB) $(TEST_BIN) $(FAULT_TEST_BIN) $(PROC_TEST_BIN) $(PROC_SHIM_OBJ) $(BENCH_BIN) $(DESTRUCT_BINS) $(APP_BIN) $(REGEX_TEST_BIN) $(OPTIONS_FNAME) *~ *.mod *.smod
 
 veryclean: clean
 	@rm -vfr obj_* *.gcov
@@ -519,7 +437,8 @@ windows:
 	@for t in $(WIN_TESTS); do echo "    $(WIN_ODIR)/$$t.exe"; done
 
 help:
-	@echo "Targets : all, utest, sqlttest, shelltest, sqrdtest, calctest, faulttest, destruct, bench"
+	@echo "Targets : all, check (depcheck utest sqlttest shelltest), depcheck"
+	@echo "          utest, sqlttest, shelltest, sqrdtest, calctest, faulttest, destruct, bench"
 	@echo "          install, uninstall (PREFIX=$(PREFIX)), install-calc"
 	@echo "          clean, veryclean, distclean"
 	@echo "          coverage, coverage-gcov, coverage-clean, docs, docs-clean, windows"
