@@ -19,6 +19,11 @@ crash, even at the cost of an `fsync` per write.
 ## Features
 
 - **A database is a directory.** No server, no daemon — open a path.
+- **One file when you need one.** `db_pack` writes the whole database to a
+  single `.sqr` container and `db_unpack` restores it to a new directory —
+  for backup, transport, or an application that keeps its document as one
+  file and unpacks it on open. See
+  [Single-file container](#single-file-container-sqr) below.
 - **Typed columns:** `DT_INT` (32-bit), `DT_REAL` (64-bit), `DT_CHAR`
   (fixed-width, NUL-padded), `DT_TEXT` (length-prefixed blob, binary-safe).
 - **Per-row NULL bitmap** — a NULL column reads back as absent and is omitted
@@ -136,6 +141,7 @@ call db_commit(db, st)     ! durable here; or db_rollback(db, st)
 ## Public API surface
 
 - **Lifecycle:** `db_open`, `db_close`, `db_set_readonly`
+- **Single-file container:** `db_pack`, `db_unpack`, `db_pack_live`
 - **Tables:** `db_create_table`, `db_drop_table`, `db_compact`,
   `db_add_column`, `db_drop_column`, `db_reshape_table`, `db_list_tables`,
   `db_table_index`,
@@ -165,7 +171,8 @@ Every `db_*` procedure also has a type-bound equivalent on `db_t`
 
 ```
 root:    open <dir>   close   readonly   tables   desc <table>
-         create <table>   use <table>   drop <table>   quit
+         create <table>   use <table>   drop <table>
+         pack <dir> <file>   unpack <file> <dir>   quit
 creator: col <name> <type>   done   cancel   quit
 table:   insert ...   select   get <id>   delete <id>   compact
          addcolumn <name> <type>   dropcolumn <name>
@@ -191,7 +198,7 @@ sqlsh mydb                     # interactive (prompts/errors on stderr)
 ```
 
 Meta-commands: `.open <dir>`, `.close`, `.tables`, `.schema [table]`,
-`.help`, `.quit`. Everything else is SQL:
+`.pack <dir> <file>`, `.unpack <file> <dir>`, `.help`, `.quit`. Everything else is SQL:
 
 **Input encoding.** `sqlsh` and `sqrsh` read UTF-8 (plain ASCII included).
 Text is stored and compared as bytes, so UTF-8 values round-trip and sort in
@@ -319,7 +326,8 @@ releases its file units, reads the snapshot, and reopens them, all while
 holding its own advisory lock, so no client is disconnected and no other
 process can take the database meanwhile. It is refused while a transaction is
 open — a directory mid-gesture is not a state worth archiving. Restore with
-`sqlsh`'s `.unpack`, which is the same container format as `db_pack`.
+`sqlsh`'s `.unpack`, which is the same container format as `db_pack` (see
+[Single-file container](#single-file-container-sqr)).
 
 ```
 $ sqrbak info ~/db/current
@@ -366,6 +374,61 @@ A database is a directory containing:
 
 Each record is: 1 status byte (`ROW_ALIVE` / `ROW_TOMBSTONE`), then a
 `(ncols+7)/8`-byte NULL bitmap, then column data at fixed offsets.
+
+---
+
+## Single-file container (`.sqr`)
+
+The working form of a database is always the directory above: `db_open`
+opens a directory and nothing else. When one file is wanted — a backup, a
+copy to another machine, a document an application saves and reopens — the
+directory is packed into a `.sqr` container and unpacked again before use.
+
+| Routine                      | What it does                                         |
+|------------------------------|------------------------------------------------------|
+| `db_pack(dir, file)`         | pack a database directory that no writer has open into `file` |
+| `db_unpack(file, dir)`       | restore a container into a **new** directory `dir`   |
+| `db_pack_live(db, file)`     | pack the database an open handle is serving, without closing it (`db%pack_live`) |
+
+All three take the optional `stat` and `errmsg` arguments.
+
+- **Pack is a consistent snapshot.** `db_pack` opens the database read-only
+  under the shared lock and does not wait: a database open for writing
+  elsewhere is `SQR_LOCKED`, and one that needs journal recovery is
+  `SQR_READONLY` (open it read-write once, then pack). The lock file and the
+  journal are not archived. The container is written to a temporary file,
+  synced and renamed into place, so an existing `file` is replaced whole or
+  not at all.
+- **Unpack never overwrites.** An existing `dir` is `SQR_DUP`. The checksum
+  is verified before anything is written, every archived name is checked
+  against path traversal, and the files are extracted into a temporary
+  directory that is renamed into place, so a failure leaves no partial
+  database. A truncated or damaged file is `SQR_ERR`; a newer container
+  version or the other byte order is `SQR_VERSION`.
+- **`db_pack_live` is the hot backup.** It is what `sqrd` runs for a `PACK`
+  request and so what `sqrbak backup` uses: the handle's file units are
+  flushed and released, the snapshot is read, and the units are reopened, all
+  under the handle's own lock. It is refused (`SQR_INVALID`) while a
+  transaction is open.
+
+The format is a plain archive, not a compressed one: a header (magic `SQRP`,
+version, byte-order mark, file count, checksum), a table of contents, then
+each file's bytes. A container is therefore about the size of the directory
+it came from, and is read on a machine of the same byte order.
+
+From the shells:
+
+```
+sql> .pack   db/accounts accounts.sqr
+sql> .unpack accounts.sqr restored
+
+sqr> pack   db/accounts accounts.sqr
+sqr> unpack accounts.sqr restored
+```
+
+A program that wants a single-file document does the same around its own
+open and save: `db_unpack` into a scratch directory, `db_open` that, and
+`db_pack` (or `db_pack_live`) back to the document on save.
 
 ---
 
