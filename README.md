@@ -192,14 +192,53 @@ sqlsh mydb                     # interactive (prompts/errors on stderr)
 Meta-commands: `.open <dir>`, `.close`, `.tables`, `.schema [table]`,
 `.help`, `.quit`. Everything else is SQL:
 
-**Input encoding.** `sqlsh` reads UTF-8 (plain ASCII included). Text is
-stored and compared as bytes, so UTF-8 values round-trip and sort in
+**Input encoding.** `sqlsh` and `sqrsh` read UTF-8 (plain ASCII included).
+Text is stored and compared as bytes, so UTF-8 values round-trip and sort in
 code-point order; `CHAR(n)` counts bytes, not characters, and a non-ASCII
 table or column name must be double-quoted. A UTF-8 byte-order mark at the
-start of the input is ignored. UTF-16 is not supported: a script that
-starts with a UTF-16 byte-order mark — what `>` produces in Windows
-PowerShell 5.1 — is refused with a message and exit status 1. Re-save it as
-UTF-8 (`Out-File -Encoding utf8`, or use PowerShell 7).
+start of the input is ignored.
+
+Nothing else is supported, and input that can be recognised as something
+else is refused by name, with exit status 1:
+
+- by its leading signature (table below);
+- by NUL bytes in a line: a 16- or 32-bit encoding written without a
+  byte-order mark. Lines before the first such line have already been run.
+
+| First bytes   | Reported as                    | `sql` constant        | Read? |
+|---------------|--------------------------------|-----------------------|-------|
+| (none)        | ASCII / UTF-8                  | `SQL_ENC_PLAIN`       | yes   |
+| `EF BB BF`    | UTF-8 with a byte-order mark   | `SQL_ENC_UTF8`        | yes, mark dropped |
+| `FF FE 00 00` | UTF-32 / UCS-4, little-endian  | `SQL_ENC_UTF32_LE`    | no    |
+| `00 00 FE FF` | UTF-32 / UCS-4, big-endian     | `SQL_ENC_UTF32_BE`    | no    |
+| `FF FE`       | UTF-16 / UCS-2, little-endian  | `SQL_ENC_UTF16_LE`    | no    |
+| `FE FF`       | UTF-16 / UCS-2, big-endian     | `SQL_ENC_UTF16_BE`    | no    |
+| `2B 2F 76`    | UTF-7                          | `SQL_ENC_UTF7`        | no    |
+| `F7 64 4C`    | UTF-1                          | `SQL_ENC_UTF1`        | no    |
+| `DD 73 66 73` | UTF-EBCDIC                     | `SQL_ENC_UTF_EBCDIC`  | no    |
+| `0E FE FF`    | SCSU                           | `SQL_ENC_SCSU`        | no    |
+| `FB EE 28`    | BOCU-1                         | `SQL_ENC_BOCU1`       | no    |
+| `84 31 95 33` | GB18030                        | `SQL_ENC_GB18030`     | no    |
+| NUL in a line | a wide encoding with no mark   | `SQL_ENC_WIDE_NO_BOM` | no    |
+
+UCS-2 and UTF-16 (and UCS-4 and UTF-32) begin with the same bytes, so each
+pair is reported under one name. UTF-32 little-endian is tested before
+UTF-16 little-endian, whose mark it starts with. The UTF-7 signature is the
+printable text `+/v`: input whose first line begins with those three
+characters is refused. Plain EBCDIC has neither a signature nor NUL bytes
+and is not detected.
+
+The message is `unsupported encoding (<name>); expected ASCII or UTF-8`.
+The usual cause is Windows PowerShell 5.1, whose `>` writes UTF-16: re-save
+the script as UTF-8 (`Out-File -Encoding utf8`, or use PowerShell 7).
+
+Legacy 8-bit sets (Latin-1, CP1252, ...) have no signature and cannot be
+told from UTF-8; they are stored as the bytes they are, unvalidated.
+
+Both shells apply the same table: `sqlsh` through `sql_screen_line` in the
+library (public, with `sql_strip_bom`, `sql_encoding_name`,
+`sql_encoding_supported` and `sql_encoding_message`, for a program that
+reads its own SQL), `sqrsh` through cmdgraph 1.4.0, which reads its input.
 
 ```sql
 CREATE TABLE employee (id INTEGER, name CHAR(20), dept CHAR(12), salary REAL);

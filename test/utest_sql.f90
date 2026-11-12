@@ -46,6 +46,7 @@ program utest_sql
     call test_render()
     call test_functional_example()
     call test_strip_bom()
+    call test_encodings()
     call test_limits()
 
     call cleanup_dir()
@@ -133,11 +134,11 @@ contains
 
         s = ULE // 'S' // char(0)
         call sql_strip_bom(s, enc)
-        call check(enc == SQL_ENC_UTF16 .and. len(s) == 4, 'bom: UTF-16LE reported, text left alone')
+        call check(enc == SQL_ENC_UTF16_LE .and. len(s) == 4, 'bom: UTF-16LE reported, text left alone')
 
         s = UBE // char(0) // 'S'
         call sql_strip_bom(s, enc)
-        call check(enc == SQL_ENC_UTF16, 'bom: UTF-16BE reported')
+        call check(enc == SQL_ENC_UTF16_BE, 'bom: UTF-16BE reported')
 
         ! Shorter than any mark, and a mark's first byte alone, are plain.
         s = ''
@@ -158,6 +159,63 @@ contains
         deallocate(s)
         call sql_strip_bom(s, enc)
         call check(enc == SQL_ENC_PLAIN .and. .not. allocated(s), 'bom: unallocated text is plain')
+    end subroutine
+
+    ! Every signature sqr recognises, the NUL rule, and the names / message.
+    subroutine test_encodings()
+        type :: case_t
+            character(len=4) :: bytes
+            integer          :: nbytes
+            integer          :: enc
+        end type
+        character(len=1), parameter :: NUL = char(0)
+        type(case_t), parameter :: CASES(*) = [ &
+            case_t(char(int(z'FF')) // char(int(z'FE')) // NUL // NUL,                             4, SQL_ENC_UTF32_LE),   &
+            case_t(NUL // NUL // char(int(z'FE')) // char(int(z'FF')),                             4, SQL_ENC_UTF32_BE),   &
+            case_t(char(int(z'2B')) // char(int(z'2F')) // char(int(z'76')) // ' ',                3, SQL_ENC_UTF7),       &
+            case_t(char(int(z'F7')) // char(int(z'64')) // char(int(z'4C')) // ' ',                3, SQL_ENC_UTF1),       &
+            case_t(char(int(z'DD')) // char(int(z'73')) // char(int(z'66')) // char(int(z'73')),   4, SQL_ENC_UTF_EBCDIC), &
+            case_t(char(int(z'0E')) // char(int(z'FE')) // char(int(z'FF')) // ' ',                3, SQL_ENC_SCSU),       &
+            case_t(char(int(z'FB')) // char(int(z'EE')) // char(int(z'28')) // ' ',                3, SQL_ENC_BOCU1),      &
+            case_t(char(int(z'84')) // char(int(z'31')) // char(int(z'95')) // char(int(z'33')),   4, SQL_ENC_GB18030)     ]
+        character(len=:), allocatable :: s
+        integer :: enc, i
+
+        sig: do i = 1, size(CASES)
+            s = CASES(i)%bytes(1:CASES(i)%nbytes) // 'SELECT'
+            call sql_strip_bom(s, enc)
+            call check(enc == CASES(i)%enc .and. .not. sql_encoding_supported(enc) &
+                       .and. len(s) == CASES(i)%nbytes + 6, &
+                       'enc: ' // sql_encoding_name(CASES(i)%enc) // ' recognised, refused, text left alone')
+        end do sig
+
+        ! NUL bytes with no signature: a wide encoding without a mark.
+        s = 'S' // NUL // 'E' // NUL
+        call sql_strip_bom(s, enc)
+        call check(enc == SQL_ENC_WIDE_NO_BOM, 'enc: NUL bytes on the first line')
+        s = char(int(z'EF')) // char(int(z'BB')) // char(int(z'BF')) // 'S' // NUL
+        call sql_strip_bom(s, enc)
+        call check(enc == SQL_ENC_WIDE_NO_BOM, 'enc: NUL bytes behind a UTF-8 mark')
+
+        ! Later lines: only the NUL rule applies; a signature there is data.
+        s = char(int(z'FF')) // char(int(z'FE')) // 'x'
+        call sql_screen_line(s, .false., enc)
+        call check(enc == SQL_ENC_PLAIN .and. len(s) == 3, 'enc: signature on a later line is data')
+        s = 'S' // NUL
+        call sql_screen_line(s, .false., enc)
+        call check(enc == SQL_ENC_WIDE_NO_BOM, 'enc: NUL bytes on a later line')
+        s = char(int(z'EF')) // char(int(z'BB')) // char(int(z'BF')) // 'SELECT'
+        call sql_screen_line(s, .true., enc)
+        call check(enc == SQL_ENC_UTF8 .and. s == 'SELECT', 'enc: first line goes through sql_strip_bom')
+        deallocate(s)
+        call sql_screen_line(s, .false., enc)
+        call check(enc == SQL_ENC_PLAIN, 'enc: unallocated later line is plain')
+
+        call check(all(sql_encoding_supported([SQL_ENC_PLAIN, SQL_ENC_UTF8])), 'enc: plain and UTF-8 are supported')
+        call check(sql_encoding_name(-1) == 'unknown', 'enc: unknown code has a name')
+        call check(sql_encoding_message(SQL_ENC_UTF16_BE) == &
+                   'unsupported encoding (UTF-16 / UCS-2, big-endian); expected ASCII or UTF-8', &
+                   'enc: message wording')
     end subroutine
 
     subroutine cleanup_dir()

@@ -1160,14 +1160,17 @@ end module sqrsh_actions
 
 
 program sqrsh
+    use, intrinsic :: iso_fortran_env, only: error_unit
     use cmdgraph
     use sqr
     use sqrsh_state
     use sqrsh_actions
+    use :: clib_wrap, only: c_exit
     implicit none
 
     type(engine_t) :: ui
     character(len=SQR_MAX_DIR) :: arg
+    integer :: run_stat
 
 #ifdef SQR_WITH_REGEX
     ! The regex `match` command is supplied as an external procedure by the
@@ -1256,9 +1259,16 @@ program sqrsh
     end if
 
     write(*,'(a)') 'sqr shell — type `help` for commands'
-    call ui%run()
+    call ui%run(stat=run_stat)
 
     if (db%opened) call db_close(db)
+
+    ! Input in an encoding cmdgraph does not read (it has said which, on
+    ! stderr): end with status 1 so a script runner can tell.
+    if (run_stat == RUN_BAD_ENCODING) then
+        flush(error_unit)
+        call c_exit(1)
+    end if
 
 contains
 

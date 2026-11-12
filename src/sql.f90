@@ -187,13 +187,34 @@ module sql
     integer, parameter, public :: SQL_MAX_COLS       = 256  !! Columns in a `CREATE TABLE`, a projection or an `INSERT` column list
     integer, parameter, public :: SQL_MAX_INDEX_COLS = 64   !! Columns in a `CREATE` / `DROP INDEX` column list
 
-    ! --- Input-text encodings reported by `sql_strip_bom` ---
-    integer, parameter, public :: SQL_ENC_PLAIN = 0  !! No byte-order mark: taken as UTF-8 (ASCII included)
-    integer, parameter, public :: SQL_ENC_UTF8  = 1  !! UTF-8 byte-order mark found and removed
-    integer, parameter, public :: SQL_ENC_UTF16 = 2  !! UTF-16 byte-order mark found: the text is not usable
+    ! --- Input-text encodings reported by `sql_strip_bom` / `sql_screen_line` ---
+    ! sqr text is UTF-8 handled as bytes.  Legacy 8-bit sets cannot be told
+    ! apart from it and pass through as opaque bytes (`SQL_ENC_PLAIN`).  Every
+    ! value except the first two is refused - see `sql_encoding_supported`.
+    ! The table, the names and the wording match cmdgraph's, so `sqlsh` and
+    ! `sqrsh` give the same answer for the same input.
+    integer, parameter, public :: SQL_ENC_PLAIN       =  0  !! No signature: ASCII, UTF-8, or an 8-bit set (not validated)
+    integer, parameter, public :: SQL_ENC_UTF8        =  1  !! UTF-8 byte-order mark found and removed
+    integer, parameter, public :: SQL_ENC_UTF16_LE    =  2  !! UTF-16 / UCS-2, little-endian
+    integer, parameter, public :: SQL_ENC_UTF16_BE    =  3  !! UTF-16 / UCS-2, big-endian
+    integer, parameter, public :: SQL_ENC_UTF32_LE    =  4  !! UTF-32 / UCS-4, little-endian
+    integer, parameter, public :: SQL_ENC_UTF32_BE    =  5  !! UTF-32 / UCS-4, big-endian
+    integer, parameter, public :: SQL_ENC_UTF7        =  6  !! UTF-7
+    integer, parameter, public :: SQL_ENC_UTF1        =  7  !! UTF-1
+    integer, parameter, public :: SQL_ENC_UTF_EBCDIC  =  8  !! UTF-EBCDIC
+    integer, parameter, public :: SQL_ENC_SCSU        =  9  !! SCSU
+    integer, parameter, public :: SQL_ENC_BOCU1       = 10  !! BOCU-1
+    integer, parameter, public :: SQL_ENC_GB18030     = 11  !! GB18030
+    !! No signature, but NUL bytes: a 16- or 32-bit encoding written without
+    !! a byte-order mark.
+    integer, parameter, public :: SQL_ENC_WIDE_NO_BOM = 12
 
     ! --- Public entry points ---
     public :: sql_strip_bom !! first line of input -> encoding, UTF-8 BOM removed
+    public :: sql_screen_line        !! any line of input -> encoding
+    public :: sql_encoding_name      !! encoding -> display name
+    public :: sql_encoding_supported !! encoding -> can sqr read it?
+    public :: sql_encoding_message   !! refused encoding -> the message to show
     public :: sql_lex      !! source line  -> token stream
     public :: sql_parse    !! source line  -> one statement AST
     public :: sql_exec     !! statement AST -> result (drives the engine)
@@ -201,25 +222,60 @@ module sql
     public :: sql_render   !! result        -> printed to a unit (the REPL renderer)
 
     interface
-        !! Classify the start of an input stream by its byte-order mark and
+        !! Classify the start of an input stream by its leading bytes and
         !! make it lexable.  sqr text is UTF-8 handled as bytes, so:
         !!
         !! - a UTF-8 mark (`EF BB BF`, written by e.g. Windows PowerShell 5.1
         !!   `Out-File -Encoding utf8`) is removed from `text` and `enc` is
         !!   `SQL_ENC_UTF8`;
-        !! - a UTF-16 mark (`FF FE` or `FE FF`, the default of Windows
-        !!   PowerShell 5.1 `>` redirection) leaves `text` alone and sets `enc`
-        !!   to `SQL_ENC_UTF16` — the caller should refuse the input, since
-        !!   neither the lexer nor `DT_CHAR` storage can hold UTF-16 (UTF-32LE
-        !!   begins with the same two bytes and is reported the same way);
+        !! - the signature of an encoding sqr cannot read leaves `text` alone
+        !!   and names it in `enc`: UTF-16 / UCS-2 (`FF FE` or `FE FF`, the
+        !!   default of Windows PowerShell 5.1 `>` redirection), UTF-32 /
+        !!   UCS-4, UTF-7, UTF-1, UTF-EBCDIC, SCSU, BOCU-1, GB18030;
+        !! - text with no signature but with NUL bytes is
+        !!   `SQL_ENC_WIDE_NO_BOM`: a 16- or 32-bit encoding without a mark;
         !! - anything else is `SQL_ENC_PLAIN`, `text` untouched.
         !!
-        !! Call it on the **first** line of a stream only.  An unallocated
+        !! The caller should refuse input for which `sql_encoding_supported`
+        !! is false: neither the lexer nor `DT_CHAR` storage can hold it.
+        !!
+        !! Call it on the **first** line of a stream only (`sql_screen_line`
+        !! does that, and handles the later lines too).  An unallocated
         !! `text` is `SQL_ENC_PLAIN`.
         pure module subroutine sql_strip_bom(text, enc)
             character(len=:), allocatable, intent(inout) :: text  !! First input line
-            integer,                       intent(out)   :: enc   !! `SQL_ENC_PLAIN` / `SQL_ENC_UTF8` / `SQL_ENC_UTF16`
+            integer,                       intent(out)   :: enc   !! One of the `SQL_ENC_*` values
         end subroutine
+
+        !! Classify one line of an input stream.  The first line is tested
+        !! for a signature (and loses a UTF-8 mark) by `sql_strip_bom`; every
+        !! later line is tested only for NUL bytes, which catch a wide
+        !! encoding that has no mark.
+        pure module subroutine sql_screen_line(text, first, enc)
+            character(len=:), allocatable, intent(inout) :: text   !! The line
+            logical,                       intent(in)    :: first  !! Is it the first line of the stream?
+            integer,                       intent(out)   :: enc    !! One of the `SQL_ENC_*` values
+        end subroutine
+
+        !! Display name of an `SQL_ENC_*` value.
+        pure module function sql_encoding_name(enc) result(name)
+            integer, intent(in)           :: enc
+            character(len=:), allocatable :: name
+        end function
+
+        !! `.true.` for the encodings sqr reads: `SQL_ENC_PLAIN` and
+        !! `SQL_ENC_UTF8`.
+        pure elemental module function sql_encoding_supported(enc) result(ok)
+            integer, intent(in) :: enc
+            logical             :: ok
+        end function
+
+        !! The message for a refused encoding:
+        !! `unsupported encoding (<name>); expected ASCII or UTF-8`.
+        pure module function sql_encoding_message(enc) result(msg)
+            integer, intent(in)           :: enc
+            character(len=:), allocatable :: msg
+        end function
 
         !! Tokenise one source line.  Always succeeds for well-formed tokens;
         !! reports `SQR_INVALID` with `errmsg` (carrying the offending column)

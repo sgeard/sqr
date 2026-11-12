@@ -309,10 +309,11 @@ SQLT_TESTS  := $(wildcard $(SQLT_DIR)/tests/*.test)
 sqlttest: $(ODIR)/sqlsh$(EXT)
 	tclsh $(SQLT_DIR)/run_sqlt.tcl $(ODIR)/sqlsh$(EXT) $(SQLT_TESTS)
 
-# Shell-level behaviour of sqlsh that is neither SQL nor reachable from the
-# Fortran unit tests: meta-commands and the encoding of the input stream.
-shelltest: $(ODIR)/sqlsh$(EXT)
-	tclsh $(SQLT_DIR)/run_shell.tcl $(ODIR)/sqlsh$(EXT)
+# Shell-level behaviour of sqlsh and sqrsh that is neither SQL nor reachable
+# from the Fortran unit tests: meta-commands and the encoding of the input
+# stream (the same cases through both shells).
+shelltest: $(ODIR)/sqlsh$(EXT) $(ODIR)/sqrsh$(EXT)
+	tclsh $(SQLT_DIR)/run_shell.tcl $(ODIR)/sqlsh$(EXT) $(ODIR)/sqrsh$(EXT)
 
 # Functional test of the sqrd wire service: a Tcl client (an independent
 # protocol implementation — see test/run_sqrd.tcl) drives a real spawned

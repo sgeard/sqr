@@ -34,10 +34,8 @@ program sqlsh
         call prompt()
         call read_line(line)
         if (.not. allocated(line)) exit repl       ! EOF
-        if (first_line) then
-            first_line = .false.
-            call check_encoding(line)
-        end if
+        call check_encoding(line, first_line)
+        first_line = .false.
         if (len_trim(line) == 0) cycle repl
         if (line(1:1) == '.') then
             if (meta(line)) exit repl               ! .quit / .exit
@@ -77,17 +75,21 @@ contains
 
     ! ---- input ----
 
-    !! Deal with a byte-order mark on the first line of input: a UTF-8 mark is
-    !! dropped; UTF-16 cannot be read at all, so say so and end with status 1
-    !! rather than report a syntax error on every line.
-    subroutine check_encoding(line)
+    !! Deal with the encoding of a line of input: a UTF-8 byte-order mark on
+    !! the first line is dropped; an encoding sqr cannot read (UTF-16, UTF-32,
+    !! ... - see `sql_strip_bom`) is named and ends sqlsh with status 1,
+    !! rather than a syntax error being reported on every line.
+    subroutine check_encoding(line, first)
         character(len=:), allocatable, intent(inout) :: line
+        logical,                       intent(in)    :: first
         integer :: enc
-        call sql_strip_bom(line, enc)
-        if (enc /= SQL_ENC_UTF16) return
-        write(error_unit,'(a)') 'sqlsh: input is UTF-16; sqlsh reads UTF-8.'
-        write(error_unit,'(a)') '       Re-save the script as UTF-8 (Windows PowerShell 5.1: ' // &
-                                'Out-File -Encoding utf8 instead of ">").'
+        call sql_screen_line(line, first, enc)
+        if (sql_encoding_supported(enc)) return
+        write(error_unit,'(2a)') 'sqlsh: ', sql_encoding_message(enc)
+        if (enc == SQL_ENC_UTF16_LE) then
+            write(error_unit,'(a)') '       Re-save the script as UTF-8 (Windows PowerShell 5.1: ' // &
+                                    'Out-File -Encoding utf8 instead of ">").'
+        end if
         if (db%opened) call db_close(db)
         flush(error_unit)
         call c_exit(1)
