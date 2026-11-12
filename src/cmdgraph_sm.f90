@@ -1,6 +1,6 @@
 !! SPDX-License-Identifier: MIT
 !! Copyright (c) 2026 Simon Geard
-!! Vendored into sqr from https://github.com/sgeard/cmdgraph (fortran/src) at svn r1883, 2026-07-09 (after its v1.3.1 release); kept in sync by hand.
+!! Vendored into sqr from https://github.com/sgeard/cmdgraph (fortran/src) at svn r2355, 2026-11-12 (v1.4.0); kept in sync by hand.
 !!
 submodule (cmdgraph) cmdgraph_sm
     implicit none
@@ -11,6 +11,33 @@ submodule (cmdgraph) cmdgraph_sm
     type :: cmd_array_t
         type(command_t), allocatable :: items(:)
     end type
+
+    ! --- Input-encoding signatures ---
+    integer, parameter :: MAX_SIG_BYTES = 4
+
+    ! One byte-order mark (or other leading signature) and what it identifies.
+    type :: signature_t
+        character(len=MAX_SIG_BYTES) :: bytes   ! blank-padded; only 1:nbytes count
+        integer                      :: nbytes
+        integer                      :: enc
+    end type
+
+    character(len=1), parameter :: NUL = achar(0)
+
+    ! Tested in this order, so a signature that begins with a shorter one
+    ! (UTF-32 LE starts with the UTF-16 LE mark) must come first.
+    type(signature_t), parameter :: SIGNATURES(*) = [ &
+        signature_t(char(int(z'FF')) // char(int(z'FE')) // NUL // NUL,                             4, ENC_UTF32_LE),   &
+        signature_t(NUL // NUL // char(int(z'FE')) // char(int(z'FF')),                             4, ENC_UTF32_BE),   &
+        signature_t(char(int(z'DD')) // char(int(z'73')) // char(int(z'66')) // char(int(z'73')),   4, ENC_UTF_EBCDIC), &
+        signature_t(char(int(z'84')) // char(int(z'31')) // char(int(z'95')) // char(int(z'33')),   4, ENC_GB18030),    &
+        signature_t(char(int(z'EF')) // char(int(z'BB')) // char(int(z'BF')) // ' ',                3, ENC_UTF8_BOM),   &
+        signature_t(char(int(z'2B')) // char(int(z'2F')) // char(int(z'76')) // ' ',                3, ENC_UTF7),       &
+        signature_t(char(int(z'F7')) // char(int(z'64')) // char(int(z'4C')) // ' ',                3, ENC_UTF1),       &
+        signature_t(char(int(z'0E')) // char(int(z'FE')) // char(int(z'FF')) // ' ',                3, ENC_SCSU),       &
+        signature_t(char(int(z'FB')) // char(int(z'EE')) // char(int(z'28')) // ' ',                3, ENC_BOCU1),      &
+        signature_t(char(int(z'FF')) // char(int(z'FE')) // '  ',                                   2, ENC_UTF16_LE),   &
+        signature_t(char(int(z'FE')) // char(int(z'FF')) // '  ',                                   2, ENC_UTF16_BE)    ]
 
 contains
 
@@ -404,29 +431,44 @@ contains
 
     ! ===== Execution =====
 
-    module subroutine run_engine(this)
+    module subroutine run_engine(this, stat)
         class(engine_t), intent(inout)         :: this
+        integer, intent(out), optional         :: stat
         character(len=4096)                    :: buffer
-        integer                                :: iostat, rc
-        character(len=:), allocatable          :: prompt
+        integer                                :: iostat, rc, enc
+        logical                                :: first
+        character(len=:), allocatable          :: prompt, src
 
+        if (present(stat)) stat = RUN_OK
+
+        first = .true.
         do while (this%is_running())
             prompt = this%states(this%stack(this%stack_top)%state_idx)%prompt
             call emit_prompt(this, prompt)
             read(this%input_unit, '(a)', iostat=iostat) buffer
             if (iostat /= 0) exit
-            rc = this%dispatch(trim(buffer))
+            src = trim(buffer)
+            call screen_line(src, first, enc)
+            first = .false.
+            if (.not. encoding_supported(enc)) then
+                call emit_error(this, unsupported_message(enc))
+                if (present(stat)) stat = RUN_BAD_ENCODING
+                return
+            end if
+            rc = this%dispatch(src)
         end do
     end subroutine run_engine
 
     ! Drive the engine from a script file. Returns ok=.true. iff the file
     ! opened and every dispatched line succeeded (or the script quit cleanly).
     ! On failure ok=.false. and the optional out args report which line and
-    ! why: stat = -1 for a file-open failure, otherwise the failing line's
-    ! dispatch return code (RC_UNKNOWN/RC_AMBIGUOUS/RC_ERROR); line = the
-    ! 1-based file line number (0 for a file-open failure); errmsg = the
-    ! diagnostic text. Stops at the first failing line (the engine is left
-    ! in whatever state that line produced).
+    ! why: stat = RUN_OPEN_FAILED for a file-open failure, RUN_BAD_ENCODING
+    ! for a line in an encoding the engine does not read (that line is not
+    ! dispatched), otherwise the failing line's dispatch return code
+    ! (RC_UNKNOWN/RC_AMBIGUOUS/RC_ERROR); line = the 1-based file line number
+    ! (0 for a file-open failure); errmsg = the diagnostic text. Stops at the
+    ! first failing line (the engine is left in whatever state that line
+    ! produced).
     module function run_file_engine(this, path, echo, stat, errmsg, line) result(ok)
         class(engine_t), intent(inout)                       :: this
         character(len=*), intent(in)                         :: path
@@ -435,12 +477,12 @@ contains
         character(len=:), allocatable, intent(out), optional :: errmsg
         integer, intent(out), optional                       :: line
         logical                                              :: ok
-        integer                                :: unit, iostat, rc, lineno
+        integer                                :: unit, iostat, rc, lineno, enc
         logical                                :: do_echo
         character(len=4096)                    :: buffer
         character(len=:), allocatable          :: src, trimmed, prompt
 
-        if (present(stat))   stat = 0
+        if (present(stat))   stat = RUN_OK
         if (present(errmsg)) errmsg = ""
         if (present(line))   line = 0
 
@@ -450,7 +492,7 @@ contains
         open(newunit=unit, file=path, status='old', action='read', iostat=iostat)
         if (iostat /= 0) then
             call set_error(this, "could not open script file: " // path)
-            if (present(stat))   stat = -1
+            if (present(stat))   stat = RUN_OPEN_FAILED
             if (present(errmsg)) errmsg = this%last_error
             ok = .false.
             return
@@ -462,6 +504,18 @@ contains
             if (iostat /= 0) exit
             lineno  = lineno + 1
             src     = trim(buffer)
+            call screen_line(src, lineno == 1, enc)
+            if (.not. encoding_supported(enc)) then
+                ! Populated silently, like the open failure: the error
+                ! channel is for events raised by a dispatched line.
+                call set_error(this, unsupported_message(enc) // ": " // path)
+                if (present(stat))   stat = RUN_BAD_ENCODING
+                if (present(line))   line = lineno
+                if (present(errmsg)) errmsg = this%last_error
+                close(unit)
+                ok = .false.
+                return
+            end if
             trimmed = adjustl(src)
             if (len_trim(trimmed) == 0)   cycle
             if (trimmed(1:1) == '#')      cycle
@@ -1226,6 +1280,86 @@ contains
         end associate
         call emit_info(this, msg)
     end subroutine report_ambiguous
+
+    ! ===== Input encoding =====
+
+    pure module subroutine strip_bom(text, enc)
+        character(len=:), allocatable, intent(inout) :: text
+        integer,                       intent(out)   :: enc
+        integer                                      :: i, n
+
+        enc = ENC_PLAIN
+        if (.not. allocated(text)) return
+
+        signature: do i = 1, size(SIGNATURES)
+            n = SIGNATURES(i)%nbytes
+            if (len(text) < n) cycle signature
+            if (text(1:n) == SIGNATURES(i)%bytes(1:n)) then
+                enc = SIGNATURES(i)%enc
+                if (enc == ENC_UTF8_BOM) text = text(n + 1:)
+                exit signature
+            end if
+        end do signature
+
+        ! A NUL is never part of a command, so in text with no signature (or
+        ! behind a UTF-8 mark) it means a wide encoding with no mark.
+        if (encoding_supported(enc)) then
+            if (index(text, NUL) > 0) enc = ENC_WIDE_NO_BOM
+        end if
+    end subroutine strip_bom
+
+    pure module function encoding_name(enc) result(name)
+        integer, intent(in)           :: enc
+        character(len=:), allocatable :: name
+
+        select case (enc)
+        case (ENC_PLAIN);       name = "ASCII / UTF-8"
+        case (ENC_UTF8_BOM);    name = "UTF-8 with a byte-order mark"
+        case (ENC_UTF16_LE);    name = "UTF-16 / UCS-2, little-endian"
+        case (ENC_UTF16_BE);    name = "UTF-16 / UCS-2, big-endian"
+        case (ENC_UTF32_LE);    name = "UTF-32 / UCS-4, little-endian"
+        case (ENC_UTF32_BE);    name = "UTF-32 / UCS-4, big-endian"
+        case (ENC_UTF7);        name = "UTF-7"
+        case (ENC_UTF1);        name = "UTF-1"
+        case (ENC_UTF_EBCDIC);  name = "UTF-EBCDIC"
+        case (ENC_SCSU);        name = "SCSU"
+        case (ENC_BOCU1);       name = "BOCU-1"
+        case (ENC_GB18030);     name = "GB18030"
+        case (ENC_WIDE_NO_BOM); name = "NUL bytes; probably UTF-16 / UCS-2 or UTF-32 / UCS-4 " // &
+                                       "without a byte-order mark"
+        case default;           name = "unknown"
+        end select
+    end function encoding_name
+
+    pure elemental module function encoding_supported(enc) result(ok)
+        integer, intent(in) :: enc
+        logical             :: ok
+
+        ok = (enc == ENC_PLAIN) .or. (enc == ENC_UTF8_BOM)
+    end function encoding_supported
+
+    ! Classify one line read by run / run_file.  The first line of a stream
+    ! is tested for a signature (and loses a UTF-8 mark); every line is
+    ! tested for NUL bytes, which catch a wide encoding that has no mark.
+    pure subroutine screen_line(text, first, enc)
+        character(len=:), allocatable, intent(inout) :: text
+        logical,                       intent(in)    :: first
+        integer,                       intent(out)   :: enc
+
+        if (first) then
+            call strip_bom(text, enc)
+        else
+            enc = merge(ENC_WIDE_NO_BOM, ENC_PLAIN, index(text, NUL) > 0)
+        end if
+    end subroutine screen_line
+
+    ! The one wording used for a refused encoding (parity contract).
+    pure function unsupported_message(enc) result(msg)
+        integer, intent(in)           :: enc
+        character(len=:), allocatable :: msg
+
+        msg = "unsupported encoding (" // encoding_name(enc) // "); expected ASCII or UTF-8"
+    end function unsupported_message
 
     subroutine emit_prompt(this, msg)
         class(engine_t), intent(inout)           :: this

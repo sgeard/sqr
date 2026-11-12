@@ -1,6 +1,6 @@
 !! SPDX-License-Identifier: MIT
 !! Copyright (c) 2026 Simon Geard
-!! Vendored into sqr from https://github.com/sgeard/cmdgraph (fortran/src) at svn r1883, 2026-07-09 (after its v1.3.1 release); kept in sync by hand.
+!! Vendored into sqr from https://github.com/sgeard/cmdgraph (fortran/src) at svn r2355, 2026-11-12 (v1.4.0); kept in sync by hand.
 !!
 !! State-graph driven command interpreter — Fortran implementation.
 !!
@@ -33,6 +33,11 @@ module cmdgraph
     public :: RC_OK, RC_UNKNOWN, RC_AMBIGUOUS, RC_TRANSITIONED, RC_EXITED, RC_ERROR
     public :: ARG_INT, ARG_REAL, ARG_CHAR, ARG_REST
     public :: QUIET_UNIT
+    public :: RUN_OK, RUN_OPEN_FAILED, RUN_BAD_ENCODING
+    public :: ENC_PLAIN, ENC_UTF8_BOM, ENC_UTF16_LE, ENC_UTF16_BE, ENC_UTF32_LE, ENC_UTF32_BE
+    public :: ENC_UTF7, ENC_UTF1, ENC_UTF_EBCDIC, ENC_SCSU, ENC_BOCU1, ENC_GB18030
+    public :: ENC_WIDE_NO_BOM
+    public :: strip_bom, encoding_name, encoding_supported
     public :: version_t, CMDGRAPH_VERSION
 
     !! Library version.  `major` and `minor` are synchronised across all
@@ -46,7 +51,7 @@ module cmdgraph
     end type version_t
 
     !! Compile-time library version constant.
-    type(version_t), parameter :: CMDGRAPH_VERSION = version_t(1, 3, 1)
+    type(version_t), parameter :: CMDGRAPH_VERSION = version_t(1, 4, 0)
 
     interface
         module function version_t_string(this) result(s)
@@ -90,6 +95,32 @@ module cmdgraph
     integer, parameter :: RC_TRANSITIONED = 3  !! State changed: Goto pushed, DoGoto succeeded, or Pop returned
     integer, parameter :: RC_EXITED       = 4  !! Engine stopped: Quit, stack exhausted, or already dead
     integer, parameter :: RC_ERROR        = 5  !! Action returned an error, or arg validation failed
+
+    ! `stat` values of `run` / `run_file` that are not a dispatch return code.
+    ! Negative, so they can never collide with an `RC_*` value.
+    integer, parameter :: RUN_OK           =  0  !! Ran to completion (same value as `RC_OK`)
+    integer, parameter :: RUN_OPEN_FAILED  = -1  !! `run_file`: the script file could not be opened
+    integer, parameter :: RUN_BAD_ENCODING = -2  !! The input is in an encoding the engine does not read
+
+    ! Input encodings, as classified from the bytes of a line.  The engine
+    ! reads ASCII and UTF-8; legacy 8-bit sets cannot be told apart from
+    ! those and pass through as opaque bytes (`ENC_PLAIN`).  Every other
+    ! value except `ENC_UTF8_BOM` is refused - see `encoding_supported`.
+    integer, parameter :: ENC_PLAIN       =  0  !! No signature: ASCII, UTF-8, or an 8-bit set (not validated)
+    integer, parameter :: ENC_UTF8_BOM    =  1  !! UTF-8 with a byte-order mark (the mark is dropped)
+    integer, parameter :: ENC_UTF16_LE    =  2  !! UTF-16 / UCS-2, little-endian
+    integer, parameter :: ENC_UTF16_BE    =  3  !! UTF-16 / UCS-2, big-endian
+    integer, parameter :: ENC_UTF32_LE    =  4  !! UTF-32 / UCS-4, little-endian
+    integer, parameter :: ENC_UTF32_BE    =  5  !! UTF-32 / UCS-4, big-endian
+    integer, parameter :: ENC_UTF7        =  6  !! UTF-7
+    integer, parameter :: ENC_UTF1        =  7  !! UTF-1
+    integer, parameter :: ENC_UTF_EBCDIC  =  8  !! UTF-EBCDIC
+    integer, parameter :: ENC_SCSU        =  9  !! SCSU
+    integer, parameter :: ENC_BOCU1       = 10  !! BOCU-1
+    integer, parameter :: ENC_GB18030     = 11  !! GB18030
+    !! No signature, but NUL bytes: a 16- or 32-bit encoding written without
+    !! a byte-order mark.
+    integer, parameter :: ENC_WIDE_NO_BOM = 12
 
     !! Return value from an action proc.  Use `action_ok` / `action_error`
     !! rather than direct initialisation.
@@ -335,8 +366,11 @@ module cmdgraph
         end subroutine finalize_engine
 
         !! Run an interactive loop reading from the configured input stream.
-        module subroutine run_engine(this)
+        !! The loop ends at end of input, on quit, or - having written the
+        !! reason to the error channel - at a line in an unsupported encoding.
+        module subroutine run_engine(this, stat)
             class(engine_t), intent(inout)         :: this
+            integer, intent(out), optional         :: stat  !! `RUN_OK`, or `RUN_BAD_ENCODING`
         end subroutine run_engine
 
         !! Execute commands from `path`, stopping at the first error.
@@ -345,9 +379,11 @@ module cmdgraph
             class(engine_t), intent(inout)                       :: this
             character(len=*), intent(in)                         :: path
             logical, intent(in), optional                        :: echo    !! If `.true.`, print each prompt+line as it is read
-            integer, intent(out), optional                       :: stat    !! RC of the failing dispatch, or `RC_OK`
+            !! `RC_*` of the failing dispatch, `RUN_OPEN_FAILED`,
+            !! `RUN_BAD_ENCODING`, or `RUN_OK`
+            integer, intent(out), optional                       :: stat
             character(len=:), allocatable, intent(out), optional :: errmsg
-            integer, intent(out), optional                       :: line    !! 1-based line number of the failure
+            integer, intent(out), optional                       :: line    !! 1-based line number of the failure (0: open failure)
             logical                                              :: ok
         end function run_file_engine
 
@@ -406,6 +442,28 @@ module cmdgraph
             class(engine_t), intent(in)            :: this
             character(len=:), allocatable          :: names(:)
         end function state_path_engine
+
+        !! Classify the first line of an input stream by its leading bytes
+        !! and drop a UTF-8 byte-order mark.  `run` and `run_file` do this
+        !! themselves; it is public for a caller that reads its own lines
+        !! and hands them to `dispatch`.  An unallocated `text` is `ENC_PLAIN`.
+        pure module subroutine strip_bom(text, enc)
+            character(len=:), allocatable, intent(inout) :: text  !! First line; a UTF-8 mark is removed
+            integer,                       intent(out)   :: enc   !! One of the `ENC_*` values
+        end subroutine strip_bom
+
+        !! Display name of an `ENC_*` value, as used in the engine's messages.
+        pure module function encoding_name(enc) result(name)
+            integer, intent(in)           :: enc
+            character(len=:), allocatable :: name
+        end function encoding_name
+
+        !! `.true.` for the encodings the engine reads: `ENC_PLAIN` and
+        !! `ENC_UTF8_BOM`.
+        pure elemental module function encoding_supported(enc) result(ok)
+            integer, intent(in) :: enc
+            logical             :: ok
+        end function encoding_supported
     end interface
 
 end module cmdgraph
