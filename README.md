@@ -195,7 +195,13 @@ notion of SQL.
 ```
 sqlsh mydb < script.sql        # run a script (results on stdout)
 sqlsh mydb                     # interactive (prompts/errors on stderr)
+sqlsh --version                # the release; --help prints the usage
 ```
+
+The directory is created if it does not exist, so an argument that starts
+with `-` is always taken as an option and an unknown one is refused (exit
+status 2) rather than opened; `sqrsh` and `sqrd` refuse one likewise. A
+directory whose name really starts with `-` is given as `./-name`.
 
 Meta-commands: `.open <dir>`, `.close`, `.tables`, `.schema [table]`,
 `.pack <dir> <file>`, `.unpack <file> <dir>`, `.help`, `.quit`. Everything else is SQL:

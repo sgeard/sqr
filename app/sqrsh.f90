@@ -1233,9 +1233,17 @@ program sqrsh
 
     call ui%finalize("root")
 
-    ! Optional positional arg: open this directory at startup.
+    ! Optional positional arg: open this directory at startup.  sqrsh has
+    ! no options, so a leading '-' is a mistake and must not become a
+    ! database directory; one really so named is given as ./-name.
     if (command_argument_count() >= 1) then
         call get_command_argument(1, arg)
+        if (arg(1:1) == '-') then
+            write(error_unit,'(a)') 'sqrsh: unknown option: ' // trim(arg)
+            write(error_unit,'(a)') 'usage: sqrsh [<db-dir>]'
+            flush(error_unit)
+            call c_exit(2)
+        end if
         call open_initial(trim(arg))
     end if
 

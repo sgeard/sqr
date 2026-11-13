@@ -37,6 +37,22 @@ proc check {cond label} {
     }
 }
 
+# ---- the command line ----
+# sqrd has no options: an argument starting with '-' is refused with status
+# 2 before it can become a database directory.
+set status 0
+set msg ""
+try {
+    exec $exe --version 0 2>@1
+} trap CHILDSTATUS {msg opts} {
+    set status [lindex [dict get $opts -errorcode] 2]
+} on error {msg} {
+    set status -1
+}
+check {$status == 2 && [string first "sqrd: unknown option: --version" $msg] >= 0} \
+    "option-like directory refused with status 2"
+check {![file exists --version]} "and no directory is created for it"
+
 # ---- start the server, read the port back ----
 set srv [open [list | $exe $dbdir 0] r]
 fconfigure $srv -blocking 1

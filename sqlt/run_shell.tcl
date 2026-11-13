@@ -7,7 +7,9 @@
 # library. This covers what sits between them and is reachable from neither:
 # the meta-commands (".tables", ...) and how the two shells treat the encoding
 # of their input stream (UTF-8 byte-order mark ignored; UTF-16, UTF-32 and
-# the other recognisable encodings refused by name, with exit status 1).
+# the other recognisable encodings refused by name, with exit status 1),
+# and the command line: an argument that starts with '-' is an option, never
+# a database directory, so a mistyped one must not create a directory.
 # sqlsh reads its own input and sqrsh's is read by cmdgraph, so the same
 # cases are run through both to show that they give the same answer.
 #
@@ -74,6 +76,44 @@ namespace eval shelltest {
             close $fh
         }
         return $result
+    }
+
+    # Run `shell` with command-line arguments `args` and an empty standard
+    # input, from inside the work area (so a directory created by mistake
+    # lands there and can be looked for). Returns the same dict as `run`.
+    proc run_args {shell args} {
+        variable work
+        set outf [file join $work out.txt]
+        set errf [file join $work err.txt]
+        set here [pwd]
+        set status 0
+        cd $work
+        try {
+            exec $shell {*}$args < /dev/null > $outf 2> $errf
+        } trap CHILDSTATUS {msg opts} {
+            set status [lindex [dict get $opts -errorcode] 2]
+        } on error {} {
+            set status -1                    ;# killed by a signal, or not started
+        } finally {
+            cd $here
+        }
+        set result [dict create status $status]
+        foreach {key path} [list out $outf err $errf] {
+            set fh [open $path r]
+            fconfigure $fh -encoding utf-8
+            dict set result $key [read $fh]
+            close $fh
+        }
+        return $result
+    }
+
+    # The release in fpm.toml, which `sqlsh --version` must agree with.
+    proc fpm_version {} {
+        set fh [open [file join [file dirname [file dirname [file normalize [info script]]]] fpm.toml] r]
+        set text [read $fh]
+        close $fh
+        if {![regexp -line {^version *= *"([^"]+)"} $text -> ver]} { return "" }
+        return $ver
     }
 
     # SQL text as the UTF-8 bytes sqlsh expects.
@@ -224,6 +264,47 @@ namespace eval shelltest {
         check {[dict get $r status] == 0 && [dict get $r err] eq ""} "sqrsh plain: exit status 0, nothing on stderr"
     }
 
+    # ---- the command line ----
+
+    # A rejected command line: status 2, the reason and the usage on stderr,
+    # and no directory named after the argument.
+    proc t_rejected {shell prog label reason args} {
+        variable work
+        set r [run_args $shell {*}$args]
+        check {[dict get $r status] == 2}                           "$prog $label: exit status 2"
+        check {[string first "$prog: $reason" [dict get $r err]] >= 0} "$prog $label: says why"
+        check {[string first "usage: $prog" [dict get $r err]] >= 0}   "$prog $label: prints the usage"
+        set made 0
+        foreach a $args { if {[file exists [file join $work $a]]} { set made 1 } }
+        check {!$made}                                              "$prog $label: no directory created"
+    }
+
+    proc t_options {} {
+        variable sqlsh
+        variable sqrsh
+        variable work
+        set r [run_args $sqlsh --version]
+        check {[dict get $r status] == 0}                       "sqlsh --version: exit status 0"
+        check {[string trim [dict get $r out]] eq "sqlsh [fpm_version]"} \
+            "sqlsh --version: prints the release in fpm.toml"
+        set r [run_args $sqlsh --help]
+        check {[dict get $r status] == 0 && [string first "usage: sqlsh" [dict get $r out]] >= 0} \
+            "sqlsh --help: usage on stdout, exit status 0"
+        check {![file exists [file join $work --version]] && ![file exists [file join $work --help]]} \
+            "sqlsh --version, --help: no directory created"
+
+        t_rejected $sqlsh sqlsh "--bogus"  "unknown option: --bogus" --bogus
+        t_rejected $sqlsh sqlsh "-x"       "unknown option: -x"      -x
+        t_rejected $sqlsh sqlsh "two args" "too many arguments"      one two
+        t_rejected $sqrsh sqrsh "--version" "unknown option: --version" --version
+
+        # A directory that really starts with '-' is still reachable.
+        set r [run_args $sqlsh ./-odd]
+        check {[dict get $r status] == 0 && [file isdirectory [file join $work -odd]]} \
+            "sqlsh ./-odd: a directory starting with '-' opens when given as a path"
+        file delete -force [file join $work -odd]
+    }
+
     proc main {argv} {
         variable sqlsh
         variable work
@@ -250,6 +331,7 @@ namespace eval shelltest {
             t_sqrsh_plain
             t_sqrsh_utf8_bom
             t_sqrsh_wide
+            t_options
         } finally {
             file delete -force $work
         }

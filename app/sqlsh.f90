@@ -8,7 +8,10 @@
 !! Prompts, banners and errors go to stderr; query output goes to stdout.  A
 !! script piped on stdin therefore produces a clean result stream on stdout
 !! (`sqlsh mydb < script.sql > out.txt`), independent of the chatter.  An
-!! optional first argument names a database directory to open at start-up.
+!! optional argument names a database directory to open at start-up; an
+!! argument that starts with `-` is an option (`--help`, `--version`), never
+!! a directory, so a mistyped option cannot create one.  A directory whose
+!! name really does start with `-` is given as `./-name`.
 
 program sqlsh
     use, intrinsic :: iso_fortran_env, only: output_unit, error_unit, iostat_end
@@ -20,12 +23,11 @@ program sqlsh
     type(db_t), save :: db
     character(len=:), allocatable :: line
     logical :: interactive, first_line
-    integer :: nargs
+    character(len=*), parameter :: USAGE = 'usage: sqlsh [<db-dir>]   (or --help, --version)'
 
     interactive = is_a_tty()       ! prompt only when reading from a terminal
 
-    nargs = command_argument_count()
-    if (nargs >= 1) call open_arg_db()
+    call start_up()
 
     if (interactive) call banner()
 
@@ -50,11 +52,50 @@ contains
 
     ! ---- start-up ----
 
-    subroutine open_arg_db()
+    !! Act on the command line: at most one argument, an option or the
+    !! database directory to open.  Anything else ends the process with the
+    !! usage and status 2, before any directory has been touched.
+    subroutine start_up()
         character(len=SQR_MAX_DIR) :: arg
+        integer :: nargs
+        nargs = command_argument_count()
+        if (nargs == 0) return
+        call get_command_argument(1, arg)
+        if (arg(1:1) == '-') then
+            select case (trim(arg))
+            case ('--help')
+                write(output_unit,'(a)') USAGE
+                call quit(0)
+            case ('--version')
+                write(output_unit,'(a)') 'sqlsh ' // SQR_RELEASE
+                call quit(0)
+            case default
+                write(error_unit,'(a)') 'sqlsh: unknown option: ' // trim(arg)
+                write(error_unit,'(a)') USAGE
+                call quit(2)
+            end select
+        end if
+        if (nargs > 1) then
+            write(error_unit,'(a)') 'sqlsh: too many arguments'
+            write(error_unit,'(a)') USAGE
+            call quit(2)
+        end if
+        call open_arg_db(trim(arg))
+    end subroutine
+
+    !! End the process with `code`.  Both streams are flushed first: c_exit
+    !! is the C library's exit, which knows nothing of Fortran's buffers.
+    subroutine quit(code)
+        integer, intent(in) :: code
+        flush(output_unit)
+        flush(error_unit)
+        call c_exit(code)
+    end subroutine
+
+    subroutine open_arg_db(arg)
+        character(len=*), intent(in) :: arg
         integer :: rs
         character(len=SQR_ERRMSG_LEN) :: emsg
-        call get_command_argument(1, arg)
         emsg = ''
         call db_open(db, trim(arg), rs, emsg)
         if (rs /= SQR_OK) then

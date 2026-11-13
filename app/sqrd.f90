@@ -26,6 +26,7 @@ program sqrd
     type(server_t) :: srv
     integer, parameter :: PORT_ARG_LEN = 32     ! buffer for the port argument
     integer, parameter :: POLL_MS      = 1000   ! serve_step poll timeout (ms)
+    character(len=*), parameter :: USAGE = 'usage: sqrd <db-dir> <port>   (port 0 = ephemeral)'
 
     character(len=SQR_MAX_DIR)    :: dirarg
     character(len=PORT_ARG_LEN)   :: portarg
@@ -37,11 +38,18 @@ program sqrd
     ! rendering of the stop code — which a launcher reading this stream (see
     ! run_sqrd) then has to filter out of the log.
     if (command_argument_count() /= 2) then
-        write(error_unit, '(a)') 'usage: sqrd <db-dir> <port>   (port 0 = ephemeral)'
-        call die()
+        write(error_unit, '(a)') USAGE
+        call die(2)
     end if
     call get_command_argument(1, dirarg)
     call get_command_argument(2, portarg)
+    ! sqrd has no options, so a leading '-' is a mistake and must not become
+    ! a database directory; one really so named is given as ./-name.
+    if (dirarg(1:1) == '-') then
+        write(error_unit, '(2a)') 'sqrd: unknown option: ', trim(dirarg)
+        write(error_unit, '(a)') USAGE
+        call die(2)
+    end if
     read(portarg, *, iostat=ios) port
     if (ios /= 0 .or. port < 0 .or. port > NET_MAX_PORT) then
         write(error_unit, '(2a)') 'sqrd: bad port: ', trim(portarg)
@@ -114,12 +122,17 @@ contains
         close(u)
     end subroutine
 
-    !! Exit non-zero after the caller has written its diagnostic.  Flushes
+    !! Exit non-zero after the caller has written its diagnostic: status 1,
+    !! or `code` (2 for a command line that was not understood).  Flushes
     !! stderr first: c_exit is the C library's exit, which knows nothing of
     !! Fortran's buffers.
-    subroutine die()
+    subroutine die(code)
+        integer, intent(in), optional :: code
+        integer :: status
+        status = 1
+        if (present(code)) status = code
         flush(error_unit)
-        call c_exit(1)
+        call c_exit(status)
     end subroutine
 
 end program sqrd
