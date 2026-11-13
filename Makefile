@@ -403,6 +403,11 @@ distclean: veryclean docs-clean
 #   * -static yields a self-contained .exe; -Wl,-u,__strcpy_chk -lssp resolves
 #     a fortify symbol libgfortran's runtime pulls in (via its directory code)
 #     under -static on this toolchain.
+# Under wine in podman expect utest_sqr.exe to report four checks SKIPPED:
+# the read-only-media tests rely on chmod, which Windows does not enforce on
+# directories and root (the container's user) is not subject to.  The reason
+# is written up beside the probes in test/utest_sqr.f90 ("Permission-based
+# tests").
 # 32-bit is intentionally not offered: the Win32 APIs are stdcall with
 # @N-decorated names on i686, which a plain bind(c) (cdecl) interface does not
 # match — that needs separate handling. 64-bit has one calling convention.

@@ -16,7 +16,7 @@ program utest_sqr
         character(len=:), allocatable :: joined
     end type
 
-    integer :: pass = 0, fail = 0
+    integer :: pass = 0, fail = 0, skipped = 0
     character(len=*), parameter :: TEST_DIR = 'utest_sqr_db'
 
     call cleanup_dir()
@@ -99,7 +99,11 @@ program utest_sqr
 
     call cleanup_dir()
 
-    print '(a,i0,a,i0,a)', 'sqr tests: ', pass, ' passed, ', fail, ' failed'
+    if (skipped > 0) then
+        print '(a,i0,a,i0,a,i0,a)', 'sqr tests: ', pass, ' passed, ', fail, ' failed, ', skipped, ' skipped'
+    else
+        print '(a,i0,a,i0,a)', 'sqr tests: ', pass, ' passed, ', fail, ' failed'
+    end if
     if (fail > 0) error stop 1
 
 contains
@@ -137,6 +141,51 @@ contains
             print '(a,a)', '  FAIL ', label
         end if
     end subroutine
+
+    ! Record a check that cannot be made on this platform.  It counts as
+    ! neither a pass nor a failure and is named in the output and the total.
+    subroutine skip(label, why)
+        character(len=*), intent(in) :: label, why
+        skipped = skipped + 1
+        print '(a,a,a,a,a)', '  SKIP ', label, ' (', why, ')'
+    end subroutine
+
+    ! ---- Permission-based tests ------------------------------------------
+    ! test_readonly_media_lock and test_clean_close imitate read-only media
+    ! with chmod: 444 on the lock file, 555 on the database directory.  They
+    ! are only meaningful where the operating system then refuses the write.
+    ! It does not in two cases:
+    !   * Windows (and so wine, where the cross-built utest_sqr.exe is run):
+    !     a directory has no write-permission bit for chmod to clear, so
+    !     files can still be created in a "555" directory;
+    !   * a process running as root (the wine container runs as root):
+    !     permission bits are not checked at all.
+    ! The store is behaving correctly in both; it is the test's stand-in for
+    ! read-only media that has no effect.  So each test probes, straight
+    ! after its chmod, whether the restriction took hold, and skips the
+    ! checks that depend on it when it did not.  First seen 2026-11-13:
+    ! three failures in utest_sqr.exe under wine in podman.
+
+    ! The probes go through the C library, as the store's own file
+    ! operations do, and not through Fortran OPEN, whose treatment of a
+    ! read-only file differs between compilers.
+
+    ! Can `path` still be written?  Truncating a file to the length it
+    ! already has changes nothing but needs write permission.
+    function file_still_writable(path) result(yes)
+        character(len=*), intent(in) :: path
+        logical :: yes
+        yes = c_truncate(path, c_file_size(path)) == 0
+    end function
+
+    ! Can a new entry still be created in directory `dir`?
+    function dir_accepts_new_entry(dir) result(yes)
+        character(len=*), intent(in) :: dir
+        logical :: yes
+        integer :: ios
+        yes = c_mkdir(dir // '/_permprobe') == 0
+        if (yes) ios = c_remove(dir // '/_permprobe')
+    end function
 
     subroutine cleanup_dir()
         integer :: ios
@@ -4510,6 +4559,15 @@ contains
         ! file no longer opens read-write.
         ios = c_chmod(MDIR // '/_lock', int(o'444'))
         call check(ios == 0, 'ro media: chmod _lock read-only')
+        if (file_still_writable(MDIR // '/_lock')) then
+            ! See "Permission-based tests" above the probes.
+            call skip('ro media: read-write open refused', 'chmod 444 is not enforced here')
+            call skip('ro media: read-only open succeeds', 'chmod 444 is not enforced here')
+            call skip('ro media: row readable',            'chmod 444 is not enforced here')
+            ios = c_chmod(MDIR // '/_lock', int(o'644'))
+            ios = c_rmtree(MDIR)
+            return
+        end if
         call db_open(db, MDIR, rs, emsg)
         call check(rs /= SQR_OK, 'ro media: read-write open refused')
         emsg = ''
@@ -4540,6 +4598,7 @@ contains
         type(db_t) :: db
         type(column_t) :: c(1)
         integer :: rs, ios, ti
+        logical :: enforced
         integer(int32) :: rid
         character(len=:), allocatable :: buf
         ios = c_rmtree(CDIR)
@@ -4561,6 +4620,7 @@ contains
         call db_get(db, 't', rid, buf, rs)
         ios = c_chmod(CDIR, int(o'555'))
         call check(ios == 0, 'clean close: chmod dir read-only')
+        enforced = .not. dir_accepts_new_entry(CDIR)
         call db_close(db, rs)
         ios = c_chmod(CDIR, int(o'755'))
         call check(rs == SQR_OK, 'clean close: unchanged store closes without writing')
@@ -4573,7 +4633,13 @@ contains
         ios = c_chmod(CDIR, int(o'555'))
         call db_close(db, rs)
         ios = c_chmod(CDIR, int(o'755'))
-        call check(rs /= SQR_OK, 'clean close: a moved counter needs the rewrite (probe sees it)')
+        if (enforced) then
+            call check(rs /= SQR_OK, 'clean close: a moved counter needs the rewrite (probe sees it)')
+        else
+            ! See "Permission-based tests" above the probes.
+            call skip('clean close: a moved counter needs the rewrite (probe sees it)', &
+                      'chmod 555 on a directory is not enforced here')
+        end if
 
         ! The store is still whole: the row count is re-derived from the data file.
         call db_open(db, CDIR, rs)
