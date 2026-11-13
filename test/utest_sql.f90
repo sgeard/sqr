@@ -29,6 +29,12 @@ program utest_sql
     call test_where_predicates()
     call test_order_and_limit()
     call test_null_handling()
+    call test_parser_1_8()
+    call test_like_function()
+    call test_like()
+    call test_in_and_not()
+    call test_const_projection()
+    call test_aggregates()
     call test_column_metadata()
     call test_binary_cells()
     call test_text_column()
@@ -327,7 +333,8 @@ contains
                        "ORDER BY a DESC LIMIT 5", st, rs)
         call check(rs == SQR_OK, 'parse: full select ok')
         call check(st%select_star .eqv. .false., 'parse: not select-star')
-        call check(size(st%names) == 2, 'parse: two projection columns')
+        call check(size(st%proj) == 2 .and. all(st%proj%kind == PROJ_COL), 'parse: two projection columns')
+        call check(st%has_from, 'parse: select has a FROM')
         call check(st%has_where, 'parse: has where')
         call check(size(st%where_groups) == 2, 'parse: two OR-groups (DNF)')
         call check(size(st%where_groups(1)%conds) == 2, 'parse: first group has two ANDed conds')
@@ -362,7 +369,7 @@ contains
         call check(trim(st%where_groups(1)%conds(1)%col) == 'Account#', 'parse: quoted name in where')
 
         call sql_parse('SELECT "from" FROM t', st, rs)
-        call check(rs == SQR_OK .and. trim(st%names(1)) == 'from', &
+        call check(rs == SQR_OK .and. trim(st%proj(1)%col) == 'from', &
                    'parse: quoted keyword usable as column name')
     end subroutine
 
@@ -591,6 +598,345 @@ contains
         call run(db, "SELECT id, age FROM t ORDER BY age", res, rs)
         call check(res%cells(3,2)%is_null, 'null: NULL sorts last ascending')
 
+        call db_close(db)
+    end subroutine
+
+    ! ===================== 1.8: LIKE / IN / projection items =====================
+
+    subroutine test_parser_1_8()
+        type(sql_stmt_t) :: st = sql_stmt_t()
+        integer :: rs
+
+        call sql_parse("SELECT a FROM t WHERE a NOT BETWEEN 1 AND 2 AND b LIKE 'x%' ESCAPE '!' " // &
+                       "OR c NOT IN (1, 2.5, -3)", st, rs)
+        call check(rs == SQR_OK, 'parse18: NOT BETWEEN / LIKE ESCAPE / NOT IN ok')
+        associate (g1 => st%where_groups(1)%conds, g2 => st%where_groups(2)%conds)
+            call check(g1(1)%op == OP_NOTBETWEEN .and. g1(1)%lit2%ival == 2, 'parse18: NOT BETWEEN cond')
+            call check(g1(2)%op == OP_LIKE .and. g1(2)%lit%sval == 'x%', 'parse18: LIKE pattern')
+            call check(g1(2)%has_esc .and. g1(2)%esc == '!', 'parse18: ESCAPE character')
+            call check(g2(1)%op == OP_NOTIN .and. size(g2(1)%lits) == 3, 'parse18: NOT IN list of three')
+            call check(g2(1)%lits(2)%ltype == LIT_REAL .and. g2(1)%lits(3)%ival == -3, &
+                       'parse18: IN list literal kinds and sign')
+        end associate
+        call sql_parse("SELECT a FROM t WHERE a LIKE 'x' AND b NOT LIKE 'y' AND c IN ('p')", st, rs)
+        call check(rs == SQR_OK .and. st%where_groups(1)%conds(2)%op == OP_NOTLIKE &
+                   .and. st%where_groups(1)%conds(3)%op == OP_IN &
+                   .and. .not. st%where_groups(1)%conds(1)%has_esc, 'parse18: LIKE / NOT LIKE / IN')
+
+        call sql_parse("SELECT COUNT(*), count(a), Min(a), MAX(a) AS top, sum(a), avg(a), 1, 'x' FROM t", st, rs)
+        call check(rs == SQR_OK .and. size(st%proj) == 8, 'parse18: eight projection items')
+        call check(all(st%proj(1:6)%kind == PROJ_AGG) .and. all(st%proj(7:8)%kind == PROJ_LIT), &
+                   'parse18: item kinds')
+        call check(all(st%proj(1:6)%agg == [AGG_COUNT_STAR, AGG_COUNT, AGG_MIN, AGG_MAX, AGG_SUM, AGG_AVG]), &
+                   'parse18: aggregate kinds, any case')
+        call check(trim(st%proj(1)%label) == 'COUNT(*)' .and. trim(st%proj(2)%label) == 'COUNT(a)' &
+                   .and. trim(st%proj(3)%label) == 'MIN(a)', 'parse18: canonical aggregate labels')
+        call check(trim(st%proj(4)%label) == 'top', 'parse18: AS overrides the label')
+        call check(trim(st%proj(7)%label) == '1' .and. trim(st%proj(8)%label) == '?column?', &
+                   'parse18: literal labels')
+
+        call sql_parse("SELECT count, min FROM t", st, rs)
+        call check(rs == SQR_OK .and. all(st%proj%kind == PROJ_COL) .and. trim(st%proj(1)%col) == 'count', &
+                   'parse18: count/min without ( are columns')
+        call sql_parse("SELECT -2.5 AS neg, +7", st, rs)
+        call check(rs == SQR_OK .and. .not. st%has_from, 'parse18: SELECT of literals needs no FROM')
+        call check(trim(st%proj(1)%label) == 'neg' .and. trim(st%proj(2)%label) == '7' &
+                   .and. st%proj(1)%lit%rval == -2.5_real64, 'parse18: signed literals')
+        call sql_parse("SELECT -3", st, rs)
+        call check(rs == SQR_OK .and. trim(st%proj(1)%label) == '-3', 'parse18: negative literal label')
+
+        ! errors
+        call sql_parse("SELECT a FROM t WHERE a NOT 5", st, rs)
+        call check(rs == SQR_INVALID, 'parse18 err: NOT without BETWEEN/LIKE/IN')
+        call sql_parse("SELECT a FROM t WHERE a LIKE 5", st, rs)
+        call check(rs == SQR_INVALID, 'parse18 err: LIKE needs a string')
+        call sql_parse("SELECT a FROM t WHERE a LIKE 'x' ESCAPE 'ab'", st, rs)
+        call check(rs == SQR_INVALID, 'parse18 err: two-character ESCAPE')
+        call sql_parse("SELECT a FROM t WHERE a LIKE 'x' ESCAPE ''", st, rs)
+        call check(rs == SQR_INVALID, 'parse18 err: empty ESCAPE')
+        call sql_parse("SELECT a FROM t WHERE a IN ()", st, rs)
+        call check(rs == SQR_INVALID, 'parse18 err: empty IN list')
+        call sql_parse("SELECT a FROM t WHERE a IN (1, 2", st, rs)
+        call check(rs == SQR_INVALID, 'parse18 err: unclosed IN list')
+        call sql_parse("SELECT a FROM t WHERE a IN (SELECT a FROM t)", st, rs)
+        call check(rs == SQR_INVALID, 'parse18 err: subquery in IN')
+        call sql_parse("SELECT a", st, rs)
+        call check(rs == SQR_INVALID, 'parse18 err: column without FROM')
+        call sql_parse("SELECT COUNT(*)", st, rs)
+        call check(rs == SQR_INVALID, 'parse18 err: aggregate without FROM')
+        call sql_parse("SELECT NULL", st, rs)
+        call check(rs == SQR_INVALID, 'parse18 err: NULL in the projection')
+        call sql_parse("SELECT median(a) FROM t", st, rs)
+        call check(rs == SQR_INVALID, 'parse18 err: unknown function')
+        call sql_parse("SELECT MAX(*) FROM t", st, rs)
+        call check(rs == SQR_INVALID, 'parse18 err: MAX(*)')
+        call sql_parse("SELECT MAX(a FROM t", st, rs)
+        call check(rs == SQR_INVALID, 'parse18 err: unclosed aggregate')
+        call sql_parse("SELECT a AS FROM t", st, rs)
+        call check(rs == SQR_INVALID, 'parse18 err: AS without a usable alias')
+        call sql_parse("SELECT 1 WHERE 1 = 1", st, rs)
+        call check(rs == SQR_INVALID, 'parse18 err: nothing may follow a FROM-less SELECT')
+    end subroutine
+
+    subroutine test_like_function()
+        character(len=*), parameter :: E_ACUTE = char(int(z'C3')) // char(int(z'A9'))   ! U+00E9
+        character(len=*), parameter :: EURO = char(int(z'E2')) // char(int(z'82')) // char(int(z'AC'))
+        character(len=*), parameter :: LATIN1_E = char(int(z'E9'))
+
+        call check(sql_like('', ''), 'like: empty matches empty')
+        call check(.not. sql_like('a', ''), 'like: empty pattern rejects text')
+        call check(sql_like('', '%') .and. sql_like('abc', '%') .and. sql_like('abc', '%%'), 'like: % alone')
+        call check(sql_like('abc', 'abc') .and. .not. sql_like('abc', 'abd'), 'like: literal')
+        call check(.not. sql_like('abc', 'ab') .and. .not. sql_like('ab', 'abc'), 'like: whole value must match')
+        call check(.not. sql_like('abc', 'ABC'), 'like: case-sensitive')
+        call check(sql_like('abc', 'a%') .and. sql_like('abc', '%c') .and. sql_like('abc', '%b%'), &
+                   'like: % at start, end, both')
+        call check(.not. sql_like('abc', 'b%') .and. .not. sql_like('abc', '%b'), 'like: anchored')
+        call check(sql_like('abcabc', '%abc') .and. sql_like('aXbXc', 'a%b%c'), 'like: % backtracks')
+        call check(sql_like('mississippi', '%iss%ipp%') .and. .not. sql_like('mississippi', '%iss%ipx%'), &
+                   'like: several %')
+        call check(sql_like('abc', 'a_c') .and. sql_like('abc', '___'), 'like: _ takes one')
+        call check(.not. sql_like('abc', '__') .and. .not. sql_like('abc', '____') &
+                   .and. .not. sql_like('', '_'), 'like: _ takes exactly one')
+        call check(sql_like('abc', '_%') .and. sql_like('a', '_%') .and. .not. sql_like('', '_%'), 'like: _% is one or more')
+        call check(sql_like('caf' // E_ACUTE, 'caf_') .and. .not. sql_like('caf' // E_ACUTE, 'caf__'), &
+                   'like: _ takes a two-byte character whole')
+        call check(sql_like(EURO // '5', '_5') .and. sql_like('a' // EURO // 'b', 'a_b'), &
+                   'like: _ takes a three-byte character whole')
+        call check(sql_like(E_ACUTE // EURO, '%' // EURO) .and. sql_like(E_ACUTE // 'x', '%x'), &
+                   'like: % steps over multi-byte characters')
+        call check(sql_like('caf' // LATIN1_E, 'caf_') .and. sql_like(LATIN1_E // 'a', '_a'), &
+                   'like: a stray 8-bit byte is one character')
+        call check(sql_like('50%', '50!%', '!') .and. .not. sql_like('500', '50!%', '!'), 'like: escaped %')
+        call check(sql_like('a_b', 'a!_b', '!') .and. .not. sql_like('axb', 'a!_b', '!'), 'like: escaped _')
+        call check(sql_like('a!b', 'a!!b', '!') .and. sql_like('100%!', '%!%!!', '!'), 'like: escaped escape')
+        call check(sql_like('a!b', 'a!b') .and. sql_like('a\b', 'a\b'), 'like: no escape unless asked')
+    end subroutine
+
+    subroutine test_like()
+        type(db_t) :: db
+        type(sql_result_t) :: res
+        integer :: rs
+        character(len=200) :: em
+
+        call fresh_db(db)
+        call run(db, "CREATE TABLE t (id INTEGER, name CHAR(12), note TEXT)", res, rs)
+        call run(db, "INSERT INTO t VALUES (1,'Alice','n'),(2,'Alan','n'),(3,'Bob','n'),(4,'50%','n')," // &
+                     "(5,'a_c','n'),(6,'abc','n')", res, rs)
+        call run(db, "INSERT INTO t (id) VALUES (7)", res, rs)
+
+        call run(db, "SELECT id FROM t WHERE name LIKE 'Al%' ORDER BY id", res, rs)
+        call check(rs == SQR_OK .and. res%nrows == 2 .and. cell(res,1,1) == '1' .and. cell(res,2,1) == '2', &
+                   'like sql: prefix')
+        call run(db, "SELECT id FROM t WHERE name LIKE 'Bob'", res, rs)
+        call check(res%nrows == 1 .and. cell(res,1,1) == '3', 'like sql: stored padding is not part of the value')
+        call run(db, "SELECT id FROM t WHERE name LIKE '_l%e'", res, rs)
+        call check(res%nrows == 1 .and. cell(res,1,1) == '1', 'like sql: _ and %')
+        call run(db, "SELECT id FROM t WHERE name NOT LIKE 'A%' ORDER BY id", res, rs)
+        call check(res%nrows == 4 .and. cell(res,1,1) == '3', 'like sql: NOT LIKE skips NULL')
+        call run(db, "SELECT id FROM t WHERE name LIKE '%'", res, rs)
+        call check(res%nrows == 6, 'like sql: % does not match NULL')
+        call run(db, "SELECT id FROM t WHERE name LIKE '%!%' ESCAPE '!'", res, rs)
+        call check(res%nrows == 1 .and. cell(res,1,1) == '4', 'like sql: ESCAPE finds a literal %')
+        call run(db, "SELECT id FROM t WHERE name LIKE 'a\_c' ESCAPE '\'", res, rs)
+        call check(res%nrows == 1 .and. cell(res,1,1) == '5', 'like sql: ESCAPE finds a literal _')
+        call run(db, "SELECT id FROM t WHERE name LIKE 'a_c' ORDER BY id", res, rs)
+        call check(res%nrows == 2, 'like sql: unescaped _ matches both')
+        call run(db, "SELECT id FROM t WHERE name LIKE 'Al%' AND id > 1 OR name LIKE 'B%' ORDER BY id", res, rs)
+        call check(res%nrows == 2 .and. cell(res,1,1) == '2' .and. cell(res,2,1) == '3', 'like sql: with AND / OR')
+
+        call run(db, "UPDATE t SET id = 30 WHERE name LIKE 'B%'", res, rs)
+        call check(rs == SQR_OK .and. res%count == 1, 'like sql: UPDATE ... WHERE LIKE')
+        call run(db, "DELETE FROM t WHERE name LIKE 'a%'", res, rs)
+        call check(rs == SQR_OK .and. res%count == 2, 'like sql: DELETE ... WHERE LIKE')
+
+        call run(db, "SELECT id FROM t WHERE id LIKE '1%'", res, rs, em)
+        call check(rs == SQR_INVALID .and. index(em, 'character column') > 0, 'like sql err: numeric column')
+        call run(db, "SELECT id FROM t WHERE note LIKE 'n%'", res, rs, em)
+        call check(rs == SQR_INVALID .and. index(em, 'TEXT') > 0, 'like sql err: TEXT column')
+        call run(db, "SELECT id FROM t WHERE name LIKE 'a!' ESCAPE '!'", res, rs, em)
+        call check(rs == SQR_INVALID .and. index(em, 'escape') > 0, 'like sql err: pattern ends in the escape')
+        call run(db, "SELECT id FROM t WHERE name LIKE 'a!b' ESCAPE '!'", res, rs, em)
+        call check(rs == SQR_INVALID, 'like sql err: escape before an ordinary character')
+        call db_close(db)
+    end subroutine
+
+    subroutine test_in_and_not()
+        type(db_t) :: db
+        type(sql_result_t) :: res
+        integer :: rs
+        character(len=200) :: em
+
+        call fresh_db(db)
+        call run(db, "CREATE TABLE t (id INTEGER, x REAL, name CHAR(8))", res, rs)
+        call run(db, "CREATE INDEX ON t (id)", res, rs)
+        call run(db, "INSERT INTO t VALUES (1,1.5,'a'),(2,2.0,'b'),(3,3.5,'c'),(4,4.0,'d')", res, rs)
+        call run(db, "INSERT INTO t (id) VALUES (5)", res, rs)
+
+        call run(db, "SELECT id FROM t WHERE id IN (1, 3, 99) ORDER BY id", res, rs)
+        call check(rs == SQR_OK .and. res%nrows == 2 .and. cell(res,1,1) == '1' .and. cell(res,2,1) == '3', &
+                   'in: INT list on an indexed column')
+        call run(db, "SELECT id FROM t WHERE id IN (2.0)", res, rs)
+        call check(res%nrows == 1 .and. cell(res,1,1) == '2', 'in: REAL literal against an INT column')
+        call run(db, "SELECT id FROM t WHERE x IN (2, 3.5) ORDER BY id", res, rs)
+        call check(res%nrows == 2 .and. cell(res,1,1) == '2' .and. cell(res,2,1) == '3', 'in: REAL column')
+        call run(db, "SELECT id FROM t WHERE name IN ('a', 'd', 'zz') ORDER BY id", res, rs)
+        call check(res%nrows == 2 .and. cell(res,1,1) == '1' .and. cell(res,2,1) == '4', 'in: CHAR column')
+        call run(db, "SELECT id FROM t WHERE name NOT IN ('a', 'd') ORDER BY id", res, rs)
+        call check(res%nrows == 2 .and. cell(res,1,1) == '2' .and. cell(res,2,1) == '3', 'in: NOT IN skips NULL')
+        call run(db, "SELECT id FROM t WHERE x NOT IN (1.5)", res, rs)
+        call check(res%nrows == 3, 'in: NOT IN on REAL skips NULL')
+        call run(db, "SELECT id FROM t WHERE id IN (1,2) AND name IN ('b','c')", res, rs)
+        call check(res%nrows == 1 .and. cell(res,1,1) == '2', 'in: two IN conditions ANDed')
+
+        call run(db, "SELECT id FROM t WHERE id NOT BETWEEN 2 AND 4 ORDER BY id", res, rs)
+        call check(res%nrows == 2 .and. cell(res,1,1) == '1' .and. cell(res,2,1) == '5', 'not between: INT')
+        call run(db, "SELECT id FROM t WHERE x NOT BETWEEN 2 AND 4", res, rs)
+        call check(res%nrows == 1 .and. cell(res,1,1) == '1', 'not between: REAL skips NULL')
+        call run(db, "SELECT id FROM t WHERE name NOT BETWEEN 'b' AND 'c' ORDER BY id", res, rs)
+        call check(res%nrows == 2 .and. cell(res,2,1) == '4', 'not between: CHAR')
+
+        call run(db, "DELETE FROM t WHERE id IN (4, 5)", res, rs)
+        call check(rs == SQR_OK .and. res%count == 2, 'in: DELETE ... WHERE IN')
+
+        call run(db, "SELECT id FROM t WHERE id IN (1, 'a')", res, rs, em)
+        call check(rs == SQR_INVALID .and. index(em, 'numeric literal') > 0, 'in err: string in a numeric list')
+        call run(db, "SELECT id FROM t WHERE name IN ('a', 1)", res, rs, em)
+        call check(rs == SQR_INVALID .and. index(em, 'string literal') > 0, 'in err: number in a string list')
+        call run(db, "SELECT id FROM t WHERE id IN (1, NULL)", res, rs, em)
+        call check(rs == SQR_INVALID .and. index(em, 'IS NULL') > 0, 'in err: NULL in the list')
+        call db_close(db)
+    end subroutine
+
+    subroutine test_const_projection()
+        type(db_t) :: db, closed
+        type(sql_result_t) :: res
+        integer :: rs
+        character(len=200) :: em
+        integer(int32) :: iv
+        real(real64)   :: xv
+
+        ! No table, so no open database is needed.
+        em = ''
+        call sql_run(closed, "SELECT 1, 2.5, 'abc' AS s, -4", res, rs, em)
+        call check(rs == SQR_OK .and. res%kind == SQLRES_ROWS .and. res%nrows == 1 .and. res%ncols == 4, &
+                   'const: one row of four without a database')
+        call check(cell(res,1,1) == '1' .and. cell(res,1,3) == 'abc' .and. cell(res,1,4) == '-4', 'const: cells')
+        call check(all(res%coltypes == [DT_INT, DT_REAL, DT_CHAR, DT_INT]), 'const: column types')
+        call check(all(res%colsizes == [SQR_INT_SIZE, SQR_REAL_SIZE, 3, SQR_INT_SIZE]), 'const: column sizes')
+        call check(trim(res%colnames(1)) == '1' .and. trim(res%colnames(2)) == '2.5' &
+                   .and. trim(res%colnames(3)) == 's' .and. trim(res%colnames(4)) == '-4', 'const: column names')
+        call sql_run(closed, "SELECT ''", res, rs, em)
+        call check(rs == SQR_OK .and. res%colsizes(1) == 1 .and. cell(res,1,1) == '' &
+                   .and. trim(res%colnames(1)) == '?column?', 'const: empty string')
+
+        call sql_run(closed, "SELECT 7, 0.1", res, rs, em, binary_cells=.true.)
+        iv = transfer(res%cells(1,1)%text, iv)
+        xv = transfer(res%cells(1,2)%text, xv)
+        call check(rs == SQR_OK .and. len(res%cells(1,1)%text) == 4 .and. iv == 7_int32, 'const: binary INT')
+        call check(len(res%cells(1,2)%text) == 8 .and. xv == 0.1_real64, 'const: binary REAL is exact')
+
+        call fresh_db(db)
+        call run(db, "CREATE TABLE t (id INTEGER, name CHAR(8))", res, rs)
+        call run(db, "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')", res, rs)
+        call run(db, "SELECT 1 FROM t WHERE id > 1", res, rs)
+        call check(rs == SQR_OK .and. res%nrows == 2 .and. res%ncols == 1 .and. cell(res,2,1) == '1', &
+                   'const: one literal row per matching row')
+        call run(db, "SELECT name, 'x' AS tag, id FROM t ORDER BY id DESC LIMIT 2", res, rs)
+        call check(rs == SQR_OK .and. res%nrows == 2 .and. cell(res,1,1) == 'c' .and. cell(res,1,2) == 'x' &
+                   .and. cell(res,2,3) == '2', 'const: literal between columns, ordered and limited')
+        call check(trim(res%colnames(2)) == 'tag' .and. res%coltypes(2) == DT_CHAR, 'const: literal column metadata')
+        call run(db, "SELECT id AS ident FROM t WHERE id = 1", res, rs)
+        call check(rs == SQR_OK .and. trim(res%colnames(1)) == 'ident' .and. cell(res,1,1) == '1', &
+                   'alias: a column can be renamed')
+        call db_close(db)
+    end subroutine
+
+    subroutine test_aggregates()
+        type(db_t) :: db
+        type(sql_result_t) :: res
+        integer :: rs
+        character(len=200) :: em
+        integer(int32) :: iv
+        real(real64)   :: xv
+
+        call fresh_db(db)
+        call run(db, "CREATE TABLE t (id INTEGER, x REAL, name CHAR(8), note TEXT)", res, rs)
+        call run(db, "CREATE INDEX ON t (id)", res, rs)
+
+        ! Empty table.
+        call run(db, "SELECT COUNT(*), COUNT(id), MIN(id), MAX(x), SUM(id), AVG(x), MIN(name) FROM t", res, rs)
+        call check(rs == SQR_OK .and. res%nrows == 1 .and. res%ncols == 7, 'agg: empty table gives one row')
+        call check(cell(res,1,1) == '0' .and. cell(res,1,2) == '0', 'agg: COUNT of nothing is 0')
+        call check(all(res%cells(1,3:7)%is_null), 'agg: MIN/MAX/SUM/AVG of nothing are NULL')
+        call check(all(res%coltypes == [DT_INT, DT_INT, DT_INT, DT_REAL, DT_INT, DT_REAL, DT_CHAR]), &
+                   'agg: result types')
+        call check(res%colsizes(7) == 8 .and. res%colsizes(6) == SQR_REAL_SIZE, 'agg: result sizes')
+        call check(trim(res%colnames(1)) == 'COUNT(*)' .and. trim(res%colnames(6)) == 'AVG(x)', 'agg: result names')
+
+        call run(db, "INSERT INTO t VALUES (1,1.5,'pear','n'),(2,2.5,'apple','n'),(3,-4.0,'fig','n')", res, rs)
+        call run(db, "INSERT INTO t (id) VALUES (10)", res, rs)
+
+        call run(db, "SELECT COUNT(*), COUNT(x), COUNT(note), COUNT(name) FROM t", res, rs)
+        call check(rs == SQR_OK .and. cell(res,1,1) == '4' .and. cell(res,1,2) == '3' &
+                   .and. cell(res,1,3) == '3' .and. cell(res,1,4) == '3', 'agg: COUNT(*) counts NULLs, COUNT(col) skips them')
+        call run(db, "SELECT MIN(id), MAX(id), SUM(id), AVG(id) FROM t", res, rs)
+        call check(cell(res,1,1) == '1' .and. cell(res,1,2) == '10' .and. cell(res,1,3) == '16', 'agg: INT min/max/sum')
+        call check(cell(res,1,4) == '4.00000000E+00' .and. res%coltypes(4) == DT_REAL, 'agg: AVG of INT is REAL')
+        call run(db, "SELECT MIN(x), MAX(x), SUM(x), AVG(x) FROM t", res, rs)
+        call check(cell(res,1,1) == '-4.00000000E+00' .and. cell(res,1,2) == '2.50000000E+00', 'agg: REAL min/max skip NULL')
+        call check(cell(res,1,3) == '0.00000000E+00' .and. cell(res,1,4) == '0.00000000E+00', 'agg: REAL sum/avg skip NULL')
+        call run(db, "SELECT MIN(name), MAX(name) FROM t", res, rs)
+        call check(cell(res,1,1) == 'apple' .and. cell(res,1,2) == 'pear', 'agg: CHAR min/max')
+
+        call run(db, "SELECT COUNT(*), MAX(id) FROM t WHERE id < 3", res, rs)
+        call check(cell(res,1,1) == '2' .and. cell(res,1,2) == '2', 'agg: over a WHERE (index band)')
+        call run(db, "SELECT COUNT(*) FROM t WHERE name LIKE '%p%' AND id IN (1,2,3)", res, rs)
+        call check(cell(res,1,1) == '2', 'agg: over LIKE and IN')
+        call run(db, "SELECT COUNT(*), MAX(x) FROM t WHERE id > 100", res, rs)
+        call check(res%nrows == 1 .and. cell(res,1,1) == '0' .and. res%cells(1,2)%is_null, 'agg: no matching rows')
+        call run(db, "SELECT COUNT(*) AS n, 'rows', 2 FROM t", res, rs)
+        call check(rs == SQR_OK .and. trim(res%colnames(1)) == 'n' .and. cell(res,1,2) == 'rows' &
+                   .and. cell(res,1,3) == '2', 'agg: alias and literals beside an aggregate')
+        call run(db, "SELECT COUNT(*) FROM t LIMIT 0", res, rs)
+        call check(rs == SQR_OK .and. res%nrows == 0 .and. res%ncols == 1, 'agg: LIMIT 0 gives no row')
+        call run(db, "SELECT COUNT(*) FROM t LIMIT 5", res, rs)
+        call check(res%nrows == 1, 'agg: LIMIT above one still gives one row')
+
+        em = ''
+        call sql_run(db, "SELECT COUNT(*), SUM(x), MIN(x) FROM t WHERE id > 100", res, rs, em, binary_cells=.true.)
+        iv = transfer(res%cells(1,1)%text, iv)
+        call check(rs == SQR_OK .and. iv == 0_int32 .and. res%cells(1,2)%is_null &
+                   .and. len(res%cells(1,2)%text) == 0, 'agg: binary COUNT and NULL')
+        call sql_run(db, "SELECT SUM(id), AVG(x) FROM t", res, rs, em, binary_cells=.true.)
+        iv = transfer(res%cells(1,1)%text, iv)
+        xv = transfer(res%cells(1,2)%text, xv)
+        call check(iv == 16_int32 .and. xv == 0.0_real64, 'agg: binary SUM and AVG')
+
+        ! SUM of INT: exact to the int32 limit, an error beyond it.
+        call run(db, "DELETE FROM t", res, rs)
+        call run(db, "INSERT INTO t (id) VALUES (2147483647), (-5), (5)", res, rs)
+        call run(db, "SELECT SUM(id) FROM t", res, rs)
+        call check(rs == SQR_OK .and. cell(res,1,1) == '2147483647', 'agg: SUM reaching huge(int32) through a larger partial sum')
+        call run(db, "INSERT INTO t (id) VALUES (1)", res, rs)
+        call run(db, "SELECT SUM(id) FROM t", res, rs, em)
+        call check(rs == SQR_INVALID .and. index(em, 'overflow') > 0 .and. index(em, 'SUM(id)') > 0, &
+                   'agg err: INT SUM overflow is reported')
+        call run(db, "SELECT AVG(id) FROM t", res, rs)
+        call check(rs == SQR_OK, 'agg: AVG is unaffected by the int32 limit')
+
+        call run(db, "SELECT id, COUNT(*) FROM t", res, rs, em)
+        call check(rs == SQR_INVALID .and. index(em, 'must appear in an aggregate') > 0, 'agg err: bare column beside an aggregate')
+        call run(db, "SELECT COUNT(*) FROM t ORDER BY id", res, rs, em)
+        call check(rs == SQR_INVALID .and. index(em, 'ORDER BY') > 0, 'agg err: ORDER BY with an aggregate')
+        call run(db, "SELECT SUM(name) FROM t", res, rs, em)
+        call check(rs == SQR_INVALID .and. index(em, 'numeric column') > 0, 'agg err: SUM of CHAR')
+        call run(db, "SELECT AVG(note) FROM t", res, rs, em)
+        call check(rs == SQR_INVALID, 'agg err: AVG of TEXT')
+        call run(db, "SELECT MAX(note) FROM t", res, rs, em)
+        call check(rs == SQR_INVALID .and. index(em, 'TEXT') > 0, 'agg err: MAX of TEXT')
+        call run(db, "SELECT MAX(nope) FROM t", res, rs, em)
+        call check(rs == SQR_INVALID .and. index(em, 'no such column') > 0, 'agg err: unknown column')
         call db_close(db)
     end subroutine
 
@@ -1025,6 +1371,13 @@ contains
         call check(res%count == 1, 'example: trim lowest earner')
         call run(db, "SELECT * FROM employee", res, rs)
         call check(res%nrows == 4, 'example: final headcount')
+
+        ! The same headcount, and the pay spread, as aggregates.
+        call run(db, "SELECT COUNT(*) AS staff, MIN(salary), MAX(salary) FROM employee", res, rs)
+        call check(rs == SQR_OK .and. res%nrows == 1 .and. cell(res,1,1) == '4' &
+                   .and. trim(res%colnames(1)) == 'staff', 'example: headcount by COUNT(*)')
+        call run(db, "SELECT COUNT(*) FROM employee WHERE dept IN ('eng', 'sales') AND name LIKE '%e'", res, rs)
+        call check(rs == SQR_OK .and. res%nrows == 1, 'example: IN and LIKE under an aggregate')
 
         call db_close(db)
     end subroutine

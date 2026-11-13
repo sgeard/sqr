@@ -415,7 +415,7 @@ WIN_CFLAGS := -O2 -Wall -Wextra
 # -lws2_32: Winsock, pulled in by the socket shim now in osshim.c/clib_wrap.
 WIN_LINK   := -static -Wl,-u,__strcpy_chk -lssp -lws2_32
 # Module/submodule order matters (parents before submodules).
-WIN_SRC   := clib_wrap b_tree sqr_fault sqr_consts sqr clib_wrap_sm b_tree_sm sqr_fault_off_sm sqr_base sqr_table sqr_record sqr_index sqr_admin sqr_rowbuf sqr_journal sql sql_base sql_parse sql_exec sqr_net sqr_net_sm sqr_serve sqr_serve_sm
+WIN_SRC   := clib_wrap b_tree sqr_fault sqr_consts sqr clib_wrap_sm b_tree_sm sqr_fault_off_sm sqr_base sqr_table sqr_record sqr_index sqr_admin sqr_rowbuf sqr_journal sqr_pack sql sql_base sql_parse sql_exec sqr_net sqr_net_sm sqr_serve sqr_serve_sm
 WIN_TESTS := utest_btree utest_sqr utest_sql
 
 windows:

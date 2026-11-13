@@ -1,0 +1,103 @@
+# const.test — literals in the projection, with and without a table, and
+# AS aliases.
+
+# No table needed.
+query I nosort
+SELECT 1
+----
+1
+
+query IRT nosort
+SELECT 42, 2.5, 'abc'
+----
+42
+2.500
+abc
+
+query IR nosort
+SELECT -7, -0.5
+----
+-7
+-0.500
+
+query T nosort
+SELECT ''
+----
+(empty)
+
+query I nosort
+SELECT 1 AS one
+----
+1
+
+statement ok
+CREATE TABLE c(id INTEGER, name CHAR(8))
+
+statement ok
+INSERT INTO c VALUES(1, 'a')
+
+statement ok
+INSERT INTO c VALUES(2, 'b')
+
+statement ok
+INSERT INTO c VALUES(3, 'c')
+
+# One literal row per matching row (the existence-probe idiom).
+query I nosort
+SELECT 1 FROM c WHERE id > 1
+----
+1
+1
+
+# Literals beside columns.
+query TTI nosort
+SELECT name, 'x', id FROM c ORDER BY id DESC LIMIT 2
+----
+c
+x
+3
+b
+x
+2
+
+# Aliases rename result columns without changing the values.
+query IT nosort
+SELECT id AS ident, name AS label FROM c WHERE id = 2
+----
+2
+b
+
+# A column called count is still a column.
+statement ok
+CREATE TABLE k(count INTEGER)
+
+statement ok
+INSERT INTO k VALUES(9)
+
+query I nosort
+SELECT count FROM k
+----
+9
+
+query II nosort
+SELECT COUNT(count), COUNT(*) AS n FROM k
+----
+1
+1
+
+# Without FROM only literals are allowed, and nothing may follow.
+statement error
+SELECT id
+
+statement error
+SELECT COUNT(*)
+
+statement error
+SELECT 1 WHERE 1 = 1
+
+statement error
+SELECT NULL
+
+# No arithmetic in the projection.
+statement error
+SELECT 1 + 1

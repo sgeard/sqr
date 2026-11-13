@@ -35,6 +35,7 @@ program utest_serve
     call t_catalogue()
     call t_info()
     call t_pack()
+    call t_aggregate_const()
     call t_errors()
     call t_busy()
     call t_rollback_on_drop()
@@ -349,6 +350,38 @@ contains
         call read_rows(cli1, nr, nc, collines, isnull, cells, ok)
         call check(ok .and. nr == 1 .and. cell_int(cells(1, 1)) == 5_int32, &
                    'pack: the reopened index finds the new row')
+    end subroutine
+
+    ! Aggregates and literals travel as ordinary ROWS results: same COL
+    ! lines, same binary cells.
+    subroutine t_aggregate_const()
+        integer :: nr, nc
+        character(len=64), allocatable :: collines(:), cells(:,:)
+        logical,           allocatable :: isnull(:,:)
+        logical :: ok
+        call send_sql(cli1, 'SELECT COUNT(*), MAX(id), AVG(x) AS mean, MIN(x) FROM t WHERE id <= 2')
+        call read_rows(cli1, nr, nc, collines, isnull, cells, ok)
+        call check(ok .and. nr == 1 .and. nc == 4, 'agg: one row of four framed')
+        if (.not. ok) return
+        call check(collines(1) == 'COL COUNT(*) INT 4 null 0', 'agg: COUNT(*) column line')
+        call check(collines(2) == 'COL MAX(id) INT 4 null 0',  'agg: MAX column line')
+        call check(collines(3) == 'COL mean REAL 8 null 0',    'agg: aliased AVG column line')
+        call check(cell_int(cells(1, 1)) == 2_int32 .and. cell_int(cells(1, 2)) == 2_int32, &
+                   'agg: COUNT and MAX cells decode')
+        call check(cell_real(cells(1, 4)) == -1.5e-300_real64, 'agg: MIN of REAL is bit-exact')
+
+        call send_sql(cli1, 'SELECT 7, 0.1, ''a b'' AS "two words"')
+        call read_rows(cli1, nr, nc, collines, isnull, cells, ok)
+        call check(ok .and. nr == 1 .and. nc == 3, 'const: one row of three framed')
+        if (.not. ok) return
+        call check(collines(1) == 'COL 7 INT 4 null 0',           'const: INT literal column line')
+        call check(collines(3) == 'COL two words CHAR 3 null 0',  'const: alias with a space, unquoted')
+        call check(cell_int(cells(1, 1)) == 7_int32 .and. cell_real(cells(1, 2)) == 0.1_real64, &
+                   'const: literal cells decode')
+
+        call send_sql(cli1, 'SELECT COUNT(*) FROM t WHERE id > 1000')
+        call read_rows(cli1, nr, nc, collines, isnull, cells, ok)
+        call check(ok .and. nr == 1 .and. cell_int(cells(1, 1)) == 0_int32, 'agg: COUNT of nothing is a 0 row')
     end subroutine
 
     subroutine t_errors()

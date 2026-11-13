@@ -1,0 +1,119 @@
+# like.test — LIKE, NOT LIKE and ESCAPE.
+# `%` is any run of characters, `_` exactly one.  sqr's LIKE compares bytes,
+# so it is case-sensitive (the SQL standard and PostgreSQL; SQLite's LIKE
+# ignores ASCII case, which is why 'al%' finds nothing here).
+
+statement ok
+CREATE TABLE p(id INTEGER, name CHAR(12))
+
+statement ok
+INSERT INTO p VALUES(1, 'Alice')
+
+statement ok
+INSERT INTO p VALUES(2, 'Alan')
+
+statement ok
+INSERT INTO p VALUES(3, 'Bob')
+
+statement ok
+INSERT INTO p VALUES(4, '50%')
+
+statement ok
+INSERT INTO p VALUES(5, 'a_c')
+
+statement ok
+INSERT INTO p VALUES(6, 'abc')
+
+statement ok
+INSERT INTO p (id) VALUES(7)
+
+# Prefix.
+query I nosort
+SELECT id FROM p WHERE name LIKE 'Al%' ORDER BY id
+----
+1
+2
+
+# Case-sensitive: no row.
+query I nosort
+SELECT id FROM p WHERE name LIKE 'al%' ORDER BY id
+----
+
+# Suffix and infix.
+query T rowsort
+SELECT name FROM p WHERE name LIKE '%b%'
+----
+Bob
+abc
+
+# The whole value must match; CHAR padding is not part of it.
+query I nosort
+SELECT id FROM p WHERE name LIKE 'Bob'
+----
+3
+
+# `_` is exactly one character: both 'a_c' and 'abc'.
+query I nosort
+SELECT id FROM p WHERE name LIKE 'a_c' ORDER BY id
+----
+5
+6
+
+query I nosort
+SELECT id FROM p WHERE name LIKE '___' ORDER BY id
+----
+3
+4
+5
+6
+
+# NOT LIKE; the NULL name matches neither LIKE nor NOT LIKE.
+query I nosort
+SELECT id FROM p WHERE name NOT LIKE 'A%' ORDER BY id
+----
+3
+4
+5
+6
+
+query I nosort
+SELECT id FROM p WHERE name LIKE '%' ORDER BY id
+----
+1
+2
+3
+4
+5
+6
+
+# ESCAPE makes a wildcard literal.
+query I nosort
+SELECT id FROM p WHERE name LIKE '%!%' ESCAPE '!'
+----
+4
+
+query I nosort
+SELECT id FROM p WHERE name LIKE 'a!_c' ESCAPE '!'
+----
+5
+
+# Combined with other conditions.
+query I nosort
+SELECT id FROM p WHERE name LIKE 'A%' AND id > 1 OR name LIKE '5%' ORDER BY id
+----
+2
+4
+
+# LIKE needs a character column and a string pattern.
+statement error
+SELECT id FROM p WHERE id LIKE '1%'
+
+statement error
+SELECT id FROM p WHERE name LIKE 5
+
+# The escape character must be followed by %, _ or itself.
+statement error
+SELECT id FROM p WHERE name LIKE 'a!b' ESCAPE '!'
+
+statement error
+SELECT id FROM p WHERE name LIKE 'a' ESCAPE 'xy'

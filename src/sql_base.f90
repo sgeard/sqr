@@ -39,6 +39,10 @@ submodule (sql) sql_base
         signature_t(char(int(z'FF')) // char(int(z'FE')) // '  ',                                 2, SQL_ENC_UTF16_LE),   &
         signature_t(char(int(z'FE')) // char(int(z'FF')) // '  ',                                 2, SQL_ENC_UTF16_BE)    ]
 
+    !! Display names of the aggregates, indexed by `AGG_*`.
+    character(len=5), parameter :: AGG_NAMES(6) = &
+        [character(len=5) :: 'COUNT', 'COUNT', 'MIN', 'MAX', 'SUM', 'AVG']
+
 contains
 
     ! ===== input encoding =====
@@ -117,6 +121,124 @@ contains
         character(len=:), allocatable :: msg
 
         msg = 'unsupported encoding (' // sql_encoding_name(enc) // '); expected ASCII or UTF-8'
+    end function
+
+    ! ===== LIKE =====
+
+    pure module function sql_like(s, pattern, esc) result(yes)
+        character(len=*), intent(in)           :: s
+        character(len=*), intent(in)           :: pattern
+        character(len=1), intent(in), optional :: esc
+        logical                                :: yes
+        if (present(esc)) then
+            yes = like_from(s, pattern, 1, 1, 0, 0, esc, .true.)
+        else
+            yes = like_from(s, pattern, 1, 1, 0, 0, ' ', .false.)
+        end if
+    end function
+
+    ! Match s(i:) against p(j:).  (bi, bj) is the restart point left by the
+    ! last `%`: the pattern position after it and the string position it
+    ! has consumed up to (bj = 0: no `%` seen yet).  A mismatch lets that
+    ! `%` take one more character and tries again, so every call is a tail
+    ! call and nothing is allocated.
+    pure recursive function like_from(s, p, i, j, bi, bj, esc, has_esc) result(yes)
+        character(len=*), intent(in) :: s, p
+        integer,          intent(in) :: i, j, bi, bj
+        character(len=1), intent(in) :: esc
+        logical,          intent(in) :: has_esc
+        logical :: yes
+        integer :: nb
+
+        if (j > len(p)) then
+            if (i > len(s)) then
+                yes = .true.
+                return
+            end if
+        else if (has_esc .and. p(j:j) == esc .and. j < len(p)) then
+            ! escaped: the next pattern byte is literal
+            if (i <= len(s)) then
+                if (s(i:i) == p(j+1:j+1)) then
+                    yes = like_from(s, p, i + 1, j + 2, bi, bj, esc, has_esc)
+                    return
+                end if
+            end if
+        else if (p(j:j) == '%') then
+            if (j == len(p)) then
+                yes = .true.             ! a trailing % takes the rest
+            else
+                yes = like_from(s, p, i, j + 1, i, j + 1, esc, has_esc)
+            end if
+            return
+        else if (i <= len(s)) then
+            if (p(j:j) == '_') then
+                yes = like_from(s, p, i + utf8_width(s, i), j + 1, bi, bj, esc, has_esc)
+                return
+            else if (s(i:i) == p(j:j)) then
+                yes = like_from(s, p, i + 1, j + 1, bi, bj, esc, has_esc)
+                return
+            end if
+        end if
+
+        ! Mismatch: give the last % one more character, if there is one.
+        if (bj == 0 .or. bi > len(s)) then
+            yes = .false.
+        else
+            nb = bi + utf8_width(s, bi)
+            yes = like_from(s, p, nb, bj, nb, bj, esc, has_esc)
+        end if
+    end function
+
+    ! Bytes in the UTF-8 character that starts at s(i:i): a lead byte and
+    ! the continuation bytes (10xxxxxx) it announces, as far as they are
+    ! really there.  Any other byte - ASCII, a stray continuation byte, a
+    ! legacy 8-bit character - is one.
+    pure function utf8_width(s, i) result(w)
+        character(len=*), intent(in) :: s
+        integer,          intent(in) :: i
+        integer :: w, want, b
+        b = iachar(s(i:i))
+        if (b >= int(z'F0')) then
+            want = 4
+        else if (b >= int(z'E0')) then
+            want = 3
+        else if (b >= int(z'C0')) then
+            want = 2
+        else
+            want = 1
+        end if
+        w = 1
+        do while (w < want .and. i + w <= len(s))
+            b = iachar(s(i+w:i+w))
+            if (b < int(z'80') .or. b > int(z'BF')) exit
+            w = w + 1
+        end do
+    end function
+
+    ! Is `p` a well-formed LIKE pattern for escape character `esc`?  The
+    ! escape must be followed by `%`, `_` or itself.
+    pure function like_pattern_ok(p, esc) result(ok)
+        character(len=*), intent(in) :: p
+        character(len=1), intent(in) :: esc
+        logical :: ok
+        integer :: j
+        ok = .true.
+        j = 1
+        do while (j <= len(p))
+            if (p(j:j) == esc) then
+                if (j == len(p)) then
+                    ok = .false.
+                    return
+                end if
+                if (scan(p(j+1:j+1), '%_' // esc) == 0) then
+                    ok = .false.
+                    return
+                end if
+                j = j + 2
+            else
+                j = j + 1
+            end if
+        end do
     end function
 
     ! ===== shared helpers (host-associated by sql_parse / sql_exec) =====

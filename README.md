@@ -255,19 +255,48 @@ INSERT INTO employee VALUES (1,'Alice','eng',55000.0), (2,'Bob','eng',48000.0);
 SELECT name, salary FROM employee WHERE dept = 'eng' ORDER BY salary DESC LIMIT 5;
 UPDATE employee SET salary = 50000.0 WHERE dept = 'sales' AND salary < 50000.0;
 DELETE FROM employee WHERE salary < 40000.0;
+SELECT COUNT(*) AS staff, AVG(salary), MAX(salary) FROM employee WHERE dept IN ('eng', 'ops');
+SELECT name FROM employee WHERE name LIKE 'A%' AND dept NOT IN ('sales');
 ```
 
 The supported subset: DDL (`CREATE`/`DROP TABLE`, `CREATE [UNIQUE] INDEX`,
 `DROP INDEX`, `ALTER TABLE … ADD/DROP COLUMN`), DML (`INSERT`, `DELETE`,
-`UPDATE`), `SELECT col|* … [WHERE][ORDER BY col [ASC|DESC]][LIMIT n]`, and
-`BEGIN`/`COMMIT`/`ROLLBACK`. The `WHERE` predicate combines comparisons
-(`= <> < <= > >=`), `BETWEEN`, and `IS [NOT] NULL` with `AND`/`OR`. Types
-are `INTEGER`/`INT`, `REAL`, `CHAR(n)`, `TEXT`. A single equality on an
-indexed column is driven through the B+-tree; everything else is a scan,
-with the full predicate re-applied either way (identical results). Out of
-scope (kept honest): JOINs, subqueries, aggregates / `GROUP BY`,
-expressions in the projection, and column constraints such as `NOT NULL` —
-the engine has no constraint store.
+`UPDATE`), `SELECT item,…|* … [WHERE][ORDER BY col [ASC|DESC]][LIMIT n]`, and
+`BEGIN`/`COMMIT`/`ROLLBACK`. Types are `INTEGER`/`INT`, `REAL`, `CHAR(n)`,
+`TEXT`.
+
+A projection `item` is a column, a literal or an aggregate, optionally
+renamed with `AS name`:
+
+- **Aggregates** — `COUNT(*)`, `COUNT(col)`, `MIN`, `MAX`, `SUM`, `AVG`.
+  There is no `GROUP BY`, so a projection holding an aggregate returns
+  exactly one row and may hold only aggregates and literals. NULL values are
+  skipped; over no rows `COUNT` is 0 and the others are NULL. `AVG` is always
+  `REAL`; `SUM` has its column's type, and a `SUM` of an `INTEGER` column
+  that leaves the 32-bit range is an error, not a wrapped value.
+- **Literals** — `SELECT 1` needs no table; `SELECT name, 'x' FROM t` gives
+  the literal on every row.
+
+The `WHERE` predicate combines these with `AND`/`OR` (no parentheses):
+
+| Condition | Notes |
+|---|---|
+| `col = <> < <= > >= literal` | |
+| `col [NOT] BETWEEN a AND b` | inclusive |
+| `col [NOT] IN (literal, …)` | a list, not a subquery |
+| `col [NOT] LIKE 'pattern' [ESCAPE 'c']` | `CHAR` columns; `%` is any run of characters, `_` exactly one (one UTF-8 character, not one byte) |
+| `col IS [NOT] NULL` | the only condition a NULL value satisfies |
+
+`LIKE` compares bytes, so it is **case-sensitive**, as in the SQL standard
+and PostgreSQL (SQLite's ignores ASCII case). There is no regular-expression
+operator.
+
+A single comparison or `BETWEEN` on an indexed column is driven through the
+B+-tree; everything else is a scan, with the full predicate re-applied
+either way (identical results). Out of scope (kept honest): JOINs,
+subqueries, `GROUP BY` / `HAVING`, `DISTINCT`, arithmetic in the
+projection, and column constraints such as `NOT NULL` — the engine has no
+constraint store.
 
 ---
 

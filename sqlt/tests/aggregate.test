@@ -1,0 +1,126 @@
+# aggregate.test — COUNT / MIN / MAX / SUM / AVG without GROUP BY.
+# One row always comes back.  NULL values are skipped; over no rows COUNT is
+# 0 and the others are NULL.
+
+statement ok
+CREATE TABLE e(id INTEGER, dept CHAR(8), salary REAL, bonus INTEGER)
+
+# Over an empty table.
+query IIRI nosort
+SELECT COUNT(*), COUNT(id), AVG(salary), MAX(id) FROM e
+----
+0
+0
+NULL
+NULL
+
+statement ok
+INSERT INTO e VALUES(1, 'eng', 55000.0, 10)
+
+statement ok
+INSERT INTO e VALUES(2, 'eng', 48000.0, 20)
+
+statement ok
+INSERT INTO e VALUES(3, 'sales', 39000.0, NULL)
+
+statement ok
+INSERT INTO e (id, dept) VALUES(4, 'sales')
+
+# COUNT(*) counts rows; COUNT(col) counts non-NULL values.
+query III nosort
+SELECT COUNT(*), COUNT(salary), COUNT(bonus) FROM e
+----
+4
+3
+2
+
+query IIII nosort
+SELECT MIN(id), MAX(id), SUM(id), SUM(bonus) FROM e
+----
+1
+4
+10
+30
+
+# AVG is REAL even over an INTEGER column.
+query RR nosort
+SELECT AVG(id), AVG(bonus) FROM e
+----
+2.500
+15.000
+
+query RRR nosort
+SELECT MIN(salary), MAX(salary), SUM(salary) FROM e
+----
+39000.000
+55000.000
+142000.000
+
+query TT nosort
+SELECT MIN(dept), MAX(dept) FROM e
+----
+eng
+sales
+
+# Over a WHERE.
+query IR nosort
+SELECT COUNT(*), AVG(salary) FROM e WHERE dept = 'eng'
+----
+2
+51500.000
+
+query I nosort
+SELECT COUNT(*) FROM e WHERE dept LIKE 's%' AND id IN (3, 4)
+----
+2
+
+# No matching rows.
+query IR nosort
+SELECT COUNT(*), MAX(salary) FROM e WHERE id > 100
+----
+0
+NULL
+
+# Literals may sit beside aggregates.
+query ITI nosort
+SELECT COUNT(*), 'rows', 2 FROM e
+----
+4
+rows
+2
+
+# LIMIT applies to the one row.
+query I nosort
+SELECT COUNT(*) FROM e LIMIT 0
+----
+
+# A bare column beside an aggregate needs GROUP BY, which sqr does not have.
+statement error
+SELECT dept, COUNT(*) FROM e
+
+statement error
+SELECT COUNT(*) FROM e GROUP BY dept
+
+statement error
+SELECT COUNT(*) FROM e ORDER BY id
+
+# SUM and AVG need numbers.
+statement error
+SELECT SUM(dept) FROM e
+
+statement error
+SELECT COUNT(DISTINCT dept) FROM e
+
+# SUM of an INTEGER column that leaves the 32-bit range is an error.
+statement ok
+INSERT INTO e (id, bonus) VALUES(5, 2147483647)
+
+statement error
+SELECT SUM(bonus) FROM e
+
+# The other aggregates are unaffected.
+query II nosort
+SELECT MAX(bonus), COUNT(bonus) FROM e
+----
+2147483647
+3

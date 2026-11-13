@@ -16,17 +16,25 @@ SELECT a FROM no_such_table
 statement error
 SELECT a FROM t3 JOIN t3
 
-# Aggregates are not supported.
+# GROUP BY is not supported (plain aggregates are: see aggregate.test).
 statement error
-SELECT COUNT(*) FROM t3
+SELECT a, COUNT(*) FROM t3 GROUP BY a
+
+# DISTINCT is not supported.
+statement error
+SELECT DISTINCT a FROM t3
 
 # Subqueries are not supported.
 statement error
 SELECT a FROM t3 WHERE a IN (SELECT a FROM t3)
 
-# LIKE is not supported.
+# Arithmetic in the projection is not supported.
 statement error
-SELECT a FROM t3 WHERE b LIKE '2'
+SELECT a + b FROM t3
+
+# There is no regular-expression operator (LIKE is: see like.test).
+statement error
+SELECT a FROM t3 WHERE a REGEXP '2'
 
 # A well-formed statement still succeeds (guards against the harness reporting
 # everything as an error).

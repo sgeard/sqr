@@ -586,6 +586,7 @@ contains
 
         subroutine parse_cond(c)
             type(sql_cond_t), intent(out) :: c
+            logical :: neg
             call take_name(c%col, 'column name')
             if (had_err) return
             if (is_kw(tk(), 'is')) then
@@ -597,19 +598,77 @@ contains
                     c%op = OP_ISNULL
                 end if
                 call eat_kw('null')
-            else if (is_kw(tk(), 'between')) then
+                return
+            end if
+            neg = is_kw(tk(), 'not')
+            if (neg) call adv()
+            if (is_kw(tk(), 'between')) then
                 call adv()
-                c%op = OP_BETWEEN
+                c%op = merge(OP_NOTBETWEEN, OP_BETWEEN, neg)
                 call parse_literal(c%lit)
                 if (had_err) return
                 call eat_kw('and')
                 if (had_err) return
                 call parse_literal(c%lit2)
+            else if (is_kw(tk(), 'like')) then
+                call adv()
+                c%op = merge(OP_NOTLIKE, OP_LIKE, neg)
+                call parse_like(c)
+            else if (is_kw(tk(), 'in')) then
+                call adv()
+                c%op = merge(OP_NOTIN, OP_IN, neg)
+                call parse_in_list(c%lits)
+            else if (neg) then
+                call errf(cur_col(), 'expected between, like or in after not')
             else
                 call parse_compare_op(c%op)
                 if (had_err) return
                 call parse_literal(c%lit)
             end if
+        end subroutine
+
+        ! The rest of `LIKE`: a string pattern, then an optional
+        ! `ESCAPE 'c'` naming a single one-byte character.
+        subroutine parse_like(c)
+            type(sql_cond_t), intent(inout) :: c
+            if (cur_kind() /= TK_STR) then
+                call errf(cur_col(), 'LIKE needs a string pattern')
+                return
+            end if
+            c%lit%ltype = LIT_STR
+            c%lit%sval  = cur_text()
+            call adv()
+            if (.not. is_kw(tk(), 'escape')) return
+            call adv()
+            if (cur_kind() /= TK_STR .or. len(cur_text()) /= 1) then
+                call errf(cur_col(), 'ESCAPE needs a single-character string')
+                return
+            end if
+            c%has_esc = .true.
+            c%esc     = cur_text()
+            call adv()
+        end subroutine
+
+        ! The rest of `IN`: `( literal [, literal]* )`.  A subquery is not
+        ! a literal, so `IN (SELECT …)` fails here.
+        subroutine parse_in_list(lits)
+            type(sql_lit_t), allocatable, intent(out) :: lits(:)
+            type(sql_lit_t), allocatable :: acc(:)
+            type(sql_lit_t) :: lit
+            integer :: n
+            n = 0
+            call eat_punct('(')
+            if (had_err) return
+            do
+                call parse_literal(lit)
+                if (had_err) return
+                call grow_lits(acc, n, lit)
+                if (.not. is_punct(tk(), ',')) exit
+                call adv()
+            end do
+            call eat_punct(')')
+            if (had_err) return
+            lits = acc(1:n)
         end subroutine
 
         subroutine parse_compare_op(op)
@@ -674,23 +733,140 @@ contains
         ! ---- SELECT ----
 
         subroutine parse_select()
-            character(len=SQR_NAME_LEN) :: cols(SQL_MAX_COLS)
-            integer :: nc
             call adv()   ! SELECT
             stmt%kind = ST_SELECT
             if (is_punct(tk(), '*')) then
                 stmt%select_star = .true.
                 call adv()
             else
-                call parse_name_list(cols, nc, 'projection columns')
+                call parse_proj_list()
                 if (had_err) return
-                stmt%names = cols(1:nc)
             end if
-            call eat_kw('from')
-            if (had_err) return
+            if (.not. is_kw(tk(), 'from')) then
+                ! No table: legal only for a projection of literals.
+                if (stmt%select_star) then
+                    call errf(cur_col(), 'expected from')
+                else if (any(stmt%proj%kind /= PROJ_LIT)) then
+                    call errf(cur_col(), 'expected from')
+                end if
+                return
+            end if
+            call adv()
+            stmt%has_from = .true.
             call take_name(stmt%table, 'table name')
             if (had_err) return
             call parse_tail(want_order=.true.)
+        end subroutine
+
+        ! `item [, item]*` into stmt%proj.
+        subroutine parse_proj_list()
+            type(sql_proj_t), allocatable :: acc(:), tmp(:)
+            type(sql_proj_t) :: item
+            integer :: n
+            n = 0
+            allocate(acc(LIST_INIT_CAP))
+            do
+                if (n >= SQL_MAX_COLS) then
+                    call errf(cur_col(), 'too many projection columns')
+                    return
+                end if
+                call parse_proj_item(item)
+                if (had_err) return
+                if (n == size(acc)) then
+                    allocate(tmp(2 * size(acc)))
+                    tmp(1:n) = acc(1:n)
+                    call move_alloc(tmp, acc)
+                end if
+                n = n + 1
+                acc(n) = item
+                if (.not. is_punct(tk(), ',')) exit
+                call adv()
+            end do
+            stmt%proj = acc(1:n)
+        end subroutine
+
+        ! One projection item: a literal, an aggregate (a word followed by
+        ! `(`, so a column may still be called `count`), or a column; then
+        ! an optional `AS name`.
+        subroutine parse_proj_item(item)
+            type(sql_proj_t), intent(out) :: item
+            character(len=SQR_NAME_LEN) :: alias
+            character(len=:), allocatable :: src
+            logical :: is_lit, signed
+
+            signed = is_punct(tk(), '-') .or. is_punct(tk(), '+')
+            is_lit = signed .or. cur_kind() == TK_INT .or. cur_kind() == TK_REAL &
+                     .or. cur_kind() == TK_STR
+            if (is_lit) then
+                src = cur_text()
+                if (signed) then
+                    if (src == '+') src = ''
+                    if (p < ntok) src = src // toks(p + 1)%text
+                end if
+                item%kind = PROJ_LIT
+                call parse_literal(item%lit)
+                if (had_err) return
+                if (item%lit%ltype == LIT_STR) then
+                    item%label = '?column?'
+                else
+                    item%label = src
+                end if
+            else if (is_kw(tk(), 'null')) then
+                call errf(cur_col(), 'NULL is not allowed in the projection')
+                return
+            else if (cur_kind() == TK_IDENT .and. next_is_paren()) then
+                call parse_aggregate(item)
+                if (had_err) return
+            else
+                call take_name(item%col, 'projection columns')
+                if (had_err) return
+                item%kind  = PROJ_COL
+                item%label = item%col
+            end if
+
+            if (is_kw(tk(), 'as')) then
+                call adv()
+                call take_name(alias, 'alias')
+                if (had_err) return
+                item%label = alias
+            end if
+        end subroutine
+
+        ! Is the token after the current one a `(`?
+        function next_is_paren() result(yes)
+            logical :: yes
+            yes = .false.
+            if (p < ntok) yes = is_punct(toks(p + 1), '(')
+        end function
+
+        ! `COUNT(*)` or `fn(column)`; the current token is the function name.
+        subroutine parse_aggregate(item)
+            type(sql_proj_t), intent(inout) :: item
+            character(len=:), allocatable :: fn
+            fn = lower(cur_text())
+            select case (fn)
+            case ('count'); item%agg = AGG_COUNT
+            case ('min');   item%agg = AGG_MIN
+            case ('max');   item%agg = AGG_MAX
+            case ('sum');   item%agg = AGG_SUM
+            case ('avg');   item%agg = AGG_AVG
+            case default
+                call errf(cur_col(), 'unknown function "' // cur_text() // '"')
+                return
+            end select
+            item%kind = PROJ_AGG
+            call adv()
+            call adv()   ! the ( that next_is_paren saw
+            if (item%agg == AGG_COUNT .and. is_punct(tk(), '*')) then
+                call adv()
+                item%agg   = AGG_COUNT_STAR
+                item%label = 'COUNT(*)'
+            else
+                call take_name(item%col, 'column name')
+                if (had_err) return
+                item%label = trim(AGG_NAMES(item%agg)) // '(' // trim(item%col) // ')'
+            end if
+            call eat_punct(')')
         end subroutine
 
         ! ---- INSERT ----

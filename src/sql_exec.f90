@@ -10,7 +10,13 @@
 !! predicate is re-evaluated on every gathered row, so an index-driven plan
 !! and a scan plan always yield identical results — the open half of an
 !! exclusive bound (`<`, `>`) is included in the band and filtered by that
-!! re-evaluation, so no key arithmetic is needed.
+!! re-evaluation, so no key arithmetic is needed.  `LIKE`, `IN` and the
+!! `NOT` forms are always scans.
+!!
+!! A SELECT takes one of three shapes (`exec_select`): literals with no
+!! table (`select_const`), one output row per matching row (`select_rows`),
+!! or a single row of aggregates folded over the matching rows
+!! (`select_aggregate`).
 
 submodule (sql:sql_base) sql_executor
     use, intrinsic :: ieee_arithmetic, only: ieee_value, &
@@ -81,6 +87,12 @@ contains
             call exec_txn(db, stmt, res, stat, errmsg)
             return
         end select
+
+        ! Nor does a SELECT of literals with no table.
+        if (stmt%kind == ST_SELECT .and. .not. stmt%has_from) then
+            call select_const(stmt, res, bmode, stat, errmsg)
+            return
+        end if
 
         if (.not. db%opened) then
             call set_err(stat, errmsg, SQR_INVALID, 'no database open')
@@ -450,20 +462,25 @@ contains
         integer,            intent(out),  optional :: stat
         character(len=*),   intent(inout), optional :: errmsg
         type(row_match_ctx_t) :: g
-        integer :: ti, rs, nproj, j, i, oc, nout
-        integer, allocatable :: proj(:), perm(:)
+        integer :: ti, rs, oc
+        integer, allocatable :: ords(:)
+        type(sql_proj_t), allocatable :: items(:)
         type(column_t), allocatable :: cols(:)
+        logical :: has_agg
 
         ti = require_table(db, stmt%table, stat, errmsg)
         if (ti == 0) return
         call db_describe(db, trim(stmt%table), cols)
         if (.not. validate_where(cols, stmt, stat, errmsg)) return
-        if (.not. validate_projection(cols, stmt, proj, stat, errmsg)) return
-        nproj = size(proj)
+        if (.not. resolve_projection(cols, stmt, items, ords, has_agg, stat, errmsg)) return
 
         ! ORDER BY column (must exist and be sortable).
         oc = 0
         if (stmt%has_order) then
+            if (has_agg) then
+                call set_err(stat, errmsg, SQR_INVALID, 'ORDER BY is not allowed with an aggregate')
+                return
+            end if
             oc = col_index(cols, trim(stmt%order_col))
             if (oc == 0) then
                 call set_err(stat, errmsg, SQR_INVALID, 'no such column: ' // trim(stmt%order_col))
@@ -478,32 +495,227 @@ contains
         call gather(db, stmt, g, rs, errmsg)
         if (rs /= SQR_OK) then; if (present(stat)) stat = rs; return; end if
 
-        ! Order the gathered rows.
+        call describe_result(cols, items, ords, res)
+        if (has_agg) then
+            call select_aggregate(stmt, g, items, ords, binary, res, stat, errmsg)
+        else
+            call select_rows(db, stmt, g, items, ords, oc, binary, res)
+        end if
+    end subroutine
+
+    ! One output row per gathered row, ordered and limited.
+    subroutine select_rows(db, stmt, g, items, ords, oc, binary, res)
+        type(db_t),            intent(inout), target :: db
+        type(sql_stmt_t),      intent(in)    :: stmt
+        type(row_match_ctx_t), intent(in)    :: g
+        type(sql_proj_t),      intent(in)    :: items(:)
+        integer,               intent(in)    :: ords(:)
+        integer,               intent(in)    :: oc
+        logical,               intent(in)    :: binary
+        type(sql_result_t),    intent(inout) :: res
+        integer, allocatable :: perm(:)
+        integer :: i, j, nout
+
         allocate(perm(g%n))
         perm = [(i, i = 1, g%n)]
         if (stmt%has_order .and. g%n > 1) call order_rows(g, oc, stmt%order_desc, perm)
 
-        ! Apply LIMIT.
         nout = g%n
         if (stmt%has_limit) nout = min(nout, stmt%limit_n)
 
-        ! Build the result grid.
-        res%kind  = SQLRES_ROWS
         res%nrows = nout
-        res%ncols = nproj
-        allocate(res%colnames(nproj))
-        do j = 1, nproj
-            res%colnames(j) = cols(proj(j))%name
-        end do
-        res%coltypes = cols(proj)%dtype
-        res%colsizes = cols(proj)%csize
-        allocate(res%cells(nout, nproj))
+        allocate(res%cells(nout, res%ncols))
         do i = 1, nout
-            do j = 1, nproj
-                call render_cell(db, trim(stmt%table), cols(proj(j)), &
-                                 g%rids(perm(i)), g%bufs(perm(i)), binary, res%cells(i, j))
+            do j = 1, res%ncols
+                if (items(j)%kind == PROJ_LIT) then
+                    call cell_lit(items(j)%lit, binary, res%cells(i, j))
+                else
+                    call render_cell(db, trim(stmt%table), g%cols(ords(j)), &
+                                     g%rids(perm(i)), g%bufs(perm(i)), binary, res%cells(i, j))
+                end if
             end do
         end do
+    end subroutine
+
+    ! One row of aggregates (and literals) folded over the gathered rows.
+    subroutine select_aggregate(stmt, g, items, ords, binary, res, stat, errmsg)
+        type(sql_stmt_t),      intent(in)    :: stmt
+        type(row_match_ctx_t), intent(in)    :: g
+        type(sql_proj_t),      intent(in)    :: items(:)
+        integer,               intent(in)    :: ords(:)
+        logical,               intent(in)    :: binary
+        type(sql_result_t),    intent(inout) :: res
+        integer,               intent(out),  optional :: stat
+        character(len=*),      intent(inout), optional :: errmsg
+        type(sql_cell_t), allocatable :: row(:)
+        integer :: j
+        logical :: ok
+
+        allocate(row(res%ncols))
+        do j = 1, res%ncols
+            if (items(j)%kind == PROJ_LIT) then
+                call cell_lit(items(j)%lit, binary, row(j))
+            else
+                call agg_cell(g, items(j), ords(j), binary, row(j), ok)
+                if (.not. ok) then
+                    call set_err(stat, errmsg, SQR_INVALID, &
+                        'integer overflow in ' // trim(items(j)%label))
+                    return
+                end if
+            end if
+        end do
+
+        res%nrows = 1
+        if (stmt%has_limit) res%nrows = min(1, stmt%limit_n)
+        allocate(res%cells(res%nrows, res%ncols))
+        if (res%nrows == 1) res%cells(1, :) = row
+    end subroutine
+
+    ! SELECT of literals with no table: one row, no database needed.
+    subroutine select_const(stmt, res, binary, stat, errmsg)
+        type(sql_stmt_t),   intent(in)    :: stmt
+        type(sql_result_t), intent(out)   :: res
+        logical,            intent(in)    :: binary
+        integer,            intent(out),  optional :: stat
+        character(len=*),   intent(inout), optional :: errmsg
+        type(column_t) :: nocols(0)
+        integer :: j
+
+        if (stmt%select_star .or. .not. allocated(stmt%proj)) then
+            call set_err(stat, errmsg, SQR_INVALID, 'SELECT without FROM takes literals only')
+            return
+        end if
+        if (any(stmt%proj%kind /= PROJ_LIT)) then
+            call set_err(stat, errmsg, SQR_INVALID, 'SELECT without FROM takes literals only')
+            return
+        end if
+        call describe_result(nocols, stmt%proj, [(0, j = 1, size(stmt%proj))], res)
+        res%nrows = 1
+        allocate(res%cells(1, res%ncols))
+        do j = 1, res%ncols
+            call cell_lit(stmt%proj(j)%lit, binary, res%cells(1, j))
+        end do
+    end subroutine
+
+    ! Fill a ROWS result's column metadata (name, type, size) from the
+    ! resolved projection.  `ords(j)` is the table column behind item j
+    ! (0 for a literal or COUNT(*)).
+    subroutine describe_result(cols, items, ords, res)
+        type(column_t),     intent(in)    :: cols(:)
+        type(sql_proj_t),   intent(in)    :: items(:)
+        integer,            intent(in)    :: ords(:)
+        type(sql_result_t), intent(inout) :: res
+        integer :: j, n
+
+        n = size(items)
+        res%kind  = SQLRES_ROWS
+        res%ncols = n
+        allocate(res%colnames(n), res%coltypes(n), res%colsizes(n))
+        do j = 1, n
+            res%colnames(j) = items(j)%label
+            res%coltypes(j) = DT_INT
+            res%colsizes(j) = SQR_INT_SIZE          ! COUNT, an integer literal
+            select case (items(j)%kind)
+            case (PROJ_COL)
+                res%coltypes(j) = cols(ords(j))%dtype
+                res%colsizes(j) = cols(ords(j))%csize
+            case (PROJ_LIT)
+                select case (items(j)%lit%ltype)
+                case (LIT_REAL)
+                    res%coltypes(j) = DT_REAL
+                    res%colsizes(j) = SQR_REAL_SIZE
+                case (LIT_STR)
+                    res%coltypes(j) = DT_CHAR
+                    res%colsizes(j) = max(1, len(items(j)%lit%sval))
+                end select
+            case (PROJ_AGG)
+                select case (items(j)%agg)
+                case (AGG_MIN, AGG_MAX, AGG_SUM)
+                    res%coltypes(j) = cols(ords(j))%dtype
+                    res%colsizes(j) = cols(ords(j))%csize
+                case (AGG_AVG)
+                    res%coltypes(j) = DT_REAL
+                    res%colsizes(j) = SQR_REAL_SIZE
+                end select
+            end select
+        end do
+    end subroutine
+
+    ! Fold one aggregate over the gathered rows into a result cell.  NULL
+    ! values are skipped; with nothing to fold, COUNT is 0 and the others
+    ! are NULL.  `ok` is false only for a SUM of an INT column whose total
+    ! does not fit the column's type.
+    subroutine agg_cell(g, item, oc, binary, cell, ok)
+        type(row_match_ctx_t), intent(in)  :: g
+        type(sql_proj_t),      intent(in)  :: item
+        integer,               intent(in)  :: oc
+        logical,               intent(in)  :: binary
+        type(sql_cell_t),      intent(out) :: cell
+        logical,               intent(out) :: ok
+        integer :: i, cnt, best
+        integer(int64) :: isum
+        real(real64)   :: rsum
+
+        ok = .true.
+        if (item%agg == AGG_COUNT_STAR) then
+            call cell_int(int(g%n, int32), binary, cell)
+            return
+        end if
+
+        associate (col => g%cols(oc))
+            cnt = 0;  best = 0;  isum = 0_int64;  rsum = 0.0_real64
+            rows: do i = 1, g%n
+                if (row_is_null(g%bufs(i), col)) cycle rows
+                cnt = cnt + 1
+                select case (item%agg)
+                case (AGG_SUM, AGG_AVG)
+                    if (col%dtype == DT_INT) then
+                        isum = isum + int(row_get_int(g%bufs(i), col), int64)
+                    else
+                        rsum = rsum + row_get_real(g%bufs(i), col)
+                    end if
+                case (AGG_MIN)
+                    if (best == 0) then
+                        best = i
+                    else if (cmp_rows(g, oc, i, best) < 0) then
+                        best = i
+                    end if
+                case (AGG_MAX)
+                    if (best == 0) then
+                        best = i
+                    else if (cmp_rows(g, oc, i, best) > 0) then
+                        best = i
+                    end if
+                end select
+            end do rows
+
+            if (item%agg == AGG_COUNT) then
+                call cell_int(int(cnt, int32), binary, cell)
+            else if (cnt == 0) then
+                call cell_null(binary, cell)
+            else
+                select case (item%agg)
+                case (AGG_MIN, AGG_MAX)
+                    select case (col%dtype)
+                    case (DT_INT);  call cell_int(row_get_int(g%bufs(best), col), binary, cell)
+                    case (DT_REAL); call cell_real(row_get_real(g%bufs(best), col), binary, cell)
+                    case default;   cell%text = trim(row_get_char(g%bufs(best), col))
+                    end select
+                case (AGG_SUM)
+                    if (col%dtype == DT_REAL) then
+                        call cell_real(rsum, binary, cell)
+                    else if (isum > int(huge(0_int32), int64) .or. &
+                             isum < -int(huge(0_int32), int64) - 1_int64) then
+                        ok = .false.
+                    else
+                        call cell_int(int(isum, int32), binary, cell)
+                    end if
+                case (AGG_AVG)
+                    if (col%dtype == DT_INT) rsum = real(isum, real64)
+                    call cell_real(rsum / real(cnt, real64), binary, cell)
+                end select
+            end if
+        end associate
     end subroutine
 
     ! ===================== row gathering (index or scan) =====================
@@ -804,6 +1016,10 @@ contains
                 case (OP_GT);      yes = v >  lit_num(c%lit)
                 case (OP_GE);      yes = v >= lit_num(c%lit)
                 case (OP_BETWEEN); yes = v >= lit_num(c%lit) .and. v <= lit_num(c%lit2)
+                case (OP_NOTBETWEEN)
+                    yes = .not. (v >= lit_num(c%lit) .and. v <= lit_num(c%lit2))
+                case (OP_IN);      yes = any(v == lit_num(c%lits))
+                case (OP_NOTIN);   yes = all(v /= lit_num(c%lits))
                 end select
             case (DT_CHAR)
                 clen = char_cell(buf, col)
@@ -816,10 +1032,44 @@ contains
                     case (OP_GT);      yes = s >  c%lit%sval
                     case (OP_GE);      yes = s >= c%lit%sval
                     case (OP_BETWEEN); yes = s >= c%lit%sval .and. s <= c%lit2%sval
+                    case (OP_NOTBETWEEN)
+                        yes = .not. (s >= c%lit%sval .and. s <= c%lit2%sval)
+                    case (OP_LIKE);    yes = like_cond(s, c)
+                    case (OP_NOTLIKE); yes = .not. like_cond(s, c)
+                    case (OP_IN);      yes = in_strings(s, c%lits)
+                    case (OP_NOTIN);   yes = .not. in_strings(s, c%lits)
                     end select
                 end associate
             end select
         end associate
+    end function
+
+    ! LIKE for one condition: the pattern in c%lit, with its escape if any.
+    pure function like_cond(s, c) result(yes)
+        character(len=*), intent(in) :: s
+        type(sql_cond_t), intent(in) :: c
+        logical :: yes
+        if (c%has_esc) then
+            yes = sql_like(s, c%lit%sval, c%esc)
+        else
+            yes = sql_like(s, c%lit%sval)
+        end if
+    end function
+
+    ! Is `s` equal to one of the string literals?  (Fortran's comparison
+    ! ignores trailing blanks, as `=` on a CHAR column does.)
+    pure function in_strings(s, lits) result(yes)
+        character(len=*), intent(in) :: s
+        type(sql_lit_t),  intent(in) :: lits(:)
+        logical :: yes
+        integer :: k
+        yes = .false.
+        do k = 1, size(lits)
+            if (s == lits(k)%sval) then
+                yes = .true.
+                return
+            end if
+        end do
     end function
 
     ! ===================== validation =====================
@@ -853,7 +1103,7 @@ contains
         integer,          intent(out),  optional :: stat
         character(len=*), intent(inout), optional :: errmsg
         logical :: ok
-        integer :: ci
+        integer :: ci, k
         ok = .false.
         ci = col_index(cols, trim(c%col))
         if (ci == 0) then
@@ -871,10 +1121,30 @@ contains
                     'cannot compare TEXT column "' // trim(c%col) // '" (only IS [NOT] NULL)')
                 return
             end if
-            if (.not. lit_ok_for(col%dtype, c%lit, c%col, stat, errmsg)) return
-            if (c%op == OP_BETWEEN) then
-                if (.not. lit_ok_for(col%dtype, c%lit2, c%col, stat, errmsg)) return
-            end if
+            select case (c%op)
+            case (OP_IN, OP_NOTIN)
+                do k = 1, size(c%lits)
+                    if (.not. lit_ok_for(col%dtype, c%lits(k), c%col, stat, errmsg)) return
+                end do
+            case (OP_LIKE, OP_NOTLIKE)
+                if (col%dtype /= DT_CHAR) then
+                    call set_err(stat, errmsg, SQR_INVALID, &
+                        'LIKE needs a character column, "' // trim(c%col) // '" is numeric')
+                    return
+                end if
+                if (c%has_esc) then
+                    if (.not. like_pattern_ok(c%lit%sval, c%esc)) then
+                        call set_err(stat, errmsg, SQR_INVALID, &
+                            'LIKE pattern: the escape character must be followed by %, _ or itself')
+                        return
+                    end if
+                end if
+            case default
+                if (.not. lit_ok_for(col%dtype, c%lit, c%col, stat, errmsg)) return
+                if (c%op == OP_BETWEEN .or. c%op == OP_NOTBETWEEN) then
+                    if (.not. lit_ok_for(col%dtype, c%lit2, c%col, stat, errmsg)) return
+                end if
+            end select
         end associate
         ok = .true.
     end function
@@ -910,28 +1180,71 @@ contains
         ok = .true.
     end function
 
-    function validate_projection(cols, stmt, proj, stat, errmsg) result(ok)
-        type(column_t),      intent(in)  :: cols(:)
-        type(sql_stmt_t),    intent(in)  :: stmt
-        integer, allocatable, intent(out) :: proj(:)
-        integer,             intent(out),  optional :: stat
-        character(len=*),    intent(inout), optional :: errmsg
+    ! Resolve a SELECT's projection against the table: `items` is the
+    ! projection with `*` expanded, `ords(j)` the table column behind item
+    ! j (0 for a literal or COUNT(*)), `has_agg` whether it aggregates.
+    ! Checks that columns exist, that each aggregate suits its column's
+    ! type, and that no bare column sits beside an aggregate.
+    function resolve_projection(cols, stmt, items, ords, has_agg, stat, errmsg) result(ok)
+        type(column_t),                intent(in)  :: cols(:)
+        type(sql_stmt_t),              intent(in)  :: stmt
+        type(sql_proj_t), allocatable, intent(out) :: items(:)
+        integer, allocatable,          intent(out) :: ords(:)
+        logical,                       intent(out) :: has_agg
+        integer,                       intent(out),  optional :: stat
+        character(len=*),              intent(inout), optional :: errmsg
         logical :: ok
         integer :: j, ci
+
         ok = .false.
+        has_agg = .false.
         if (stmt%select_star) then
-            proj = [(j, j = 1, size(cols))]
+            allocate(items(size(cols)))
+            items%kind  = PROJ_COL
+            items%col   = cols%name
+            items%label = cols%name
+            ords = [(j, j = 1, size(cols))]
             ok = .true.
             return
         end if
-        allocate(proj(size(stmt%names)))
-        do j = 1, size(stmt%names)
-            ci = col_index(cols, trim(stmt%names(j)))
-            if (ci == 0) then
-                call set_err(stat, errmsg, SQR_INVALID, 'no such column: ' // trim(stmt%names(j)))
-                return
-            end if
-            proj(j) = ci
+
+        items = stmt%proj
+        allocate(ords(size(items)), source=0)
+        has_agg = any(items%kind == PROJ_AGG)
+        do j = 1, size(items)
+            associate (it => items(j))
+                if (it%kind == PROJ_LIT) cycle
+                if (it%kind == PROJ_AGG .and. it%agg == AGG_COUNT_STAR) cycle
+                ci = col_index(cols, trim(it%col))
+                if (ci == 0) then
+                    call set_err(stat, errmsg, SQR_INVALID, 'no such column: ' // trim(it%col))
+                    return
+                end if
+                ords(j) = ci
+                if (it%kind == PROJ_COL) then
+                    if (has_agg) then
+                        call set_err(stat, errmsg, SQR_INVALID, &
+                            'column "' // trim(it%col) // '" must appear in an aggregate')
+                        return
+                    end if
+                    cycle
+                end if
+                select case (it%agg)
+                case (AGG_SUM, AGG_AVG)
+                    if (cols(ci)%dtype /= DT_INT .and. cols(ci)%dtype /= DT_REAL) then
+                        call set_err(stat, errmsg, SQR_INVALID, &
+                            trim(AGG_NAMES(it%agg)) // ' needs a numeric column, "' &
+                            // trim(it%col) // '" is not')
+                        return
+                    end if
+                case (AGG_MIN, AGG_MAX)
+                    if (cols(ci)%dtype == DT_TEXT) then
+                        call set_err(stat, errmsg, SQR_INVALID, &
+                            trim(AGG_NAMES(it%agg)) // ' cannot take a TEXT column')
+                        return
+                    end if
+                end select
+            end associate
         end do
         ok = .true.
     end function
@@ -962,7 +1275,7 @@ contains
         end do
     end function
 
-    pure function lit_num(lit) result(x)
+    pure elemental function lit_num(lit) result(x)
         type(sql_lit_t), intent(in) :: lit
         real(real64) :: x
         if (lit%ltype == LIT_INT) then
@@ -1035,39 +1348,76 @@ contains
         character(len=*), intent(in)    :: buf
         logical,          intent(in)    :: binary
         type(sql_cell_t), intent(out)   :: cell
-        character(len=NUM_TEXT_LEN) :: nb
-        character(len=I32_BYTES) :: b4
-        character(len=R64_BYTES) :: b8
         integer :: rs
         if (row_is_null(buf, col)) then
-            cell%is_null = .true.
-            if (binary) then
-                cell%text = ''
-            else
-                cell%text = 'NULL'
-            end if
+            call cell_null(binary, cell)
             return
         end if
         select case (col%dtype)
         case (DT_INT)
-            if (binary) then
-                cell%text = transfer(row_get_int(buf, col), b4)
-            else
-                write(nb, '(i0)') row_get_int(buf, col)
-                cell%text = trim(nb)
-            end if
+            call cell_int(row_get_int(buf, col), binary, cell)
         case (DT_REAL)
-            if (binary) then
-                cell%text = transfer(row_get_real(buf, col), b8)
-            else
-                write(nb, '(es15.8)') row_get_real(buf, col)
-                cell%text = trim(adjustl(nb))
-            end if
+            call cell_real(row_get_real(buf, col), binary, cell)
         case (DT_CHAR)
             cell%text = trim(row_get_char(buf, col))
         case (DT_TEXT)
             call db_get_text(db, tname, rid, trim(col%name), cell%text, rs)
             if (rs /= SQR_OK .or. .not. allocated(cell%text)) cell%text = ''
+        end select
+    end subroutine
+
+    ! The cell makers below give every source of a value - a stored column,
+    ! a literal, an aggregate - the same text and binary forms.
+
+    pure subroutine cell_null(binary, cell)
+        logical,          intent(in)  :: binary
+        type(sql_cell_t), intent(out) :: cell
+        cell%is_null = .true.
+        if (binary) then
+            cell%text = ''
+        else
+            cell%text = 'NULL'
+        end if
+    end subroutine
+
+    subroutine cell_int(v, binary, cell)
+        integer(int32),   intent(in)  :: v
+        logical,          intent(in)  :: binary
+        type(sql_cell_t), intent(out) :: cell
+        character(len=NUM_TEXT_LEN) :: nb
+        character(len=I32_BYTES) :: b4
+        if (binary) then
+            cell%text = transfer(v, b4)
+        else
+            write(nb, '(i0)') v
+            cell%text = trim(nb)
+        end if
+    end subroutine
+
+    subroutine cell_real(v, binary, cell)
+        real(real64),     intent(in)  :: v
+        logical,          intent(in)  :: binary
+        type(sql_cell_t), intent(out) :: cell
+        character(len=NUM_TEXT_LEN) :: nb
+        character(len=R64_BYTES) :: b8
+        if (binary) then
+            cell%text = transfer(v, b8)
+        else
+            write(nb, '(es15.8)') v
+            cell%text = trim(adjustl(nb))
+        end if
+    end subroutine
+
+    ! A projection literal (never NULL: the parser refuses it).
+    subroutine cell_lit(lit, binary, cell)
+        type(sql_lit_t),  intent(in)  :: lit
+        logical,          intent(in)  :: binary
+        type(sql_cell_t), intent(out) :: cell
+        select case (lit%ltype)
+        case (LIT_INT);  call cell_int(lit%ival, binary, cell)
+        case (LIT_REAL); call cell_real(lit%rval, binary, cell)
+        case (LIT_STR);  cell%text = lit%sval
+        case default;    call cell_null(binary, cell)
         end select
     end subroutine
 

@@ -15,18 +15,26 @@
 !!     Types: `INTEGER`/`INT`, `REAL`, `CHAR(n)`, `TEXT`.
 !!   * **DML** — `INSERT INTO t [(cols)] VALUES (…)[, (…)]`,
 !!     `DELETE FROM t [WHERE …]`, `UPDATE t SET col=val[,…] [WHERE …]`.
-!!   * **Query** — `SELECT col[,…|*] FROM t [WHERE pred]
-!!     [ORDER BY col [ASC|DESC]] [LIMIT n]`.
+!!   * **Query** — `SELECT item[,…]|* FROM t [WHERE pred]
+!!     [ORDER BY col [ASC|DESC]] [LIMIT n]`, where an `item` is a column, a
+!!     literal or an aggregate, optionally followed by `AS name`.  The
+!!     aggregates are `COUNT(*)`, `COUNT(col)`, `MIN(col)`, `MAX(col)`,
+!!     `SUM(col)` and `AVG(col)`; a projection that holds one returns a
+!!     single row and may hold only aggregates and literals.  `SELECT` of
+!!     literals alone needs no `FROM`.
 !!   * **Transactions** — `BEGIN`, `COMMIT`, `ROLLBACK`.
 !!
-!! `pred` is `col {= <> < <= > >=} literal`, `col BETWEEN a AND b`,
+!! `pred` is `col {= <> < <= > >=} literal`, `col [NOT] BETWEEN a AND b`,
+!! `col [NOT] LIKE pattern [ESCAPE c]`, `col [NOT] IN (literal, …)`,
 !! `col IS [NOT] NULL`, combined with `AND` / `OR` (AND binds tighter; no
-!! parentheses in this subset).
+!! parentheses in this subset).  `LIKE` compares bytes (it is
+!! case-sensitive): `%` matches any run of characters, `_` exactly one
+!! UTF-8 character.  A NULL value satisfies no condition but `IS NULL`.
 !!
 !! ## Deliberately out of scope (kept honest, same spirit as the ROADMAP)
 !!
-!! JOINs / multiple tables, subqueries, aggregates / `GROUP BY` / `HAVING`,
-!! expressions in the projection, views, foreign keys / `CHECK`, and column
+!! JOINs / multiple tables, subqueries, `GROUP BY` / `HAVING`, `DISTINCT`,
+!! arithmetic in the projection, views, foreign keys / `CHECK`, and column
 !! constraints such as `NOT NULL` (the engine has no constraint store — every
 !! column is nullable).  Keywords are case-insensitive; identifiers (table and
 !! column names) are case-sensitive, matching the engine's byte-exact names.
@@ -82,14 +90,23 @@ module sql
     integer, parameter, public :: OP_BETWEEN   = 7  !! `BETWEEN a AND b`
     integer, parameter, public :: OP_ISNULL    = 8  !! `IS NULL`
     integer, parameter, public :: OP_ISNOTNULL = 9  !! `IS NOT NULL`
+    integer, parameter, public :: OP_NOTBETWEEN = 10  !! `NOT BETWEEN a AND b`
+    integer, parameter, public :: OP_LIKE       = 11  !! `LIKE pattern`
+    integer, parameter, public :: OP_NOTLIKE    = 12  !! `NOT LIKE pattern`
+    integer, parameter, public :: OP_IN         = 13  !! `IN (literal, …)`
+    integer, parameter, public :: OP_NOTIN      = 14  !! `NOT IN (literal, …)`
 
-    !! One predicate condition: a column compared to one literal (`lit`), or a
-    !! `BETWEEN` band (`lit`..`lit2`), or a null test (no literal).
+    !! One predicate condition: a column compared to one literal (`lit`), a
+    !! `BETWEEN` band (`lit`..`lit2`), a `LIKE` pattern (`lit`, with `esc`),
+    !! an `IN` list (`lits`), or a null test (no literal).
     type, public :: sql_cond_t
         character(len=SQR_NAME_LEN) :: col = ''
         integer          :: op = 0
         type(sql_lit_t)  :: lit
         type(sql_lit_t)  :: lit2     !! BETWEEN upper bound only
+        type(sql_lit_t), allocatable :: lits(:)  !! IN list only
+        logical          :: has_esc = .false.    !! LIKE: an ESCAPE character was given
+        character(len=1) :: esc = ' '            !! LIKE: that character
         integer          :: col_ord = 0  !! Cached column ordinal in the target table (0 = unresolved); filled once per statement so per-row evaluation skips the name lookup
     end type
 
@@ -98,6 +115,35 @@ module sql
     !! *some* group (disjunctive normal form — no parentheses needed).
     type, public :: sql_cond_group_t
         type(sql_cond_t), allocatable :: conds(:)
+    end type
+
+    ! --- SELECT projection items ---
+    integer, parameter, public :: PROJ_COL = 1  !! A column
+    integer, parameter, public :: PROJ_LIT = 2  !! A literal
+    integer, parameter, public :: PROJ_AGG = 3  !! An aggregate
+
+    integer, parameter, public :: AGG_COUNT_STAR = 1  !! `COUNT(*)`
+    integer, parameter, public :: AGG_COUNT      = 2  !! `COUNT(col)`
+    integer, parameter, public :: AGG_MIN        = 3  !! `MIN(col)`
+    integer, parameter, public :: AGG_MAX        = 4  !! `MAX(col)`
+    integer, parameter, public :: AGG_SUM        = 5  !! `SUM(col)`
+    integer, parameter, public :: AGG_AVG        = 6  !! `AVG(col)`
+
+    !! Length of a result-column label: long enough for an aggregate over a
+    !! column whose name is `SQR_NAME_LEN` bytes (`COUNT(` + name + `)`).
+    integer, parameter, public :: SQL_LABEL_LEN = SQR_NAME_LEN + 8
+
+    !! One SELECT projection item, tagged by `kind` (the same fat-record
+    !! style as `sql_stmt_t`).  `label` names the result column: the `AS`
+    !! alias if one was given, otherwise the column name, the aggregate in
+    !! canonical form (`MAX(salary)`), a numeric literal's source text, or
+    !! `?column?` for a string literal.
+    type, public :: sql_proj_t
+        integer :: kind = PROJ_COL
+        character(len=SQR_NAME_LEN)  :: col = ''   !! `PROJ_COL`, and the argument of a `PROJ_AGG`
+        type(sql_lit_t)              :: lit        !! `PROJ_LIT`
+        integer                      :: agg = 0    !! `PROJ_AGG`: one of `AGG_*`
+        character(len=SQL_LABEL_LEN) :: label = '' !! Result-column name
     end type
 
     ! --- Statement kinds ---
@@ -128,9 +174,14 @@ module sql
         type(column_t), allocatable :: coldefs(:)
 
         ! Generic ordered name list: INSERT target columns, index members,
-        ! SELECT projection columns, ALTER DROP COLUMN target.
+        ! ALTER DROP COLUMN target.
         character(len=SQR_NAME_LEN), allocatable :: names(:)
+
+        ! SELECT projection: `proj` unless `select_star`.  `has_from` is
+        ! false for a SELECT of literals with no table.
+        type(sql_proj_t), allocatable :: proj(:)
         logical :: select_star = .false.   !! SELECT *
+        logical :: has_from    = .false.   !! SELECT … FROM table
         logical :: unique      = .false.   !! CREATE UNIQUE INDEX
 
         ! INSERT values: (nrows, ncols) grid of literals.  `ncols` matches
@@ -173,7 +224,7 @@ module sql
     !! rather than scraped from text.
     type, public :: sql_result_t
         integer :: kind = SQLRES_NONE
-        character(len=SQR_NAME_LEN), allocatable :: colnames(:)
+        character(len=SQL_LABEL_LEN), allocatable :: colnames(:)
         integer,                     allocatable :: coltypes(:)  !! Per output column: `DT_INT`/`DT_REAL`/`DT_CHAR`/`DT_TEXT`
         integer,                     allocatable :: colsizes(:)  !! Per output column: declared `csize` in bytes
         type(sql_cell_t),            allocatable :: cells(:,:)
@@ -215,6 +266,7 @@ module sql
     public :: sql_encoding_name      !! encoding -> display name
     public :: sql_encoding_supported !! encoding -> can sqr read it?
     public :: sql_encoding_message   !! refused encoding -> the message to show
+    public :: sql_like     !! does a string match a LIKE pattern?
     public :: sql_lex      !! source line  -> token stream
     public :: sql_parse    !! source line  -> one statement AST
     public :: sql_exec     !! statement AST -> result (drives the engine)
@@ -275,6 +327,20 @@ module sql
         pure module function sql_encoding_message(enc) result(msg)
             integer, intent(in)           :: enc
             character(len=:), allocatable :: msg
+        end function
+
+        !! Does `s` match the SQL `LIKE` pattern `pattern`?  `%` matches any
+        !! run of characters (including none) and `_` exactly one UTF-8
+        !! character: a lead byte with the continuation bytes that follow
+        !! it; a byte that is not part of a valid sequence counts as one
+        !! character.  Everything else matches itself, byte for byte, so the
+        !! test is case-sensitive.  With `esc`, that character makes the
+        !! `%`, `_` or `esc` after it literal.
+        pure module function sql_like(s, pattern, esc) result(yes)
+            character(len=*), intent(in)           :: s        !! The value
+            character(len=*), intent(in)           :: pattern  !! The pattern
+            character(len=1), intent(in), optional :: esc      !! Escape character
+            logical                                :: yes
         end function
 
         !! Tokenise one source line.  Always succeeds for well-formed tokens;

@@ -64,7 +64,8 @@ query <types> [nosort|rowsort|valuesort] [label]
 
 ## Scope / limitations
 
-- sqr's subset has **no JOIN, aggregates/GROUP BY, subqueries, LIKE or IN**, and
+- sqr's subset has **no JOIN, GROUP BY, subqueries, DISTINCT or projection
+  arithmetic**, its `LIKE` is case-sensitive (SQLite's is not), and it
   is **statically typed per column** (not SQLite's dynamic type affinity). The
   great majority of the upstream corpus exercises exactly those features, so
   porting is a matter of **filtering to the supported subset**, not bulk import.
@@ -81,4 +82,8 @@ query <types> [nosort|rowsort|valuesort] [label]
 - `run_sqlt.tcl` — the harness.
 - `tests/select1.test` — projection, WHERE, ORDER BY, LIMIT, rowsort.
 - `tests/where_null.test` — NULL, `IS [NOT] NULL`, `BETWEEN`, `(empty)`.
+- `tests/like.test` — `LIKE`, `NOT LIKE`, `ESCAPE`.
+- `tests/in.test` — `IN (list)`, `NOT IN`, `NOT BETWEEN`.
+- `tests/aggregate.test` — `COUNT` / `MIN` / `MAX` / `SUM` / `AVG`.
+- `tests/const.test` — literals in the projection, `AS` aliases.
 - `tests/errors.test` — statements the subset rejects (boundary documentation).
