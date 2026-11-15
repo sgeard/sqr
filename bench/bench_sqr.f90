@@ -30,6 +30,8 @@ program bench_sqr
     ! Tunable problem sizes.
     integer, parameter :: SCALE_N(4) = [2000, 4000, 8000, 16000]
     integer, parameter :: TXN_SCALE(4) = [500, 1000, 2000, 4000]   ! explicit-txn arm scaling
+    integer, parameter :: NULL_ROWS    = 16000   ! autocommit NULL-key inserts
+    integer, parameter :: NULL_TXN     = 4000    ! NULL-key inserts in one txn
     integer, parameter :: LOOKUP_ROWS  = 20000
     integer, parameter :: LOOKUP_HITS  = 20000   ! indexed lookups timed
     integer, parameter :: SCAN_HITS    = 200     ! full-scan lookups timed
@@ -53,6 +55,7 @@ program bench_sqr
     call bench_bulk_insert()
     call bench_index_scaling()
     call bench_txn_insert()
+    call bench_null_insert()
     call bench_lookup()
     call bench_delete_compact()
     call bench_text()
@@ -295,6 +298,66 @@ contains
         end if
         print '(i8,f11.3,f12.2,f8.2)', n, secs(t0, t1), us, ratio
         prev_us = us
+    end subroutine
+
+    ! --- 2c. Indexed insert, NULL key ----------------------------------
+    ! Every row carries a NULL in the indexed column.  Before schema
+    ! version 2 such a row was left out of the index, so the insert did no
+    ! index work at all; since then it is an index insert like any other
+    ! (the keys are equal and ordered by row id, so each entry goes after
+    ! the last).  This is the case in which that change costs most.
+    ! Two figures: autocommit, and one explicit transaction, the second set
+    ! against the same transaction over a value key.
+    subroutine bench_null_insert()
+        real(real64) :: auto_us, null_us, val_us
+        print '(a)', '-- 2c. indexed insert, NULL key --'
+        call one_null_run(NULL_ROWS, .true.,  .false., auto_us)
+        call one_null_run(NULL_TXN,  .true.,  .true.,  null_us)
+        call one_null_run(NULL_TXN,  .false., .true.,  val_us)
+        print '(a,f9.2,a,i0)', '   autocommit, NULL key: ', auto_us, ' us/insert, N=', NULL_ROWS
+        print '(a,f9.2,a,i0)', '   one txn,    NULL key: ', null_us, ' us/insert, N=', NULL_TXN
+        print '(a,f9.2,a,i0)', '   one txn,   value key: ', val_us,  ' us/insert, N=', NULL_TXN
+        print '(a)', ''
+    end subroutine
+
+    ! One run of n inserts into a table indexed on k: k NULL in every row
+    ! or ascending, autocommit or inside one explicit transaction.
+    subroutine one_null_run(n, null_key, in_txn, us)
+        integer,      intent(in)  :: n
+        logical,      intent(in)  :: null_key, in_txn
+        real(real64), intent(out) :: us
+        type(db_t) :: db
+        character(len=:), allocatable :: buf
+        integer :: rs, i, ti
+        integer(int32) :: rid
+        integer(int64) :: t0, t1
+        call cleanup()
+        call db_open(db, DBDIR, rs);                         call die('open', rs)
+        call db_create_table(db, 't', bench_cols(), rs);     call die('create', rs)
+        call db_create_index(db, 't', 'k', rs);              call die('index', rs)
+        ti = db_table_index(db, 't')
+        call row_alloc(buf, db%tables(ti)%record_size)
+        if (in_txn) then
+            call db_begin(db, rs);                           call die('begin', rs)
+        end if
+        call system_clock(t0)
+        rows: do i = 1, n
+            call row_set_status(buf, ROW_ALIVE)
+            call row_set_int(buf, db%tables(ti)%cols(1), int(i, int32))
+            if (null_key) then
+                call row_set_null(buf, db%tables(ti)%cols(2))
+            else
+                call row_set_int(buf, db%tables(ti)%cols(2), int(i, int32))
+            end if
+            call db_insert(db, 't', buf, rid, rs)
+            if (rs /= SQR_OK) call die('insert(null)', rs)
+        end do rows
+        call system_clock(t1)
+        if (in_txn) then
+            call db_commit(db, rs);                          call die('commit', rs)
+        end if
+        call db_close(db)
+        us = 1.0e6_real64 * secs(t0, t1) / real(n, real64)
     end subroutine
 
     ! --- 3. Point lookup: index vs full scan --------------------------

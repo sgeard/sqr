@@ -416,6 +416,38 @@ A database is a directory containing:
 Each record is: 1 status byte (`ROW_ALIVE` / `ROW_TOMBSTONE`), then a
 `(ncols+7)/8`-byte NULL bitmap, then column data at fixed offsets.
 
+An index entry is the key and the row id. Each member of the key is one
+flag byte (`00` NULL, `01` present) followed by the member's value bytes, so
+a NULL member is part of the key and every live row has an entry in every
+index. NULL orders before any value.
+
+### Upgrading a 1.x database
+
+sqr 2.0 changed the index key (schema version 2): 1.x keys had no flag
+byte, and a row with a NULL in an indexed column was left out of the index,
+which could hide it from a query that used a composite index. Table data,
+blobs, the journal, the `.sqr` container and the wire protocol are
+unchanged.
+
+- **Opening a 1.x database read-write upgrades it in place**, once: every
+  index is rebuilt and the schema version rewritten. No table row is
+  touched. An upgrade interrupted by a crash is completed by the next
+  read-write open. It takes about 0.3 s for a 100 000-row table with two
+  indices.
+- **A read-only open of a 1.x database is refused** with `SQR_VERSION`,
+  because it cannot rebuild. Open it read-write once, or read it with
+  sqr 1.8.2, the last release that reads the 1.x format. A database on
+  read-only media must be copied to writable storage first.
+- **A `.sqr` container** holding a 1.x database unpacks as 1.x and upgrades
+  on its first read-write open.
+- **sqr 1.x cannot open an upgraded database** (`sqlsh` 1.8.2 reports
+  "cannot read catalog"). Keep a copy if 1.x programs still need it.
+
+Two results change with the format. `db_open_cursor` over a whole index now
+yields the rows with a NULL leading member, first; and `ORDER BY` puts
+NULLs first when ascending and last with `DESC`, where 1.x put them last
+and first.
+
 ---
 
 ## Single-file container (`.sqr`)

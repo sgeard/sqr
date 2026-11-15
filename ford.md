@@ -29,7 +29,7 @@ A database directory contains, per table:
 | `_catalog.dat` | stream binary | magic `SQRC`, schema version, table names |
 | `<table>.schema` | stream binary | magic `SQRT`, header, column + index definitions |
 | `<table>.dat` | direct, `recl = record_size` | status byte + columns packed at fixed offsets |
-| `<table>__i<slot>.idx` | direct, `recl = key_size+4` | `(key_bytes, int32 row_id)` sorted ascending |
+| `<table>__i<slot>.idx` | paged B+-tree (`b_tree`) | `(key_bytes, int32 row_id)` entries; each key member is a flag byte (NULL or present) then its value |
 | `<table>.blob` | stream binary | append-only bytes for `DT_TEXT` columns |
 
 Each data record is one `character(len=record_size)` buffer: byte 1 is the
