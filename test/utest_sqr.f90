@@ -58,6 +58,8 @@ program utest_sqr
     call test_quiesce()
     call test_natural_keys()
     call test_null_columns()
+    call test_null_in_keys()
+    call test_format_upgrade()
     call test_leading_column()
     call test_find_by_leading()
     call test_drop_index()
@@ -3636,15 +3638,16 @@ contains
                    'null: range excludes NULL-member rows -> 1,3')
         call db_open_cursor(db, 't', 'val', cur, rs)
         call drain_cursor(db, cur, ids, n)
-        call check(n == 2, 'null: open_cursor excludes NULL rows')
+        call check(n == 4 .and. all(ids(1:4) == [2_int32, 4_int32, 1_int32, 3_int32]), &
+                   'null: open_cursor yields NULL rows first -> 2,4,1,3')
 
-        ! update: NULL row -> valued enters the index; valued row -> NULL leaves it
+        ! update: NULL row -> valued is found by its value; valued row -> NULL no longer is
         call upd_null(db, ti, 2_int32, 15_int32, .false., 'b', buf)
         call db_find_by_int(db, 't', 'val', 15_int32, rid, rs)
-        call check(rs == SQR_OK .and. rid == 2, 'null: update NULL->value enters index')
+        call check(rs == SQR_OK .and. rid == 2, 'null: update NULL->value is found by value')
         call upd_null(db, ti, 1_int32, 0_int32, .true., 'a', buf)
         call db_find_by_int(db, 't', 'val', 10_int32, rid, rs)
-        call check(rs == SQR_NOT_FOUND, 'null: update value->NULL leaves index')
+        call check(rs == SQR_NOT_FOUND, 'null: update value->NULL matches no value')
 
         ! a unique index permits any number of NULL-member rows
         call upd_null(db, ti, 3_int32, 0_int32, .true., 'c', buf)   ! now 1,3 NULL; 2 has 15; 4 NULL
@@ -3664,6 +3667,369 @@ contains
 
         call db_close(db)
         ios = c_rmtree(NDIR)
+    end subroutine
+
+    ! ===== NULL members in index keys (schema version 2; review E1, E3) =====
+
+    ! Row buffer for a table (id INT, a INT, b INT); a and b may be NULL.
+    subroutine row3(db, ti, id, a, anull, b, bnull, buf)
+        type(db_t),       intent(in)    :: db
+        integer,          intent(in)    :: ti
+        integer(int32),   intent(in)    :: id, a, b
+        logical,          intent(in)    :: anull, bnull
+        character(len=:), allocatable, intent(inout) :: buf
+        associate (c => db%tables(ti)%cols)
+            call row_alloc(buf, db%tables(ti)%record_size)
+            call row_set_int(buf, c(1), id)
+            if (anull) then
+                call row_set_null(buf, c(2))
+            else
+                call row_set_int(buf, c(2), a)
+            end if
+            if (bnull) then
+                call row_set_null(buf, c(3))
+            else
+                call row_set_int(buf, c(3), b)
+            end if
+        end associate
+    end subroutine
+
+    subroutine test_null_in_keys()
+        use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan
+        character(len=*), parameter :: KDIR = 'utest_sqr_nullkey_db'
+        character(len=8), parameter :: AB(2) = [character(len=8) :: 'a', 'b']
+        character(len=8), parameter :: XY(2) = [character(len=8) :: 'x', 'y']
+        logical, parameter :: NUL = .true., SET = .false.
+        type(db_t) :: db
+        type(column_t) :: c(3), cr(3)
+        integer :: rs, ios, ti, tr, n
+        integer(int32) :: rid, ids(16), rids(2)
+        character(len=:), allocatable :: buf, got, bufs(:)
+        type(db_cursor_t) :: cur
+        character(len=128) :: emsg
+        logical :: ok
+
+        ios = c_rmtree(KDIR)
+        c(1)%name = 'id'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        c(2)%name = 'a' ; c(2)%dtype = DT_INT; c(2)%csize = 4
+        c(3)%name = 'b' ; c(3)%dtype = DT_INT; c(3)%csize = 4
+        call db_open(db, KDIR, rs, emsg)
+        call db_create_table(db, 'k', c, rs, emsg)
+        ti = db_table_index(db, 'k')
+        call row3(db, ti, 1_int32, 5_int32, SET, 0_int32, NUL, buf); call db_insert(db, 'k', buf, rid, rs)
+        call row3(db, ti, 2_int32, 5_int32, SET, 1_int32, SET, buf); call db_insert(db, 'k', buf, rid, rs)
+        call row3(db, ti, 3_int32, 6_int32, SET, 0_int32, NUL, buf); call db_insert(db, 'k', buf, rid, rs)
+        call row3(db, ti, 4_int32, 0_int32, NUL, 7_int32, SET, buf); call db_insert(db, 'k', buf, rid, rs)
+
+        ! The answers a single-column index on a gives ...
+        call db_create_index(db, 'k', 'a', rs)
+        call db_find_range(db, 'k', 'a', 5_int32, 5_int32, cur, rs)
+        call drain_cursor(db, cur, ids, n)
+        call check(n == 2 .and. all(ids(1:2) == [1_int32, 2_int32]), &
+                   'nullkey: single-column index, a = 5 -> 1,2')
+        call db_drop_index(db, 'k', 'a', rs)
+
+        ! ... are the answers a composite index on (a, b) gives (review E1:
+        ! in 1.x the rows whose b is NULL vanished once this index existed).
+        call db_create_index(db, 'k', AB, rs)
+        call check(rs == SQR_OK, 'nullkey: composite (a,b) built over NULL members')
+        call db_find_range(db, 'k', 'a', 5_int32, 5_int32, cur, rs)
+        call drain_cursor(db, cur, ids, n)
+        call check(n == 2 .and. all(ids(1:2) == [1_int32, 2_int32]), &
+                   'nullkey: composite index, a = 5 -> 1,2 (NULL trailing member found)')
+        call db_find_range(db, 'k', 'a', 5_int32, 6_int32, cur, rs)
+        call drain_cursor(db, cur, ids, n)
+        call check(n == 3 .and. all(ids(1:3) == [1_int32, 2_int32, 3_int32]), &
+                   'nullkey: composite index, a in [5,6] -> 1,2,3')
+        call db_find_by_int(db, 'k', 'a', 6_int32, rid, rs)
+        call check(rs == SQR_OK .and. rid == 3, 'nullkey: find a = 6 reaches the (6,NULL) row')
+        call db_find_by_int(db, 'k', 'a', 5_int32, rid, rs)
+        call check(rs == SQR_OK .and. rid == 1, 'nullkey: find a = 5 -> first in key order, (5,NULL)')
+
+        ! A NULL leading member is outside every value range, however wide ...
+        call db_find_range(db, 'k', 'a', -huge(0_int32) - 1_int32, huge(0_int32), cur, rs)
+        call drain_cursor(db, cur, ids, n)
+        call check(n == 3 .and. all(ids(1:3) == [1_int32, 2_int32, 3_int32]), &
+                   'nullkey: full int range excludes the NULL leading member')
+        ! ... and first in the whole-index order.
+        call db_open_cursor(db, 'k', 'a', cur, rs)
+        call drain_cursor(db, cur, ids, n)
+        call check(n == 4 .and. all(ids(1:4) == [4_int32, 1_int32, 2_int32, 3_int32]), &
+                   'nullkey: open_cursor yields every row, NULL first -> 4,1,2,3')
+        call db_verify(db, 'k', rs, emsg)
+        call check(rs == SQR_OK, 'nullkey: verify passes on NULL-bearing indexed data')
+
+        ! Unique: a key with a NULL member equals no other key.
+        call row3(db, ti, 5_int32, 5_int32, SET, 0_int32, NUL, buf); call db_insert(db, 'k', buf, rid, rs)
+        call db_drop_index(db, 'k', AB, rs)
+        call db_create_index(db, 'k', AB, rs, unique=.true.)
+        call check(rs == SQR_OK, 'nullkey: unique index builds over two (5,NULL) rows')
+        call row3(db, ti, 6_int32, 6_int32, SET, 0_int32, NUL, buf); call db_insert(db, 'k', buf, rid, rs)
+        call check(rs == SQR_OK .and. rid == 6, 'nullkey: unique index accepts a second (6,NULL)')
+        call row3(db, ti, 9_int32, 5_int32, SET, 1_int32, SET, buf); call db_insert(db, 'k', buf, rid, rs)
+        call check(rs == SQR_DUP, 'nullkey: unique index refuses a second (5,1)')
+        call row3(db, ti, 6_int32, 5_int32, SET, 1_int32, SET, buf); call db_update(db, 'k', 6_int32, buf, rs)
+        call check(rs == SQR_DUP, 'nullkey: update NULL -> value refused when the key is taken')
+        call row3(db, ti, 6_int32, 0_int32, NUL, 7_int32, SET, buf); call db_update(db, 'k', 6_int32, buf, rs)
+        call check(rs == SQR_OK, 'nullkey: update to a second (NULL,7) accepted')
+        call db_open_cursor(db, 'k', 'a', cur, rs)
+        call drain_cursor(db, cur, ids, n)
+        call check(n == 6 .and. all(ids(1:6) == [4_int32, 6_int32, 1_int32, 5_int32, 2_int32, 3_int32]), &
+                   'nullkey: order is NULL first per member, ties by row id -> 4,6,1,5,2,3')
+        call row3(db, ti, 6_int32, 5_int32, SET, 2_int32, SET, buf); call db_update(db, 'k', 6_int32, buf, rs)
+        call db_open_cursor(db, 'k', 'a', cur, rs)
+        call drain_cursor(db, cur, ids, n)
+        call check(rs == SQR_OK .and. n == 6 .and. &
+                   all(ids(1:6) == [4_int32, 1_int32, 5_int32, 2_int32, 6_int32, 3_int32]), &
+                   'nullkey: update NULL -> value moves the entry -> 4,1,5,2,6,3')
+        call db_verify(db, 'k', rs, emsg)
+        call check(rs == SQR_OK, 'nullkey: verify passes with repeated NULL keys in a unique index')
+
+        ! By-key: a NULL key member names no row (review E3: it used to act
+        ! on the row whose member was zero).
+        call row3(db, ti, 7_int32, 0_int32, SET, 0_int32, SET, buf); call db_insert(db, 'k', buf, rid, rs)
+        call row_alloc(got, db%tables(ti)%record_size)
+        call row3(db, ti, 0_int32, 0_int32, NUL, 0_int32, SET, buf)
+        call db_get_by_key(db, 'k', AB, buf, got, rs)
+        call check(rs == SQR_NOT_FOUND, 'nullkey: get_by_key (NULL,0) -> NOT_FOUND')
+        call db_delete_by_key(db, 'k', AB, buf, rs)
+        call check(rs == SQR_NOT_FOUND, 'nullkey: delete_by_key (NULL,0) -> NOT_FOUND')
+        call row3(db, ti, 0_int32, 0_int32, SET, 0_int32, NUL, buf)
+        call db_get_by_key(db, 'k', AB, buf, got, rs)
+        call check(rs == SQR_NOT_FOUND, 'nullkey: get_by_key (0,NULL) -> NOT_FOUND')
+        call row3(db, ti, 0_int32, 5_int32, SET, 0_int32, NUL, buf)
+        call db_get_by_key(db, 'k', AB, buf, got, rs)
+        call check(rs == SQR_NOT_FOUND, 'nullkey: get_by_key (5,NULL) -> NOT_FOUND though two rows hold it')
+        call row3(db, ti, 0_int32, 0_int32, SET, 0_int32, SET, buf)
+        call db_get_by_key(db, 'k', AB, buf, got, rs, row_id=rid)
+        call check(rs == SQR_OK .and. rid == 7, 'nullkey: the (0,0) row is untouched and found by its key')
+
+        ! Rollback and undo/redo carry the entry with the row.
+        call db_begin(db, rs)
+        call row3(db, ti, 3_int32, 8_int32, SET, 0_int32, NUL, buf); call db_update(db, 'k', 3_int32, buf, rs)
+        call db_find_by_int(db, 'k', 'a', 8_int32, rid, rs)
+        call check(rs == SQR_OK .and. rid == 3, 'nullkey: in txn, (6,NULL) -> (8,NULL) found at a = 8')
+        call db_rollback(db, rs)
+        call db_find_by_int(db, 'k', 'a', 8_int32, rid, rs)
+        call check(rs == SQR_NOT_FOUND, 'nullkey: rollback removes the a = 8 entry')
+        call db_find_by_int(db, 'k', 'a', 6_int32, rid, rs)
+        call check(rs == SQR_OK .and. rid == 3, 'nullkey: rollback restores the (6,NULL) entry')
+        call db_begin(db, rs, label='move')
+        call row3(db, ti, 3_int32, 9_int32, SET, 4_int32, SET, buf); call db_update(db, 'k', 3_int32, buf, rs)
+        call db_commit(db, rs)
+        call db_undo(db, rs)
+        call db_find_by_int(db, 'k', 'a', 9_int32, rid, ios)
+        call check(rs == SQR_OK .and. ios == SQR_NOT_FOUND, 'nullkey: undo removes the (9,4) entry')
+        call db_find_by_int(db, 'k', 'a', 6_int32, rid, rs)
+        call check(rs == SQR_OK .and. rid == 3, 'nullkey: undo restores the (6,NULL) entry')
+        call db_redo(db, rs)
+        call db_find_by_int(db, 'k', 'a', 9_int32, rid, ios)
+        call check(rs == SQR_OK .and. ios == SQR_OK .and. rid == 3, 'nullkey: redo brings (9,4) back')
+        call db_verify(db, 'k', rs, emsg)
+        call check(rs == SQR_OK, 'nullkey: verify passes after rollback, undo and redo')
+
+        ! Delete, reopen, compact.
+        call db_delete(db, 'k', 1_int32, rs)
+        call db_find_range(db, 'k', 'a', 5_int32, 5_int32, cur, rs)
+        call drain_cursor(db, cur, ids, n)
+        call check(n == 3 .and. all(ids(1:3) == [5_int32, 2_int32, 6_int32]), &
+                   'nullkey: deleted NULL-bearing row is skipped -> 5,2,6')
+        call db_close(db)
+        call db_open(db, KDIR, rs, emsg)
+        ti = db_table_index(db, 'k')
+        call db_open_cursor(db, 'k', 'a', cur, rs)
+        call drain_cursor(db, cur, ids, n)
+        call check(n == 6 .and. all(ids(1:6) == [4_int32, 7_int32, 5_int32, 2_int32, 6_int32, 3_int32]), &
+                   'nullkey: order survives reopen -> 4,7,5,2,6,3')
+        call db_compact(db, 'k', rs)
+        call db_open_cursor(db, 'k', 'a', cur, ios)
+        call drain_cursor(db, cur, ids, n)
+        call check(rs == SQR_OK .and. n == 6 .and. &
+                   all(ids(1:6) == [4_int32, 7_int32, 5_int32, 2_int32, 6_int32, 3_int32]), &
+                   'nullkey: order survives compact')
+        call db_verify(db, 'k', rs, emsg)
+        call check(rs == SQR_OK, 'nullkey: verify passes after delete, reopen and compact')
+
+        ! Batch insert: validated by the same rule, indexed by the rebuild.
+        allocate(character(len=db%tables(ti)%record_size) :: bufs(2))
+        call row3(db, ti, 10_int32, 7_int32, SET, 0_int32, NUL, buf); bufs(1) = buf
+        call row3(db, ti, 11_int32, 7_int32, SET, 0_int32, NUL, buf); bufs(2) = buf
+        call db_insert_many(db, 'k', bufs, rids, rs)
+        call check(rs == SQR_OK, 'nullkey: insert_many accepts two (7,NULL) under a unique index')
+        call row3(db, ti, 12_int32, 7_int32, SET, 3_int32, SET, buf); bufs(1) = buf
+        call row3(db, ti, 13_int32, 7_int32, SET, 3_int32, SET, buf); bufs(2) = buf
+        call db_insert_many(db, 'k', bufs, rids, rs)
+        call check(rs == SQR_DUP, 'nullkey: insert_many refuses two (7,3)')
+        call db_find_range(db, 'k', 'a', 7_int32, 7_int32, cur, rs)
+        call drain_cursor(db, cur, ids, n)
+        call check(n == 2 .and. all(ids(1:2) == [10_int32, 11_int32]), &
+                   'nullkey: the batch rows are indexed -> 10,11')
+
+        ! A NULL member does not excuse a NaN in another: the row is indexed.
+        cr(1)%name = 'id'; cr(1)%dtype = DT_INT ; cr(1)%csize = 4
+        cr(2)%name = 'x' ; cr(2)%dtype = DT_INT ; cr(2)%csize = 4
+        cr(3)%name = 'y' ; cr(3)%dtype = DT_REAL; cr(3)%csize = 8
+        call db_create_table(db, 'r', cr, rs, emsg)
+        tr = db_table_index(db, 'r')
+        ti = db_table_index(db, 'k')
+        call db_create_index(db, 'r', XY, rs)
+        call row_alloc(buf, db%tables(tr)%record_size)
+        call row_set_int(buf, db%tables(tr)%cols(1), 1_int32)
+        call row_set_null(buf, db%tables(tr)%cols(2))
+        call row_set_real(buf, db%tables(tr)%cols(3), ieee_value(0.0_real64, ieee_quiet_nan))
+        call db_insert(db, 'r', buf, rid, rs)
+        call check(rs == SQR_INVALID, 'nullkey: (NULL, NaN) refused - NaN has no place in the order')
+        call row_set_real(buf, db%tables(tr)%cols(3), 1.5_real64)
+        call db_insert(db, 'r', buf, rid, rs)
+        call check(rs == SQR_OK .and. rid == 1, 'nullkey: (NULL, 1.5) accepted')
+        call db_verify(db, 'r', rs, emsg)
+        call check(rs == SQR_OK, 'nullkey: verify passes on (x,y) with a NULL leading member')
+
+        ! db_verify counts one entry per live row, so an index that is one
+        ! short is caught: put back the index file as it was a row ago.
+        call db_close(db)
+        call copy_file(KDIR // '/r__i1.idx', KDIR // '/r__i1.saved', ok)
+        call db_open(db, KDIR, rs, emsg)
+        tr = db_table_index(db, 'r')
+        call row_alloc(buf, db%tables(tr)%record_size)
+        call row_set_int(buf, db%tables(tr)%cols(1), 2_int32)
+        call row_set_null(buf, db%tables(tr)%cols(2))
+        call row_set_null(buf, db%tables(tr)%cols(3))
+        call db_insert(db, 'r', buf, rid, rs)
+        call db_close(db)
+        call copy_file(KDIR // '/r__i1.saved', KDIR // '/r__i1.idx', ok)
+        call db_open(db, KDIR, rs, emsg)
+        call db_verify(db, 'r', ios, emsg)
+        call check(ok .and. rs == SQR_OK .and. ios == SQR_INVALID, &
+                   'nullkey: verify catches an index missing a NULL-keyed row')
+        call db_close(db)
+        ios = c_rmtree(KDIR)
+    end subroutine
+
+    ! The schema version stored in a database's catalog (0 if unreadable).
+    function catalog_version(dir) result(ver)
+        character(len=*), intent(in) :: dir
+        integer :: ver, u, ios
+        character(len=4) :: magic
+        integer(int32) :: bom, v
+        ver = 0
+        open(newunit=u, file=dir // '/_catalog.dat', access='stream', form='unformatted', &
+             status='old', action='read', iostat=ios)
+        if (ios /= 0) return
+        read(u, iostat=ios) magic, bom, v
+        if (ios == 0) ver = int(v)
+        close(u)
+    end function
+
+    ! Upgrade of a sqr 1.x database (schema version 1: index keys without
+    ! NULL flags, NULL-member rows left out).  The fixture was written by
+    ! sqr 1.8.2 (see test/fixtures/README).
+    subroutine test_format_upgrade()
+        character(len=*), parameter :: FIX   = 'test/fixtures/v1_null.sqr'
+        character(len=*), parameter :: UDIR  = 'utest_sqr_upgrade_db'
+        character(len=*), parameter :: UDIR2 = 'utest_sqr_upgrade2_db'
+        type(db_t) :: db
+        integer :: rs, ios, ti, n, u
+        integer(int32) :: rid, ids(16)
+        integer(int64) :: isz
+        character(len=:), allocatable :: buf
+        type(db_cursor_t) :: cur
+        character(len=256) :: emsg
+        logical :: ok
+
+        ios = c_rmtree(UDIR); ios = c_rmtree(UDIR2)
+        if (.not. c_path_exists(FIX)) then
+            call skip('upgrade: sqr 1.x fixture', 'run from the project root to find ' // FIX)
+            return
+        end if
+        call db_unpack(FIX, UDIR, rs, emsg)
+        call check(rs == SQR_OK .and. catalog_version(UDIR) == 1, 'upgrade: fixture unpacks as schema version 1')
+        isz = c_file_size(UDIR // '/t__i1.idx')
+
+        ! A read-only handle cannot rebuild, and is refused untouched.
+        emsg = ''
+        call db_open(db, UDIR, rs, emsg, readonly=.true.)
+        call check(rs == SQR_VERSION .and. .not. db%opened, 'upgrade: read-only open of a 1.x database refused')
+        call check(index(emsg, '1.x format') > 0 .and. index(emsg, 'read-write') > 0, &
+                   'upgrade: the refusal says what to do')
+        call check(catalog_version(UDIR) == 1 .and. c_file_size(UDIR // '/t__i1.idx') == isz, &
+                   'upgrade: the refused open changed nothing')
+
+        ! A read-write open upgrades in place.
+        call db_open(db, UDIR, rs, emsg)
+        call check(rs == SQR_OK .and. db%opened, 'upgrade: read-write open of a 1.x database succeeds')
+        call check(catalog_version(UDIR) == SQR_SCHEMA_VERSION .and. &
+                   all(db%tables(1:db%ntables)%schema_version == SQR_SCHEMA_VERSION), &
+                   'upgrade: catalog and every table are at the current version')
+        call db_verify(db, 't', rs, emsg)
+        call db_verify(db, 'u', ios, emsg)
+        call db_verify(db, 'e', n, emsg)
+        call check(rs == SQR_OK .and. ios == SQR_OK .and. n == SQR_OK, 'upgrade: every table verifies')
+        ! t(a,b,c,r): (5,NULL) (5,1) (6,NULL) (NULL,7) (7,2), index (a,b).
+        call db_find_range(db, 't', 'a', 5_int32, 5_int32, cur, rs)
+        call drain_cursor(db, cur, ids, n)
+        call check(n == 2, 'upgrade: a = 5 finds both rows (1.x found one)')
+        call db_find_range(db, 't', 'a', 5_int32, huge(0_int32), cur, rs)
+        call drain_cursor(db, cur, ids, n)
+        call check(n == 4 .and. all(ids(1:4) == [5_int32, 5_int32, 6_int32, 7_int32]), &
+                   'upgrade: a >= 5 finds four rows (1.x found two)')
+        call db_open_cursor(db, 't', 'a', cur, rs)
+        call drain_cursor(db, cur, ids, n)
+        call check(n == 5, 'upgrade: the cursor yields all five live rows')
+        call db_find_by_char(db, 't', 'c', 'y', rid, rs)
+        call check(rs == SQR_OK .and. rid == 2, 'upgrade: single-column CHAR index still answers')
+        ! u(k,v): unique index on k over 0, 1, NULL, NULL.
+        ti = db_table_index(db, 'u')
+        call db_find_by_int(db, 'u', 'k', 1_int32, rid, rs)
+        call check(rs == SQR_OK .and. rid == 2, 'upgrade: unique index answers')
+        call row_alloc(buf, db%tables(ti)%record_size)
+        call row_set_int(buf, db%tables(ti)%cols(1), 0_int32)
+        call row_set_char(buf, db%tables(ti)%cols(2), 'dup')
+        call db_insert(db, 'u', buf, rid, rs)
+        call check(rs == SQR_DUP, 'upgrade: unique index still enforced')
+        call row_set_null(buf, db%tables(ti)%cols(1))
+        call db_insert(db, 'u', buf, rid, rs)
+        call check(rs == SQR_OK, 'upgrade: a third NULL key is accepted')
+        call db_close(db)
+
+        ! Upgraded, so a read-only handle is now served.
+        call db_open(db, UDIR, rs, emsg, readonly=.true.)
+        call db_find_by_int(db, 'u', 'k', 1_int32, rid, ios)
+        call check(rs == SQR_OK .and. ios == SQR_OK .and. rid == 2, 'upgrade: read-only open works afterwards')
+        call db_close(db)
+
+        ! Interrupted after the tables, before the catalog: only the catalog
+        ! still says 1.
+        open(newunit=u, file=UDIR // '/_catalog.dat', access='stream', form='unformatted', &
+             status='old', action='readwrite', iostat=ios)
+        write(u, pos=9, iostat=ios) 1_int32
+        close(u)
+        call db_open(db, UDIR, rs, emsg, readonly=.true.)
+        call check(rs == SQR_VERSION, 'upgrade: half-upgraded database refused read-only')
+        call db_open(db, UDIR, rs, emsg)
+        call check(rs == SQR_OK .and. catalog_version(UDIR) == SQR_SCHEMA_VERSION, &
+                   'upgrade: a read-write open completes the catalog')
+        call db_verify(db, 't', rs, emsg)
+        call check(rs == SQR_OK, 'upgrade: verify passes after completing the catalog')
+        call db_close(db)
+
+        ! Interrupted after a table's indices were rebuilt, before its schema
+        ! was written: a version-1 schema over a current-layout index file.
+        call db_unpack(FIX, UDIR2, rs, emsg)
+        call copy_file(UDIR2 // '/u.schema', UDIR2 // '/u.schema.v1', ok)
+        call db_open(db, UDIR2, rs, emsg)
+        call db_close(db)
+        call copy_file(UDIR2 // '/u.schema.v1', UDIR2 // '/u.schema', ok)
+        call db_open(db, UDIR2, rs, emsg)
+        ti = db_table_index(db, 'u')
+        call check(ok .and. rs == SQR_OK, 'upgrade: version-1 schema over a rebuilt index opens')
+        call check(db%tables(ti)%schema_version == SQR_SCHEMA_VERSION, 'upgrade: that table is upgraded again')
+        call db_verify(db, 'u', rs, emsg)
+        call db_find_by_int(db, 'u', 'k', 1_int32, rid, ios)
+        call check(rs == SQR_OK .and. ios == SQR_OK .and. rid == 2, 'upgrade: and verifies and answers')
+        call db_close(db)
+
+        ios = c_rmtree(UDIR); ios = c_rmtree(UDIR2)
     end subroutine
 
     ! ===== 5.2 leading-column range/cursor on a composite index =====

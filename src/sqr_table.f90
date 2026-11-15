@@ -18,10 +18,16 @@ contains
         character(len=*), intent(inout), optional :: errmsg
         logical,          intent(in),   optional  :: readonly
         logical,          intent(in),   optional  :: durable
-        integer :: rs, i, j, n
+        integer :: rs, i, j, n, catver
         character(len=SQR_NAME_LEN), allocatable :: names(:)
         character(len=:), allocatable :: ndir
         character(len=SQR_ERRMSG_LEN) :: em
+        ! Said when a read-only handle meets a database whose index keys are
+        ! still in the sqr 1.x layout (schema version 1): it cannot rebuild
+        ! them, and this build carries no reader for that layout.
+        character(len=*), parameter :: NEEDS_UPGRADE = &
+            'indices are in the sqr 1.x format; open the database read-write' // &
+            ' once to upgrade it, or read it with sqr 1.8.x: "'
 
         rs = SQR_OK
         ! Fold any '\' to '/' so the engine reasons about a single separator on
@@ -112,9 +118,23 @@ contains
                 end if
             end if
 
-            call read_catalog(db, names, n, rs)
+            call read_catalog(db, names, n, rs, catver)
             if (rs /= SQR_OK) then
                 call raise_db(db, rs, stat, errmsg, 'cannot read catalog')
+                exit open_seq
+            end if
+            ! Upgrade from schema version 1 (index keys without NULL flags,
+            ! rows with a NULL member left out).  Indices are derived data, so
+            ! the upgrade is a rebuild, table by table, below: rebuild the
+            ! table's indices in the current layout, then write its schema at
+            ! the current version; the catalog follows once every table is
+            ! done.  Each step is durable before the next, and a table still at
+            ! version 1 is simply rebuilt again, so a crash anywhere leaves a
+            ! database the next read-write open completes.  A read-only handle
+            ! cannot do any of it and is refused.
+            if (catver == SCHEMA_VERSION_UNFLAGGED .and. db%readonly) then
+                rs = SQR_VERSION
+                call raise_db(db, rs, stat, errmsg, NEEDS_UPGRADE // trim(db%dir) // '"')
                 exit open_seq
             end if
 
@@ -158,7 +178,14 @@ contains
                         ! compact_marker_path). A read-only handle cannot write
                         ! the completion, so it refuses — as with a hot journal.
                         recovering: block
-                            logical :: interrupted
+                            logical :: interrupted, upgrade
+                            upgrade = t%schema_version == SCHEMA_VERSION_UNFLAGGED
+                            if (upgrade .and. db%readonly) then
+                                rs = SQR_VERSION
+                                call raise_db(db, rs, stat, errmsg, &
+                                    NEEDS_UPGRADE // trim(db%dir) // '"')
+                                exit open_seq
+                            end if
                             interrupted = file_exists(compact_marker_path(db, trim(names(i))))
                             if (interrupted .and. db%readonly) then
                                 rs = SQR_READONLY
@@ -197,7 +224,9 @@ contains
                                 exit open_seq
                             end if
 
-                            if (interrupted) then
+                            ! The rebuilds below size their buffers from
+                            ! live_count, so it has to be right first.
+                            if (interrupted .or. upgrade) then
                                 recount: block
                                     integer :: ios
                                     call recount_live(t%unit, t, ios)
@@ -219,10 +248,14 @@ contains
                                 end if
                             end if
 
-                            if (interrupted) then
-                                ! Indices map keys to pre-compact row ids — rebuild
-                                ! them (bt_open truncate-creates), persist the fixed
-                                ! counters, then retire the marker.
+                            if (interrupted .or. upgrade) then
+                                ! After an interrupted compact the indices map
+                                ! keys to pre-compact row ids; on an upgrade
+                                ! they hold version-1 keys.  Either way rebuild
+                                ! them (bt_open truncate-creates, whatever the
+                                ! file held), persist the schema - fixed
+                                ! counters, current version - then retire the
+                                ! compact marker if there was one.
                                 rebuild_all: do j = 1, t%nindices
                                     if (.not. idx_live(t%indices(j))) cycle rebuild_all
                                     call rebuild_index(db, i, j, rs)
@@ -233,12 +266,19 @@ contains
                                     end if
                                 end do rebuild_all
                                 call write_schema(db, t, rs)
-                                if (rs == SQR_OK) call clear_compact_marker(db, trim(names(i)), rs)
+                                if (rs == SQR_OK .and. interrupted) &
+                                    call clear_compact_marker(db, trim(names(i)), rs)
                                 if (rs /= SQR_OK) then
-                                    call raise_db(db, rs, stat, errmsg, &
-                                        'cannot finalise compact recovery for ' // trim(names(i)))
+                                    if (interrupted) then
+                                        call raise_db(db, rs, stat, errmsg, &
+                                            'cannot finalise compact recovery for ' // trim(names(i)))
+                                    else
+                                        call raise_db(db, rs, stat, errmsg, &
+                                            'cannot finish the index upgrade for ' // trim(names(i)))
+                                    end if
                                     exit open_seq
                                 end if
+                                t%schema_version = SQR_SCHEMA_VERSION
                             else
                                 indices_open: do j = 1, t%nindices
                                     if (.not. idx_live(t%indices(j))) cycle indices_open
@@ -254,6 +294,17 @@ contains
                     end associate
                 end do tables_open
                 db%ntables = n
+            end if
+
+            ! Every table is at the current version now; say so in the
+            ! catalog.  Last, so that it is the one thing an interrupted
+            ! upgrade can leave behind, and the next open lands here again.
+            if (catver == SCHEMA_VERSION_UNFLAGGED) then
+                call write_catalog(db, rs)
+                if (rs /= SQR_OK) then
+                    call raise_db(db, rs, stat, errmsg, 'cannot finish the format upgrade')
+                    exit open_seq
+                end if
             end if
 
             db%opened = .true.

@@ -15,8 +15,7 @@ submodule (sqr:sqr_base) sqr_record
     type :: keypair_t
         character(len=:), allocatable :: okey  ! key bytes from the old row image
         character(len=:), allocatable :: nkey  ! key bytes from the new row image
-        logical :: oldin = .false.  ! old image is in this index (no NULL member)
-        logical :: newin = .false.  ! new image is in this index
+        logical :: newnull = .false.  ! new key has a NULL member (unique index does not constrain it)
     end type
 
 contains
@@ -125,9 +124,6 @@ contains
             precheck: do ci = 1, t%nindices
                 associate (ix => t%indices(ci))
                     if (.not. idx_live(ix)) cycle precheck
-                    ! A row with any NULL index member is not in that index, so
-                    ! it cannot violate uniqueness and carries no NaN key there.
-                    if (key_has_null(t, ix, wbuf)) cycle precheck
                     call ensure_len(ix%key_scratch, ix%key_size)
                     associate (key => ix%key_scratch)
                         call extract_key(t, ix, wbuf, key)
@@ -136,7 +132,9 @@ contains
                             row_id = 0
                             return
                         end if
-                        if (ix%unique) then
+                        ! A key with a NULL member equals no other key, so a
+                        ! unique index places no constraint on it.
+                        if (ix%unique .and. .not. key_null_any(ix, key)) then
                             call unique_violation(db, idx, ci, key, 0_int32, viol, rs)
                             if (rs /= SQR_OK) then
                                 stat = rs
@@ -309,11 +307,10 @@ contains
                     allocate(character(len=ix%key_size) :: kp(j)%okey, kp(j)%nkey)
                     call extract_key(t, ix, rbuf, kp(j)%okey)
                     call extract_key(t, ix, wbuf, kp(j)%nkey)
-                    ! A NULL index member keeps the row out of that index
-                    ! (partial-index semantics), so maintenance below is driven
-                    ! by whether each image is in the index, not just key change.
-                    kp(j)%oldin = .not. key_has_null(t, ix, rbuf)
-                    kp(j)%newin = .not. key_has_null(t, ix, wbuf)
+                    ! Both images are in the index whatever they hold; the
+                    ! keys carry the NULL flags, so a member moving to or from
+                    ! NULL is a key change like any other.
+                    kp(j)%newnull = key_null_any(ix, kp(j)%nkey)
                 end associate
             end do extract_keys
 
@@ -324,16 +321,15 @@ contains
             uniq_loop: do j = 1, t%nindices
                 associate (ix => t%indices(j))
                     if (.not. idx_live(ix)) cycle uniq_loop
-                    if (.not. kp(j)%newin) cycle uniq_loop   ! new image not indexed
                     uniq_one: block
                         logical :: viol
                         if (key_has_nan(t, ix, kp(j)%nkey)) then
                             stat = SQR_INVALID
                             return
                         end if
-                        ! Check uniqueness only if the row is entering the index
-                        ! (was NULL/out) or its key changed within it.
-                        if (ix%unique .and. (.not. kp(j)%oldin .or. kp(j)%okey /= kp(j)%nkey)) then
+                        ! Check uniqueness only if the key changed, and never
+                        ! for a key with a NULL member (it equals no other).
+                        if (ix%unique .and. .not. kp(j)%newnull .and. kp(j)%okey /= kp(j)%nkey) then
                             call unique_violation(db, idx, j, kp(j)%nkey, row_id, viol, rs)
                             if (rs /= SQR_OK) then
                                 stat = rs
@@ -369,25 +365,21 @@ contains
                 return
             end if
 
-            ! Maintain each index (keys/membership reused from the single
-            ! extraction above): remove the old entry if the old image was in
-            ! the index and either the key changed or the row is leaving it;
-            ! insert the new entry if the new image belongs and either the key
-            ! changed or the row is entering it.
+            ! Maintain each index (keys reused from the single extraction
+            ! above): where the key changed, the old entry goes and the new
+            ! one is inserted.
             idx_loop: do j = 1, t%nindices
                 associate (ix => t%indices(j))
                     if (.not. idx_live(ix)) cycle idx_loop
                     maint: block
                         logical :: changed
                         changed = kp(j)%okey /= kp(j)%nkey
-                        if (kp(j)%oldin .and. (.not. kp(j)%newin .or. changed)) then
+                        if (changed) then
                             call index_remove(db, idx, j, row_id, kp(j)%okey, rs)
                             if (rs /= SQR_OK) then
                                 stat = rs
                                 return
                             end if
-                        end if
-                        if (kp(j)%newin .and. (.not. kp(j)%oldin .or. changed)) then
                             call index_insert(db, idx, j, row_id, wbuf, rs)
                             if (rs /= SQR_OK) then
                                 stat = rs
@@ -688,7 +680,6 @@ contains
         integer :: bs
         associate (t => db%tables(ti), ix => db%tables(ti)%indices(j))
             stat = SQR_OK
-            if (key_has_null(t, ix, buf)) return   ! NULL member ⇒ not indexed
             call ensure_len(ix%key_scratch, ix%key_size)
             associate (key => ix%key_scratch)
                 call extract_key(t, ix, buf, key)

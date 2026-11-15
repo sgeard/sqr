@@ -1,0 +1,112 @@
+# index_null.test — an index never changes what a query returns when a
+# member is NULL.  In sqr 1.x a row with a NULL member was left out of the
+# index, so creating a composite index on (a, b) hid every row whose b was
+# NULL from a query on a.  Each query is run before and after the index is
+# created and must give the same rows.
+
+statement ok
+CREATE TABLE n1(id INTEGER, a INTEGER, b INTEGER)
+
+statement ok
+INSERT INTO n1 VALUES(1, 5, NULL)
+
+statement ok
+INSERT INTO n1 VALUES(2, 5, 1)
+
+statement ok
+INSERT INTO n1 VALUES(3, 6, NULL)
+
+statement ok
+INSERT INTO n1 VALUES(4, NULL, 7)
+
+query I rowsort
+SELECT id FROM n1 WHERE a = 5
+----
+1
+2
+
+query I rowsort
+SELECT id FROM n1 WHERE a >= 5
+----
+1
+2
+3
+
+query I rowsort
+SELECT id FROM n1 WHERE a < 6
+----
+1
+2
+
+query I rowsort
+SELECT id FROM n1 WHERE a BETWEEN 5 AND 6
+----
+1
+2
+3
+
+statement ok
+CREATE INDEX ON n1 (a, b)
+
+query I rowsort
+SELECT id FROM n1 WHERE a = 5
+----
+1
+2
+
+query I rowsort
+SELECT id FROM n1 WHERE a >= 5
+----
+1
+2
+3
+
+# A NULL a matches no comparison, with or without the index.
+query I rowsort
+SELECT id FROM n1 WHERE a < 6
+----
+1
+2
+
+query I rowsort
+SELECT id FROM n1 WHERE a BETWEEN 5 AND 6
+----
+1
+2
+3
+
+query I rowsort
+SELECT id FROM n1 WHERE a IS NULL
+----
+4
+
+# A unique index does not constrain a key with a NULL member.
+statement ok
+CREATE TABLE n2(k INTEGER, v INTEGER)
+
+statement ok
+CREATE UNIQUE INDEX ON n2 (k)
+
+statement ok
+INSERT INTO n2 VALUES(NULL, 1)
+
+statement ok
+INSERT INTO n2 VALUES(NULL, 2)
+
+statement ok
+INSERT INTO n2 VALUES(0, 3)
+
+statement error
+INSERT INTO n2 VALUES(0, 4)
+
+query I rowsort
+SELECT v FROM n2 WHERE k = 0
+----
+3
+
+query I rowsort
+SELECT v FROM n2
+----
+1
+2
+3

@@ -83,12 +83,17 @@ module sqr
     character(len=*), parameter, public :: SQR_RELEASE = '1.8.2'
 
     ! --- On-disk format version ---
-    !! Current on-disk format version.  There is a single format: composite
-    !! index records (ncols, member names, key_size, unique) with each
-    !! index stored as a generic on-disk B+-tree.  No migration path — a
-    !! schema whose version differs is rejected with `SQR_VERSION` as a
-    !! corruption guard.
-    integer, parameter, public :: SQR_SCHEMA_VERSION = 1
+    !! Current on-disk format version: composite index records (ncols,
+    !! member names, key_size, unique) with each index stored as a generic
+    !! on-disk B+-tree, and a flag byte ahead of each key member so that a
+    !! NULL member is part of the key and every live row is indexed.
+    !!
+    !! Version 1 (sqr 1.x) had no flag bytes and left a row with a NULL
+    !! member out of the index.  A read-write `db_open` upgrades a version-1
+    !! database in place by rebuilding its indices; a read-only `db_open` of
+    !! one is refused with `SQR_VERSION` (sqr 1.8.x is the last release that
+    !! reads it).  Any other version is rejected with `SQR_VERSION`.
+    integer, parameter, public :: SQR_SCHEMA_VERSION = 2
 
     ! --- Row status byte values ---
     integer(int8), parameter, public :: ROW_ALIVE     = 1_int8  !! Live row
@@ -144,21 +149,23 @@ module sqr
     !! geometry could change); engine-internal despite being public.
     type, public :: kc_ctx_t
         integer              :: nmem = 0
-        integer, allocatable :: koff(:)  !! per-member offset within the key
+        integer, allocatable :: koff(:)  !! per-member offset of the value within the key (flag byte just before)
         integer, allocatable :: csz(:)   !! per-member byte width
         integer, allocatable :: dt(:)    !! per-member dtype
     end type
 
-    !! A (possibly composite) secondary index.  The key is the member
-    !! column bytes concatenated in declared order; a single-column index
-    !! is just arity 1.  `unique` enforces that no two live rows share a
-    !! key.
+    !! A (possibly composite) secondary index.  The key is, for each member
+    !! column in declared order, a flag byte (NULL or present) and then the
+    !! column's bytes; a single-column index is just arity 1.  Every live row
+    !! has an entry, and a NULL member orders before every value.  `unique`
+    !! enforces that no two live rows share a key; a key with a NULL member
+    !! equals no other and is not constrained.
     type, public :: index_t
         integer :: ncols = 0  !! Number of member columns (1 = single-column)
         character(len=SQR_NAME_LEN), allocatable :: columns(:)  !! Ordered member names
         integer, allocatable :: col_idx(:)  !! Index of each member into the owning `table%cols(:)`
-        integer, allocatable :: key_off(:)  !! 1-based offset of each member within the key
-        integer :: key_size = 0  !! Sum of member `csize`s (the B+-tree key length)
+        integer, allocatable :: key_off(:)  !! 1-based offset of each member's value within the key; its flag byte is the one before
+        integer :: key_size = 0  !! Sum over the members of `csize` plus one flag byte (the B+-tree key length)
         integer :: nentries = 0  !! Cached live-entry count, mirrored from `bt`
         type(btree_t) :: bt  !! On-disk B+-tree mapping the key to the `int32` row id
         logical :: unique   = .false.  !! Enforce no duplicate live keys
@@ -473,8 +480,9 @@ module sqr
     !! column width).  `col_name` may be an exact single-column index or the
     !! **leading** member of a composite index (a leading-prefix range, so no
     !! redundant single-column index is needed).  Pull rows with
-    !! `db_cursor_next`.  `lo > hi` yields an empty cursor; NULL-member rows are
-    !! excluded.
+    !! `db_cursor_next`.  `lo > hi` yields an empty cursor.  A row whose
+    !! `col_name` is NULL is in no band (a NULL matches no value); a NULL in
+    !! any other member of a composite index does not keep a row out.
     interface db_find_range
         module procedure db_find_range_int
         module procedure db_find_range_real
@@ -1017,7 +1025,10 @@ module sqr
         !! buffer the caller filled with just the key columns via the
         !! `row_set_*` helpers.  `row_id` optionally returns the resolved
         !! live row's id (0 if not resolved) so the caller can follow up
-        !! with row-id-keyed operations such as `db_get_text`.
+        !! with row-id-keyed operations such as `db_get_text`.  A key with a
+        !! NULL member names no row (`SQR_NOT_FOUND`), here and in
+        !! `db_update_by_key` and `db_delete_by_key`: a NULL equals nothing,
+        !! and a unique index may hold several rows with such a key.
         module subroutine db_get_by_key(db, table_name, col_names, keyrow, buf, stat, errmsg, row_id)
             class(db_t),       intent(inout)         :: db  !! Database handle
             character(len=*), intent(in)            :: table_name  !! Target table
@@ -1057,8 +1068,9 @@ module sqr
         !! single-column index is preferred, else the first index whose
         !! LEADING member is `col_name` serves; under a composite index
         !! several rows may share the leading value — the one returned is
-        !! the first in key order (lowest trailing members, then lowest
-        !! row id).
+        !! the first in key order (lowest trailing members, a NULL member
+        !! before any value, then lowest row id).  A row whose `col_name` is
+        !! NULL is never matched.
         module subroutine db_find_by_int(db, table_name, col_name, key, row_id, stat, errmsg)
             class(db_t),       intent(inout)        :: db  !! Database handle
             character(len=*), intent(in)           :: table_name  !! Target table
@@ -1113,8 +1125,9 @@ module sqr
         !! otherwise a composite index whose **leading** member is `col_name`
         !! (its B+-tree order is primarily by that member).  The whole-index
         !! complement to `db_find_range`; pull rows with `db_cursor_next`.  Fails
-        !! with `SQR_NOT_FOUND` if the table has no such index.  NULL-member rows
-        !! are not in the index and so are never yielded.
+        !! with `SQR_NOT_FOUND` if the table has no such index.  Every live row
+        !! is yielded; a NULL member orders before every value, so rows whose
+        !! `col_name` is NULL come first.
         module subroutine db_open_cursor(db, table_name, col_name, cur, stat, errmsg)
             class(db_t),        intent(inout)         :: db  !! Database handle
             character(len=*),  intent(in)            :: table_name  !! Target table

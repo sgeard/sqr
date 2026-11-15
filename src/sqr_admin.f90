@@ -154,8 +154,9 @@ contains
             ! Validate the WHOLE batch before writing anything: reject NaN keys
             ! and, for unique indices, any key that collides with the existing
             ! index or with an earlier batch row. A failure here leaves the table
-            ! untouched (all-or-nothing on validation). NULL-member rows are not
-            ! indexed, so they neither carry a NaN key nor constrain uniqueness.
+            ! untouched (all-or-nothing on validation). A key with a NULL member
+            ! equals no other key, so it does not constrain uniqueness; it is
+            ! indexed all the same, so its other members may not be NaN.
             validate: do j = 1, t%nindices
                 if (.not. idx_live(t%indices(j))) cycle validate
                 associate (ix => t%indices(j))
@@ -167,9 +168,8 @@ contains
                         allocate(character(len=ix%key_size) :: bkeys(n))
                         allocate(bnull(n))
                         keys_pass: do k = 1, n
-                            bnull(k) = key_has_null(t, ix, wrows(k))
-                            if (bnull(k)) cycle keys_pass
                             call extract_key(t, ix, wrows(k), bkeys(k))
+                            bnull(k) = key_null_any(ix, bkeys(k))
                             if (key_has_nan(t, ix, bkeys(k))) then
                                 stat = SQR_INVALID
                                 return
@@ -285,16 +285,12 @@ contains
                     end if
                     if (row_status(rbuf) /= ROW_ALIVE) cycle scan_rows
                     recount = recount + 1
-                    tally_idx: do j = 1, t%nindices
-                        if (.not. idx_live(t%indices(j))) cycle tally_idx
-                        if (.not. key_has_null(t, t%indices(j), rbuf)) &
-                            expected(j) = expected(j) + 1
-                    end do tally_idx
                 end do scan_rows
                 if (recount /= t%live_count) then
                     vrs = SQR_INVALID; detail = 'live_count disagrees with row recount'
                     exit verify
                 end if
+                expected = recount   ! every live index holds one entry per live row
                 inquire(unit=t%unit, size=fsize)
                 if (fsize < int(t%next_id - 1, int64) * int(t%record_size, int64)) then
                     vrs = SQR_INVALID; detail = 'data file shorter than next_id implies'

@@ -10,8 +10,7 @@
 ! and the natural-key by-unique-index operations (db_get/update/delete_by_key).
 
 submodule (sqr:sqr_base) sqr_index
-    use, intrinsic :: ieee_arithmetic, only: ieee_value, &
-                                             ieee_positive_inf, ieee_negative_inf
+    use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_positive_inf
     ! ieee_is_nan is host-associated from sqr_base (used by key_has_nan).
     implicit none
 
@@ -57,8 +56,8 @@ contains
         character(len=*), intent(in)            :: col_names(:)
         integer,          intent(out)           :: stat
         logical,          intent(in),  optional :: unique
-        integer :: ti, rs, m, p, nc, koff
-        logical :: uniq
+        integer :: ti, rs, m, p, nc
+        logical :: uniq, laid
         type(index_t), allocatable :: new_idx(:)
         type(index_t) :: ix
         if (readonly_block(db, stat)) return
@@ -86,8 +85,7 @@ contains
                 return
             end if
             ix%ncols = nc
-            allocate(ix%columns(nc), ix%col_idx(nc), ix%key_off(nc))
-            koff = 1
+            allocate(ix%columns(nc), ix%col_idx(nc))
             members: do m = 1, nc
                 ix%columns(m) = col_names(m)
                 ix%col_idx(m) = col_index(t, col_names(m))
@@ -105,10 +103,12 @@ contains
                         return
                     end if
                 end do dup_member
-                ix%key_off(m) = koff
-                koff = koff + t%cols(ix%col_idx(m))%csize
             end do members
-            ix%key_size = koff - 1
+            call layout_index_key(t, ix, laid)
+            if (.not. laid) then      ! cannot happen: every member was checked above
+                stat = SQR_INVALID
+                return
+            end if
             ix%nentries = 0
             ix%unique   = uniq
 
@@ -178,8 +178,8 @@ contains
     ! First live row whose first `nmem` key members equal those of `probe`
     ! (B+-tree lower-bound seek, then forward over the equal-run skipping
     ! dead rows).  `probe` is always a full-width key: for a leading-member
-    ! find (nmem < ix%ncols) its trailing members hold their typed minima
-    ! (build_leading_bounds' lo key), so the seek lands at the start of the
+    ! find (nmem < ix%ncols) its trailing members are NULL, the least a
+    ! member can be (build_leading_bounds' lo key), so the seek lands at the start of the
     ! run and the walk yields entries in (trailing members, row id) order;
     ! for a natural-key find nmem = ix%ncols and this is plain key
     ! equality.  row_id = 0 / SQR_NOT_FOUND if none.
@@ -355,30 +355,13 @@ contains
         dt = t%cols(ix%col_idx(1))%dtype
     end function
 
-    ! Byte image of the minimum / maximum value of a key member of the given
-    ! dtype and width, used to fill the trailing members of a leading-column
-    ! range bound so the full-key band [lokey,hikey] spans "any value" for those
-    ! members in the index's member-by-member order (key_cmp): signed int32,
-    ! real64 (-inf / +inf; NaN is already excluded from the index), or
-    ! byte-lexicographic DT_CHAR. Not pure (ieee_value is not guaranteed pure),
-    ! but only ever called from the non-pure range setup.
-    function member_min(dtype, width) result(bytes)
-        integer, intent(in)  :: dtype, width
-        character(len=width)  :: bytes
-        integer(int32) :: iv
-        real(real64)   :: rv
-        select case (dtype)
-        case (DT_INT)
-            iv = -huge(0_int32) - 1_int32          ! int32 minimum
-            bytes = transfer(iv, bytes)
-        case (DT_REAL)
-            rv = ieee_value(rv, ieee_negative_inf)
-            bytes = transfer(rv, bytes)
-        case default                               ! DT_CHAR
-            bytes = repeat(CH_NUL, width)
-        end select
-    end function
-
+    ! Byte image of the maximum value of a key member of the given dtype and
+    ! width, used to fill the trailing members of a leading-column range's
+    ! upper bound in the index's member-by-member order (key_cmp): signed
+    ! int32, real64 (+inf; NaN is already excluded from the index), or
+    ! byte-lexicographic DT_CHAR.  The lower bound needs no such value: a
+    ! NULL member orders before every value.  Not pure (ieee_value is not
+    ! guaranteed pure), but only ever called from the non-pure range setup.
     function member_max(dtype, width) result(bytes)
         integer, intent(in)  :: dtype, width
         character(len=width)  :: bytes
@@ -397,10 +380,13 @@ contains
     end function
 
     ! Compose full-width lo/hi key bounds for a range on the LEADING member of
-    ! index ix: the caller's leading-member bytes go in slot 1; every trailing
-    ! member is filled with its typed minimum (lo) / maximum (hi) so the full-key
+    ! index ix: the caller's leading-member VALUE bytes go in slot 1, flagged
+    ! present; every trailing member is NULL in the low key (the least a
+    ! member can be) and its typed maximum in the high key, so the full-key
     ! band [lokey,hikey] is exactly {rows : lo <= leading <= hi}, whatever the
-    ! trailing members hold. Reuses the existing full-key cursor machinery.
+    ! trailing members hold - a NULL included.  The leading flag is KEY_SET in
+    ! both, so a row whose leading member is NULL is outside every such band:
+    ! a NULL matches no value.  Reuses the existing full-key cursor machinery.
     subroutine build_leading_bounds(t, ix, lobytes, hibytes, lokey, hikey)
         type(table_t),                 intent(in)  :: t
         type(index_t),                 intent(in)  :: ix
@@ -408,16 +394,22 @@ contains
         character(len=:), allocatable, intent(out) :: lokey, hikey
         integer :: m, lo, hi, w, dt
         allocate(character(len=ix%key_size) :: lokey, hikey)
-        w = t%cols(ix%col_idx(1))%csize            ! leading member at key offset 1
-        lokey(1:w) = lobytes(1:w)
-        hikey(1:w) = hibytes(1:w)
+        lo = ix%key_off(1)
+        w  = t%cols(ix%col_idx(1))%csize
+        hi = lo + w - 1
+        lokey(lo-1:lo-1) = KEY_SET
+        hikey(lo-1:lo-1) = KEY_SET
+        lokey(lo:hi) = lobytes(1:w)
+        hikey(lo:hi) = hibytes(1:w)
         fill: do m = 2, ix%ncols
             lo = ix%key_off(m)
             w  = t%cols(ix%col_idx(m))%csize
             hi = lo + w - 1
             dt = t%cols(ix%col_idx(m))%dtype
-            lokey(lo:hi) = member_min(dt, w)
-            hikey(lo:hi) = member_max(dt, w)
+            lokey(lo-1:lo-1) = KEY_NULL
+            lokey(lo:hi)     = repeat(CH_NUL, w)
+            hikey(lo-1:lo-1) = KEY_SET
+            hikey(lo:hi)     = member_max(dt, w)
         end do fill
     end subroutine
 
@@ -715,6 +707,13 @@ contains
             ! with row_alloc(db_record_size(...)) exactly as it builds a row.
             if (len(keyrow) /= t%record_size) then
                 stat = SQR_INVALID
+                return
+            end if
+            ! A NULL equals nothing, so a key with a NULL member names no
+            ! row.  This has to be said here: the index does hold entries
+            ! with NULL members, and a NULL probe would compare equal to one.
+            if (key_has_null(t, t%indices(j), keyrow)) then
+                stat = SQR_NOT_FOUND
                 return
             end if
             allocate(character(len=t%indices(j)%key_size) :: key)

@@ -26,8 +26,10 @@ crash, even at the cost of an `fsync` per write.
   [Single-file container](#single-file-container-sqr) below.
 - **Typed columns:** `DT_INT` (32-bit), `DT_REAL` (64-bit), `DT_CHAR`
   (fixed-width, NUL-padded), `DT_TEXT` (length-prefixed blob, binary-safe).
-- **Per-row NULL bitmap** — a NULL column reads back as absent and is omitted
-  from any index it belongs to (partial-index semantics).
+- **Per-row NULL bitmap** — a NULL column reads back as absent. A row with
+  a NULL in an indexed column is in the index like any other: a NULL orders
+  before every value, matches no value, and is not constrained by a unique
+  index.
 - **On-disk B+-tree indices**, including composite keys, uniqueness, range
   scans and cursors. The `b_tree` module is fully decoupled from `sqr` and is
   independently reusable.

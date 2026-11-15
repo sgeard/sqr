@@ -30,6 +30,14 @@
 ! B+-tree (see the b_tree module) keyed by the composite key bytes with
 ! the int32 row id as the payload.
 !
+! Key layout (schema version 2): for each member, in declared order, one
+! flag byte (KEY_NULL or KEY_SET) and then the member's csize value bytes
+! (all NUL when the flag is KEY_NULL).  Every live row has one entry in
+! every live index; a NULL member orders before every value.  Version 1
+! keys had no flag bytes and left out any row with a NULL member; a
+! version-1 database has its indices rebuilt by the first read-write
+! db_open (see upgrade notes in sqr_table).
+!
 ! Submodule map — the five feature submodules below all descend from sqr_base
 ! and reach its entities (and each other's module procedures) by host
 ! association; they cannot see each other's private contained procedures, so
@@ -56,6 +64,17 @@ submodule (sqr) sqr_base
     ! B+-tree, lives in the sqr module now that index_t caches one.)
 
     character(len=4), parameter :: CATALOG_MAGIC = 'SQRC'
+
+    ! Index key member flag: one byte ahead of each member's value bytes.
+    ! KEY_NULL < KEY_SET, so the byte order of the flags is the key order
+    ! (NULL first).  Both values are part of the on-disk index format.
+    integer,          parameter :: KEY_FLAG_BYTES = 1
+    character(len=1), parameter :: KEY_NULL = achar(0)
+    character(len=1), parameter :: KEY_SET  = achar(1)
+
+    ! The schema version before index keys carried NULL flags.  Readable only
+    ! so that db_open can upgrade it; never written.
+    integer, parameter :: SCHEMA_VERSION_UNFLAGGED = 1
     character(len=*), parameter :: CATALOG_FILE  = '_catalog.dat'
     character(len=*), parameter :: LOCK_FILE     = '_lock'
 
@@ -526,16 +545,18 @@ contains
 
     ! ===== Catalog I/O =====
 
-    subroutine read_catalog(db, names, n, stat)
+    subroutine read_catalog(db, names, n, stat, version)
         type(db_t),                               intent(in)  :: db
         character(len=SQR_NAME_LEN), allocatable, intent(out) :: names(:)
         integer,                                  intent(out) :: n
         integer,                                  intent(out) :: stat
+        integer,                        optional, intent(out) :: version  ! as stored; current when there is no catalog yet
         integer :: u, ios, i, ver
         integer(int32) :: bom
         character(len=len(CATALOG_MAGIC)) :: magic
         n = 0
         allocate(names(0))
+        if (present(version)) version = SQR_SCHEMA_VERSION
         if (.not. file_exists(catalog_path(db))) then
             stat = SQR_OK
             return
@@ -563,14 +584,17 @@ contains
             stat = SQR_VERSION
             return
         end if
-        ! Single on-disk format: a differing version is corruption.
+        ! The current version, or the one db_open upgrades from; anything
+        ! else is a format this build cannot read.
         read(u, iostat=ios) ver, n
         call io_check(ios)
-        if (ios /= 0 .or. ver /= SQR_SCHEMA_VERSION) then
+        if (ios /= 0 .or. (ver /= SQR_SCHEMA_VERSION .and. &
+                           ver /= SCHEMA_VERSION_UNFLAGGED)) then
             close(u)
             stat = SQR_VERSION
             return
         end if
+        if (present(version)) version = ver
         ! ntables is untrusted on-disk data: a corrupt count would drive a
         ! bad allocate before any per-table validation runs. Bound it with
         ! the same corruption ceiling read_schema applies to header counts.
@@ -847,7 +871,8 @@ contains
         end if
         tbl%disk_next_id    = tbl%next_id       ! the file's image, for schema_stale
         tbl%disk_live_count = tbl%live_count
-        if (tbl%schema_version /= SQR_SCHEMA_VERSION) then
+        if (tbl%schema_version /= SQR_SCHEMA_VERSION .and. &
+            tbl%schema_version /= SCHEMA_VERSION_UNFLAGGED) then
             close(u)
             stat = SQR_VERSION
             if (present(errmsg)) errmsg = 'unsupported schema version for ' // trim(name)
@@ -959,20 +984,20 @@ contains
                 end block rec_in
                 if (ix%ncols == 0) cycle idx_in   ! dead slot: nothing to validate
                 ! Members must resolve to non-TEXT columns and the per-member
-                ! key offsets must pack to exactly key_size; col_index returns
-                ! 0 for an absent column (would index tbl%cols(0) later).
+                ! key offsets must pack to exactly the stored key_size;
+                ! col_index returns 0 for an absent column (would index
+                ! tbl%cols(0) later).  The geometry held in memory is always
+                ! the current one: a version-1 schema stored the key size
+                ! without the flag bytes, and its indices are rebuilt to the
+                ! current layout before anything reads them.
                 geom_chk: block
-                    integer :: m, koff
-                    koff = 1
-                    allocate(ix%key_off(ix%ncols))   ! nc is scoped to rec_in
-                    members_chk: do m = 1, ix%ncols
-                        if (ix%col_idx(m) < 1 .or. ix%col_idx(m) > tbl%ncols) &
-                            exit members_chk
-                        if (tbl%cols(ix%col_idx(m))%dtype == DT_TEXT) exit members_chk
-                        ix%key_off(m) = koff
-                        koff = koff + tbl%cols(ix%col_idx(m))%csize
-                    end do members_chk
-                    if (m <= ix%ncols .or. koff - 1 /= ix%key_size) then
+                    integer :: stored
+                    logical :: ok
+                    stored = ix%key_size
+                    call layout_index_key(tbl, ix, ok)
+                    if (ok .and. tbl%schema_version == SCHEMA_VERSION_UNFLAGGED) &
+                        stored = stored + ix%ncols * KEY_FLAG_BYTES
+                    if (.not. ok .or. stored /= ix%key_size) then
                         close(u)
                         stat = SQR_INVALID
                         if (present(errmsg)) errmsg = 'corrupt index geometry in ' // trim(name)
@@ -1121,12 +1146,45 @@ contains
         type is (kc_ctx_t)
             members: do m = 1, ctx%nmem
                 lo = ctx%koff(m)
+                ! The flag byte decides first: NULL orders before any value,
+                ! and two NULLs are equal for ordering (never for matching -
+                ! lookups and the unique check apply that rule themselves).
+                if (a(lo-1:lo-1) /= b(lo-1:lo-1)) then
+                    c = merge(-1, 1, a(lo-1:lo-1) == KEY_NULL)
+                    return
+                end if
+                if (a(lo-1:lo-1) == KEY_NULL) cycle members
                 hi = lo + ctx%csz(m) - 1
                 c = key_cmp(a(lo:hi), b(lo:hi), ctx%dt(m))
                 if (c /= 0) return
             end do members
         end select
     end function
+
+    ! Lay out the key of index ix over its member columns (ix%ncols and
+    ! ix%col_idx set): each member is a flag byte followed by the column's
+    ! value bytes.  key_off(m) is the offset of member m's VALUE; its flag is
+    ! the byte before.  ok = .false. (ix%key_size left 0) if a member does not
+    ! resolve to a column that can be a key member.
+    pure subroutine layout_index_key(t, ix, ok)
+        type(table_t), intent(in)    :: t
+        type(index_t), intent(inout) :: ix
+        logical,       intent(out)   :: ok
+        integer :: m, koff
+        ok = .false.
+        ix%key_size = 0
+        if (allocated(ix%key_off)) deallocate(ix%key_off)
+        allocate(ix%key_off(ix%ncols))
+        koff = 1
+        members: do m = 1, ix%ncols
+            if (ix%col_idx(m) < 1 .or. ix%col_idx(m) > t%ncols) return
+            if (t%cols(ix%col_idx(m))%dtype == DT_TEXT) return
+            ix%key_off(m) = koff + KEY_FLAG_BYTES
+            koff = ix%key_off(m) + t%cols(ix%col_idx(m))%csize
+        end do members
+        ix%key_size = koff - 1
+        ok = .true.
+    end subroutine
 
     pure function make_kc_ctx(t, ix) result(c)
         type(table_t), intent(in) :: t
@@ -1446,8 +1504,11 @@ contains
         end select
     end function
 
-    ! Gather an index's member-column bytes out of a row buffer into a
-    ! contiguous key buffer (key(1:ix%key_size)), in declared member order.
+    ! Gather an index's members out of a row buffer into a contiguous key
+    ! buffer (key(1:ix%key_size)), in declared member order: for each, the
+    ! flag byte and then the column's bytes.  A NULL member is KEY_NULL
+    ! followed by NUL bytes, whatever the row holds there, so that equal keys
+    ! are equal bytes.
     pure subroutine extract_key(t, ix, rowbuf, key)
         type(table_t),    intent(in)  :: t
         type(index_t),    intent(in)  :: ix
@@ -1456,6 +1517,15 @@ contains
         integer :: m, k, vlen, lo
         members: do m = 1, ix%ncols
             associate (c => t%cols(ix%col_idx(m)))
+                lo = ix%key_off(m)
+                if (row_is_null(rowbuf, c)) then
+                    key(lo-1:lo-1) = KEY_NULL
+                    do k = lo, lo + c%csize - 1
+                        key(k:k) = CH_NUL
+                    end do
+                    cycle members
+                end if
+                key(lo-1:lo-1) = KEY_SET
                 if (c%dtype == DT_CHAR) then
                     ! Canonicalise trailing blanks out of the key. The stored
                     ! member is NUL-padded (row_set_char); its value runs to the
@@ -1515,10 +1585,11 @@ contains
     end function
 
     ! .true. if any member column of index ix is NULL in this row buffer. Such
-    ! a row is omitted from the index entirely (partial-index / SQL NULL
-    ! semantics): it never matches an equality or range lookup, and a unique
-    ! index places no constraint on it (multiple NULL-member rows are allowed).
-    ! Operates on the full row buffer (which carries the NULL bitmap), not the
+    ! a row is in the index like any other, but SQL NULL semantics apply to
+    ! its key: it never equals another key, so a unique index places no
+    ! constraint on it (several NULL-member rows are allowed) and a by-key
+    ! lookup with a NULL member matches nothing.  Operates on the full row
+    ! buffer (which carries the NULL bitmap); key_null_any is the same test on
     ! extracted key bytes.
     pure function key_has_null(t, ix, rowbuf) result(yes)
         type(table_t),    intent(in) :: t
@@ -1535,9 +1606,25 @@ contains
         end do members
     end function
 
+    ! .true. if any member of this extracted key is NULL (see key_has_null).
+    pure function key_null_any(ix, key) result(yes)
+        type(index_t),    intent(in) :: ix
+        character(len=*), intent(in) :: key
+        logical :: yes
+        integer :: m
+        yes = .false.
+        members: do m = 1, ix%ncols
+            if (key(ix%key_off(m)-1 : ix%key_off(m)-1) == KEY_NULL) then
+                yes = .true.
+                return
+            end if
+        end do members
+    end function
+
     ! Composite compare of two key buffers: member by member in declared
-    ! order, each with its own dtype via key_cmp; the first non-equal member
-    ! decides. A single-member index is byte-identical to the old behaviour.
+    ! order - the flag byte first (NULL before any value, two NULLs equal for
+    ! ordering), then the values with their own dtype via key_cmp; the first
+    ! non-equal member decides.  The same order as bt_key_cmp.
     pure function key_cmp_ix(t, ix, a, b) result(r)
         type(table_t),    intent(in) :: t
         type(index_t),    intent(in) :: ix
@@ -1556,8 +1643,13 @@ contains
         integer :: r, m, lo, hi
         r = 0
         members: do m = 1, nmem
+            lo = ix%key_off(m)
+            if (a(lo-1:lo-1) /= b(lo-1:lo-1)) then
+                r = merge(-1, 1, a(lo-1:lo-1) == KEY_NULL)
+                return
+            end if
+            if (a(lo-1:lo-1) == KEY_NULL) cycle members
             associate (c => t%cols(ix%col_idx(m)))
-                lo = ix%key_off(m)
                 hi = lo + c%csize - 1
                 r = key_cmp(a(lo:hi), b(lo:hi), c%dtype)
             end associate
@@ -1616,10 +1708,9 @@ contains
             if (stat /= SQR_OK) return
             allocate(character(len=t%record_size) :: rbuf)
             ! Size the gather buffers straight from the table's live-row
-            ! counter, no separate counting pass.  A partial index fills fewer
-            ! slots (rows with a NULL member are skipped below); an over-run
-            ! would mean live_count is stale — a bug to surface (SQR_INVALID),
-            ! not to silently grow past.
+            ! counter, no separate counting pass.  Every live row is indexed,
+            ! so an over-run would mean live_count is stale — a bug to
+            ! surface (SQR_INVALID), not to silently grow past.
             allocate(character(len=ix%key_size) :: keys(max(1, t%live_count)))
             allocate(pays(max(1, t%live_count)))
             nlive = 0
@@ -1631,10 +1722,6 @@ contains
                     return
                 end if
                 if (row_status(rbuf) /= ROW_ALIVE) cycle gather
-                ! A row with any NULL index member is not indexed (partial-index
-                ! semantics). keys(:) was sized to the live-row count, so leaving
-                ! these out simply uses fewer slots than allocated.
-                if (key_has_null(t, ix, rbuf)) cycle gather
                 nlive = nlive + 1
                 if (nlive > size(keys)) then   ! live_count was stale
                     stat = SQR_INVALID
@@ -1798,6 +1885,10 @@ contains
                     return
                 end if
                 if (row_status(rbuf) /= ROW_ALIVE) cycle pairs
+                ! A key with a NULL member equals nothing, itself included,
+                ! so it is never one of a duplicate pair.  Equal keys without
+                ! a NULL are still adjacent, so skipping these breaks no run.
+                if (key_null_any(ix, ckey)) cycle pairs
                 if (have_live) then
                     if (key_cmp_ix(t, ix, pkey, ckey) == 0) then
                         found = .true.

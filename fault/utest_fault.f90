@@ -58,6 +58,7 @@ program utest_fault
     call compact_atomicity()
     call compact_index_recovery()
     call create_index_retry()
+    call upgrade_recovery()
     call close_failure()
     call close_clean()
 
@@ -554,6 +555,75 @@ contains
         call check(bad == 0, &
             'compact: index consistent (db_verify) after every mid-compact failure')
     end subroutine compact_index_recovery
+
+    ! Upgrade of a sqr 1.x database (schema version 1) by a read-write
+    ! db_open: rebuild each table's indices, write its schema, then the
+    ! catalog.  A fault at any I/O on the way must fail the open, and the next
+    ! open, unarmed, must finish the job: every table verifies and the query
+    ! that 1.x got wrong (a = 5 on the composite (a,b) index of t, with a NULL
+    ! b) finds both rows.
+    subroutine upgrade_recovery()
+        character(len=*), parameter :: FIX = 'test/fixtures/v1_null.sqr'
+        type(db_t) :: db
+        type(db_cursor_t) :: cur
+        integer :: rs, n, nops, bad, unhealed, ios, nrows
+        integer(int32) :: rid
+        logical :: ok, more
+        character(len=:), allocatable :: buf
+        character(len=128) :: emsg
+
+        call fault_disarm()
+        if (.not. c_path_exists(FIX)) then
+            print '(a)', '  SKIP upgrade: sqr 1.x fixture not found (run from the project root)'
+            return
+        end if
+        ios = c_rmtree(DBDIR)
+        call db_unpack(FIX, DBDIR, rs)
+        call check(rs == SQR_OK, 'upgrade: fixture unpacks')
+        call fault_arm(BIG)
+        call db_open(db, DBDIR, rs)
+        nops = fault_count()
+        call fault_disarm()
+        if (rs == SQR_OK) call db_close(db)
+        call check(rs == SQR_OK, 'upgrade: clean run succeeds')
+        call check(nops > 0,     'upgrade: I/O occurred (FAULT=on linked)')
+
+        bad = 0; unhealed = 0
+        fault_loop: do n = 1, nops
+            ios = c_rmtree(DBDIR)
+            call db_unpack(FIX, DBDIR, rs)
+            call fault_arm(n)
+            call db_open(db, DBDIR, rs)
+            call fault_disarm()
+            if (rs == SQR_OK) then
+                bad = bad + 1
+                call db_close(db)
+            end if
+            call db_open(db, DBDIR, rs)
+            if (rs /= SQR_OK) then
+                unhealed = unhealed + 1
+                cycle fault_loop
+            end if
+            ok = .true.
+            call db_verify(db, 't', rs, emsg); ok = ok .and. rs == SQR_OK
+            call db_verify(db, 'u', rs, emsg); ok = ok .and. rs == SQR_OK
+            call db_verify(db, 'e', rs, emsg); ok = ok .and. rs == SQR_OK
+            call db_find_range(db, 't', 'a', 5_int32, 5_int32, cur, rs)
+            ok = ok .and. rs == SQR_OK
+            call row_alloc(buf, db_record_size(db, 't'))
+            nrows = 0
+            drain: do
+                call db_cursor_next(db, cur, rid, buf, more, ios)
+                if (.not. more) exit drain
+                nrows = nrows + 1
+            end do drain
+            if (.not. ok .or. nrows /= 2) unhealed = unhealed + 1
+            call db_close(db)
+        end do fault_loop
+        call check(bad == 0, 'upgrade: every injected I/O failed the open')
+        call check(unhealed == 0, 'upgrade: the next open completes it after every failure')
+        ios = c_rmtree(DBDIR)
+    end subroutine upgrade_recovery
 
     ! M3: a create_index that fails at any point (including the final
     ! write_schema) must tear the half-built index back down, so a retry on the
