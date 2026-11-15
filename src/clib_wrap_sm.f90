@@ -286,30 +286,25 @@ contains
         ready = r /= 0_c_int
     end subroutine
 
+    ! Both socket transfers hand the character argument straight to the C
+    ! shim (a character scalar may be the actual argument for its buf(*)):
+    ! no copy is made, so a reply of any size costs no temporary.
     module subroutine c_sock_recv(sock, buf, nrecv)
         integer(c_int64_t), intent(in)    :: sock
         character(len=*),   intent(inout) :: buf
         integer,            intent(out)   :: nrecv
-        character(kind=c_char), allocatable :: tmp(:)
-        if (len(buf) == 0) then
-            nrecv = 0
-            return
-        end if
-        allocate(tmp(len(buf)))
-        nrecv = int(sqr_os_sock_recv(sock, tmp, int(len(buf), c_int64_t)))
-        if (nrecv > 0) buf(1:nrecv) = transfer(tmp(1:nrecv), buf(1:nrecv))
+        nrecv = 0
+        if (len(buf) == 0) return
+        nrecv = int(sqr_os_sock_recv(sock, buf, int(len(buf), c_int64_t)))
     end subroutine
 
     module function c_sock_send(sock, bytes) result(ierr)
         integer(c_int64_t), intent(in) :: sock
         character(len=*),   intent(in) :: bytes
         integer                        :: ierr
-        character(kind=c_char), allocatable :: tmp(:)
         ierr = 0
         if (len(bytes) == 0) return
-        allocate(tmp(len(bytes)))
-        tmp = transfer(bytes, tmp)
-        if (sqr_os_sock_send(sock, tmp, int(len(bytes), c_int64_t)) /= len(bytes)) ierr = 1
+        if (sqr_os_sock_send(sock, bytes, int(len(bytes), c_int64_t)) /= len(bytes)) ierr = 1
     end function
 
     module subroutine c_sock_close(sock)

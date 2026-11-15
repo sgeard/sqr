@@ -216,8 +216,8 @@ utest: $(TEST_BIN)
 	@for t in $(TEST_BIN); do echo "==> $$t" && $$t || exit 1; done
 
 # The quick gate: the dependency scan with warnings as errors, the unit
-# tests and the two shell-level suites.
-check: depcheck utest sqlttest shelltest
+# tests, the two shell-level suites and the sqrd wire-service suite.
+check: depcheck utest sqlttest shelltest sqrdtest
 
 # sqllogictest-subset functional tests: a Tcl harness (no tcllib; uses the
 # system md5sum) replays sqlt/tests/*.test records through the sqlsh REPL and

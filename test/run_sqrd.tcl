@@ -321,6 +321,39 @@ lassign [reply $c2] hdr payload
 check {$hdr eq "NONE"} "QUIT -> NONE"
 close $c2
 
+# A large reply: 4,000 rows of a full CHAR(2000) is about 7.6 MB of cells,
+# more than a default 8 MB stack can hold beside anything else.  The reply
+# must arrive whole, whatever the compiler does with temporaries.
+lassign [reply [sendsql $c "CREATE TABLE big (a INTEGER, c CHAR(2000))"]] hdr payload
+set wide [string repeat x 2000]
+set loaded 1
+lassign [reply [sendsql $c "BEGIN"]] hdr payload
+for {set base 0} {$base < 4000} {incr base 100} {
+    set vals {}
+    for {set k 1} {$k <= 100} {incr k} {
+        lappend vals "([expr {$base + $k}], '$wide')"
+    }
+    lassign [reply [sendsql $c "INSERT INTO big VALUES [join $vals ,]"]] hdr payload
+    if {$hdr ne "COUNT 100"} { set loaded 0 }
+}
+lassign [reply [sendsql $c "COMMIT"]] hdr payload
+check $loaded "4,000 wide rows loaded"
+set nbytes -1
+if {![catch {sendsql $c "SELECT * FROM big"; rows $c} r]} {
+    set nbytes 0
+    foreach pair [lindex $r 3] { incr nbytes [string length [lindex $pair 1]] }
+}
+check {$nbytes == 4000 * 2004} "a 7.6 MB reply arrives whole ($nbytes cell bytes)"
+if {$nbytes < 0} {
+    # the server died under the reply: nothing below can be asked of it
+    catch {close $c}
+    catch {close $srv}
+    file delete -force $dbdir $realdir2 $linkdir sqrd_func_backup.sqr
+    puts "sqrd functional: $npass passed, $nfail failed"
+    exit 1
+}
+lassign [reply [sendsql $c "DROP TABLE big"]] hdr payload
+
 sendline $c "QUIT"
 reply $c
 close $c
@@ -330,6 +363,46 @@ exec kill [pid $srv]
 catch {close $srv}
 file delete -force $dbdir $realdir2 $linkdir
 file delete -force sqrd_func_backup.sqr
+
+# ---- an index must survive the daemon being killed ----
+# kill is the documented way to stop sqrd, and it closes nothing.  An index
+# built outside a transaction is named by the schema at once, so its file has
+# to be complete on disk by then: the next open must succeed and the index
+# must answer.
+set killdir sqrd_func_kill
+file delete -force $killdir
+set srv [open [list | $exe $killdir 0] r]
+fconfigure $srv -blocking 1
+set port [lindex [gets $srv] 1]
+set c [dial $port]
+sendline $c "HELLO 1 killtest"
+gets $c
+reply [sendsql $c "CREATE TABLE t (a INTEGER, b CHAR(8))"]
+reply [sendsql $c "INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three')"]
+lassign [reply [sendsql $c "CREATE INDEX ON t (a)"]] hdr payload
+check {[lindex $hdr 0] eq "MSG"} "index created before the kill"
+exec kill [pid $srv]
+catch {close $c}
+catch {close $srv}
+
+set srv [open [list | $exe $killdir 0] r]
+fconfigure $srv -blocking 1
+set line [gets $srv]
+check {[lindex $line 0] eq "LISTENING"} "database reopens after the daemon was killed"
+set found ""
+if {[lindex $line 0] eq "LISTENING"} {
+    set c [dial [lindex $line 1]]
+    sendline $c "HELLO 1 killtest"
+    gets $c
+    if {![catch {sendsql $c "SELECT b FROM t WHERE a = 2"; rows $c} r]} {
+        set found [cell $r 0 0]
+    }
+    catch {close $c}
+    exec kill [pid $srv]
+}
+catch {close $srv}
+check {$found eq "two"} "and the index answers a lookup"
+file delete -force $killdir
 
 puts "sqrd functional: $npass passed, $nfail failed"
 exit [expr {$nfail > 0}]

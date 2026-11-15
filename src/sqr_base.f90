@@ -1655,7 +1655,22 @@ contains
             call bt_bulk_load(ix%bt, keys(1:nlive), pays(1:nlive), &
                               bt_key_cmp, ix%kc, bs)
             stat = sqr_of_bt(bs)
-            if (stat == SQR_OK) ix%nentries = int(ix%bt%nentries)
+            if (stat /= SQR_OK) return
+            ix%nentries = int(ix%bt%nentries)
+            ! Outside a transaction no commit barrier follows, and the caller
+            ! is about to write a schema that names this file: put the whole
+            ! tree in the file first (drain the unit, then fsync when durable),
+            ! so neither a killed process nor a power loss can leave the
+            ! schema naming an index that is not there.
+            if (.not. db%jrnl%active) then
+                call bt_sync(ix%bt, bs)
+                stat = sqr_of_bt(bs)
+                if (stat == SQR_OK .and. db%durable) then
+                    ios = c_fsync_path(index_path(db, t%name, j))
+                    call io_check(ios)
+                    if (ios /= 0) stat = SQR_ERR
+                end if
+            end if
         end associate
     end subroutine
 
