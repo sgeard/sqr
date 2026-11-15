@@ -1478,12 +1478,14 @@ contains
         logical,               intent(in) :: desc
         logical :: gt
         integer :: cmp
-        cmp = cmp_rows(g, oc, a, b)        ! ascending, NULL last
+        cmp = cmp_rows(g, oc, a, b)        ! ascending, NULL first
         if (desc) cmp = -cmp
         gt = cmp > 0
     end function
 
-    ! Compare rows a and b on column oc for ascending order, NULLs last.
+    ! Compare rows a and b on column oc for ascending order, NULLs first -
+    ! the order an index holds its keys in, so that the two can never
+    ! disagree.  DESC negates the result, which puts NULLs last.
     ! Returns -1 / 0 / 1.
     function cmp_rows(g, oc, a, b) result(cmp)
         type(row_match_ctx_t), intent(in) :: g
@@ -1495,10 +1497,10 @@ contains
             na = row_is_null(g%bufs(a), col)
             nb = row_is_null(g%bufs(b), col)
             if (na .or. nb) then
-                ! NULL sorts last in ascending order.
+                ! NULL sorts first in ascending order.
                 if (na .and. nb) then; cmp = 0
-                else if (na) then;     cmp = 1
-                else;                  cmp = -1
+                else if (na) then;     cmp = -1
+                else;                  cmp = 1
                 end if
                 return
             end if

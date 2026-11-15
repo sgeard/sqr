@@ -42,6 +42,7 @@ program utest_sql
     call test_index_scan_parity()
     call test_index_scan_parity_sweep()
     call test_index_band_parity_sweep()
+    call test_index_null_parity_sweep()
     call test_band_uses_index()
     call test_transactions()
     call test_exec_errors()
@@ -594,9 +595,15 @@ contains
         ! a comparison against NULL never matches
         call run(db, "SELECT id FROM t WHERE age >= 0 ORDER BY id", res, rs)
         call check(res%nrows == 1, 'null: comparison excludes NULLs')
-        ! NULL renders as the NULL cell and sorts last ascending
+        ! NULL renders as the NULL cell and sorts first ascending (index
+        ! order), keeping insertion order among themselves; last under DESC
         call run(db, "SELECT id, age FROM t ORDER BY age", res, rs)
-        call check(res%cells(3,2)%is_null, 'null: NULL sorts last ascending')
+        call check(res%cells(1,2)%is_null .and. res%cells(2,2)%is_null .and. &
+                   cell(res,1,1) == '1' .and. cell(res,2,1) == '3' .and. cell(res,3,1) == '2', &
+                   'null: NULL sorts first ascending -> 1,3,2')
+        call run(db, "SELECT id, age FROM t ORDER BY age DESC", res, rs)
+        call check(cell(res,1,1) == '2' .and. res%cells(2,2)%is_null .and. res%cells(3,2)%is_null, &
+                   'null: NULL sorts last descending')
 
         call db_close(db)
     end subroutine
@@ -1165,6 +1172,56 @@ contains
         call parity_probe('sweep char store+query-blank', &
             "CREATE TABLE t (c CHAR(8))", "INSERT INTO t VALUES ('b  '),('x'),('b ')", &
             't (c)', "SELECT c FROM t WHERE c = 'b '", 2)
+    end subroutine
+
+    ! NULL-bearing data under composite and single-column indices.  In sqr
+    ! 1.x a row with a NULL in any member was left out of the index, so a
+    ! query on the leading member lost every row whose trailing member was
+    ! NULL as soon as the index existed (review finding E1).  Every case
+    ! compares the scan with the index-driven plan.
+    subroutine test_index_null_parity_sweep()
+        character(len=*), parameter :: DDL = &
+            "CREATE TABLE t (a INTEGER, b INTEGER, c CHAR(8), r REAL)"
+        character(len=*), parameter :: INS = "INSERT INTO t VALUES " // &
+            "(5,NULL,'x',1.5),(5,1,NULL,NULL),(6,NULL,'y',2.5),(NULL,7,'x',NULL),(7,2,NULL,3.5)"
+
+        ! --- leading INT member, NULL trailing members ---
+        call parity_probe('null (a,b) eq', DDL, INS, 't (a, b)', &
+            "SELECT a FROM t WHERE a = 5", 2)
+        call parity_probe('null (a,b) ge', DDL, INS, 't (a, b)', &
+            "SELECT a FROM t WHERE a >= 5", 4)
+        call parity_probe('null (a,b) lt', DDL, INS, 't (a, b)', &
+            "SELECT a FROM t WHERE a < 6", 2)
+        call parity_probe('null (a,b) le', DDL, INS, 't (a, b)', &
+            "SELECT a FROM t WHERE a <= 7", 4)
+        call parity_probe('null (a,b) gt max stored', DDL, INS, 't (a, b)', &
+            "SELECT a FROM t WHERE a > 7", 0)
+        call parity_probe('null (a,b) between', DDL, INS, 't (a, b)', &
+            "SELECT a FROM t WHERE a BETWEEN 5 AND 6", 3)
+        call parity_probe('null (a,b) ge int-min', DDL, INS, 't (a, b)', &
+            "SELECT a FROM t WHERE a >= -2147483648", 4)
+        call parity_probe('null (a,c) eq', DDL, INS, 't (a, c)', &
+            "SELECT a FROM t WHERE a = 5", 2)
+        call parity_probe('null (a,r) ge', DDL, INS, 't (a, r)', &
+            "SELECT a FROM t WHERE a >= 6", 2)
+        call parity_probe('null (a,b,c) eq', DDL, INS, 't (a, b, c)', &
+            "SELECT a FROM t WHERE a = 5", 2)
+
+        ! --- leading CHAR and REAL members ---
+        call parity_probe('null (c,a) eq', DDL, INS, 't (c, a)', &
+            "SELECT a FROM t WHERE c = 'x'", 2)
+        call parity_probe('null (c,a) ge', DDL, INS, 't (c, a)', &
+            "SELECT a FROM t WHERE c >= 'x'", 3)
+        call parity_probe('null (r,b) ge', DDL, INS, 't (r, b)', &
+            "SELECT a FROM t WHERE r >= 1.5", 3)
+        call parity_probe('null (r,b) lt', DDL, INS, 't (r, b)', &
+            "SELECT a FROM t WHERE r < 3.0", 2)
+
+        ! --- single-column index over a column with NULLs ---
+        call parity_probe('null (a) lt', DDL, INS, 't (a)', &
+            "SELECT a FROM t WHERE a < 6", 2)
+        call parity_probe('null (r) le', DDL, INS, 't (r)', &
+            "SELECT a FROM t WHERE r <= 2.5", 2)
     end subroutine
 
     ! Band-shaped predicates (BETWEEN, <, <=, >, >=) driven through the

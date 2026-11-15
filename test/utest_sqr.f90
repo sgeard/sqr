@@ -4020,6 +4020,9 @@ contains
         call db_open(db, UDIR2, rs, emsg)
         call db_close(db)
         call copy_file(UDIR2 // '/u.schema.v1', UDIR2 // '/u.schema', ok)
+        call db_open(db, UDIR2, rs, emsg, readonly=.true.)
+        call check(rs == SQR_VERSION .and. .not. db%opened, &
+                   'upgrade: a version-1 table under a current catalog is refused read-only')
         call db_open(db, UDIR2, rs, emsg)
         ti = db_table_index(db, 'u')
         call check(ok .and. rs == SQR_OK, 'upgrade: version-1 schema over a rebuilt index opens')

@@ -299,6 +299,10 @@ The `WHERE` predicate combines these with `AND`/`OR` (no parentheses):
 and PostgreSQL (SQLite's ignores ASCII case). There is no regular-expression
 operator.
 
+`ORDER BY` puts NULLs first when ascending and last with `DESC`, as SQLite
+does; it is also the order an index keeps its keys in. Rows that compare
+equal keep the order they were found in.
+
 A single comparison or `BETWEEN` on an indexed column is driven through the
 B+-tree; everything else is a scan, with the full predicate re-applied
 either way (identical results). Out of scope (kept honest): JOINs,

@@ -53,3 +53,19 @@ NULL
 4
 (empty)
 40.000
+
+# ORDER BY puts NULLs first when ascending (the order an index keeps its
+# keys in) and last when descending.  The sort is stable.
+query I nosort
+SELECT id FROM t2 WHERE id <= 3 ORDER BY score
+----
+3
+1
+2
+
+query I nosort
+SELECT id FROM t2 WHERE id <= 3 ORDER BY score DESC
+----
+2
+1
+3
