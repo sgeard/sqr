@@ -11,7 +11,7 @@ program proctest
     use, intrinsic :: iso_fortran_env, only: int32, int64
     use, intrinsic :: iso_c_binding, only: c_char, c_int, c_int64_t, c_null_char
     use sqr
-    use clib_wrap, only: c_rmtree
+    use clib_wrap, only: c_rmtree, c_remove
     implicit none
 
     interface
@@ -32,6 +32,7 @@ program proctest
     end interface
 
     character(len=*), parameter :: PDIR = 'proctest_db'
+    character(len=*), parameter :: PPAK = 'proctest_bak.sqr'
     integer :: nargs, pass, fail
     character(len=16) :: mode
 
@@ -78,6 +79,7 @@ contains
         case ('few');    n = 5
         case ('deep');   n = 3000
         case ('commit'); n = 200
+        case ('undo');   n = 2
         case default;    n = 0
         end select
     end function
@@ -86,6 +88,10 @@ contains
     ! indexed table (each insert grows the data file AND writes index pages, so the
     ! journal is armed — and incrementally extended — many times), then either
     ! commit ('commit') or crash with the journal still hot ('few'/'deep').
+    ! 'undo' is "back up, undo, crash": the inserts are a committed gesture,
+    ! db_pack_live then writes the schema with the gesture's rows counted, the
+    ! gesture is undone (the data file shrinks) and the process dies before any
+    ! db_close could rewrite the schema.
     subroutine run_child(scenario)
         character(len=*), intent(in) :: scenario
         type(db_t) :: db
@@ -95,7 +101,11 @@ contains
         call db_open(db, PDIR, rs)
         if (rs /= SQR_OK) call sqr_test_hard_exit(10_c_int)
         ti = db_table_index(db, 'people')
-        call db_begin(db, rs)
+        if (scenario == 'undo') then
+            call db_begin(db, rs, label='G')
+        else
+            call db_begin(db, rs)
+        end if
         if (rs /= SQR_OK) call sqr_test_hard_exit(11_c_int)
         call row_alloc(buf, db%tables(ti)%record_size)
         n = scenario_rows(scenario)
@@ -106,9 +116,15 @@ contains
             call db_insert(db, 'people', buf, rid, rs)
             if (rs /= SQR_OK) call sqr_test_hard_exit(12_c_int)
         end do
-        if (scenario == 'commit') then
+        if (scenario == 'commit' .or. scenario == 'undo') then
             call db_commit(db, rs)             ! durable + journal voided
             if (rs /= SQR_OK) call sqr_test_hard_exit(13_c_int)
+        end if
+        if (scenario == 'undo') then
+            call db_pack_live(db, PPAK, rs)
+            if (rs /= SQR_OK) call sqr_test_hard_exit(14_c_int)
+            call db_undo(db, rs)
+            if (rs /= SQR_OK) call sqr_test_hard_exit(15_c_int)
         end if
         call sqr_test_hard_exit(0_c_int)       ! crash: hot+uncommitted, or just-committed
     end subroutine
@@ -116,7 +132,8 @@ contains
     ! One crash/recovery round for `scenario`: build the one-row indexed fixture,
     ! spawn a child that crashes, reopen in a fresh process and assert recovery.
     ! 'few'/'deep' must roll the whole uncommitted txn back to the fixture; 'commit'
-    ! must find the committed rows present.  db_verify (index + data) clean always.
+    ! must find the committed rows present; 'undo' must open at all and show the
+    ! fixture alone.  db_verify (index + data) clean always.
     subroutine one_round(scenario, pass, fail)
         character(len=*), intent(in)    :: scenario
         integer,          intent(inout) :: pass, fail
@@ -138,6 +155,7 @@ contains
         call row_set_char(buf, db%tables(1)%cols(3), 'Alice')
         call db_insert(db, 'people', buf, rid, rs)
         call db_close(db)                       ! commit the fixture; no journal left
+        rs = c_remove(PPAK)
 
         call get_command_argument(0, exepath)
         pid = sqr_test_spawn(trim(exepath)//c_null_char, 'child:'//scenario//c_null_char)
@@ -172,15 +190,18 @@ contains
         call ck(rs == SQR_OK, 'proc['//scenario//']: db_verify clean after recovery', pass, fail)
         call db_close(db)
         rs = c_rmtree(PDIR)
+        rs = c_remove(PPAK)
     end subroutine
 
     ! Parent role: sweep the crash scenarios — a shallow crash, the deep-mid-txn
-    ! E1 stress (many incremental arms), and a just-committed process.
+    ! E1 stress (many incremental arms), a just-committed process, and one that
+    ! dies after undoing a gesture a backup had already counted.
     subroutine run_parent(pass, fail)
         integer, intent(inout) :: pass, fail
         call one_round('few',    pass, fail)
         call one_round('deep',   pass, fail)
         call one_round('commit', pass, fail)
+        call one_round('undo',   pass, fail)
     end subroutine
 
 end program proctest

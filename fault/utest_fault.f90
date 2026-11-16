@@ -81,6 +81,11 @@ program utest_fault
     ! Q1: a fault swept across a LABELLED commit must never corrupt the history.
     call capture_fault()
 
+    ! C4: an undo or redo is one journalled unit — a fault anywhere inside it
+    ! leaves the gesture wholly in place or wholly gone, never half applied.
+    call history_atomicity(redo=.false.)
+    call history_atomicity(redo=.true.)
+
     ! H1: a faulted undo replay must leave the journal hot, never voided.
     call recover_fault()
     call check(no_stranded_units(), 'all: no unit left connected after faulted runs')
@@ -952,6 +957,119 @@ contains
         call check(bad == 0, &
             'capture_fault: every labelled-commit fault leaves a coherent db + replayable history')
     end subroutine capture_fault
+
+    ! C4 undo/redo atomicity.  The gesture inserts a row (the data file and
+    ! the index grow, so undo truncates and redo re-extends) and deletes one
+    ! (in-place regions).  Sweep a fault across every I/O of db_undo, or of
+    ! db_redo after a clean undo.  A faulted apply must report an error, leave
+    ! the store exactly as it was before the call — same session and after a
+    ! reopen — and leave the step where it was, so that a retry completes.  A
+    ! clean apply lands the other state.
+    subroutine history_atomicity(redo)
+        logical, intent(in) :: redo
+        integer :: rs, k, nops, bad
+        character(len=128) :: emsg
+        character(len=:), allocatable :: what
+
+        what = merge('redo', 'undo', redo)
+        call hist_start(redo)
+        call fault_arm(BIG)                      ! never fires; just counts
+        call hist_apply(redo, rs)
+        nops = fault_count()
+        call fault_disarm()
+        call check(rs == SQR_OK, 'history_atomicity: clean ' // what // ' succeeds')
+        call check(nops > 0,     'history_atomicity: ' // what // ' performs I/O')
+        call check(hist_landed(redo, .true.), 'history_atomicity: clean ' // what // ' lands')
+        call close_g()
+
+        bad = 0
+        sweep: do k = 1, nops
+            call hist_start(redo)
+            call fault_arm(k)
+            call hist_apply(redo, rs)
+            call fault_disarm()
+            if (rs == SQR_OK) then
+                if (.not. hist_landed(redo, .true.)) bad = bad + 1
+            else
+                if (.not. hist_landed(redo, .false.)) bad = bad + 1
+                ! The step is still where it was: a retry goes through.
+                call hist_apply(redo, rs)
+                if (rs /= SQR_OK) bad = bad + 1
+                if (.not. hist_landed(redo, .true.)) bad = bad + 1
+            end if
+            call close_g()
+            call db_open(gdb, DBDIR, rs)
+            gopen = rs == SQR_OK
+            if (rs /= SQR_OK) then
+                bad = bad + 1
+                cycle sweep
+            end if
+            call db_verify(gdb, 'people', rs, emsg)
+            if (rs /= SQR_OK) bad = bad + 1
+            if (hist_has_gesture() .neqv. redo) bad = bad + 1
+            call close_g()
+        end do sweep
+        call check(bad == 0, 'history_atomicity: every mid-' // what // &
+                             ' fault leaves the gesture wholly applied or wholly not')
+    end subroutine history_atomicity
+
+    ! Fresh fixture with one committed gesture on the undo stack (and, for the
+    ! redo sweep, undone again so that it sits on the redo stack).
+    subroutine hist_start(redo)
+        logical, intent(in) :: redo
+        integer :: st
+        integer(int32) :: rid
+        call prep_indexed()
+        call db_open(gdb, DBDIR, st)
+        gopen = st == SQR_OK
+        call db_begin(gdb, st, label='G')
+        call insert_zoe(gdb, rid, st)
+        call db_delete(gdb, 'people', 2_int32, st)
+        call db_commit(gdb, st)
+        if (redo) call db_undo(gdb, st)
+    end subroutine hist_start
+
+    subroutine hist_apply(redo, st)
+        logical, intent(in)  :: redo
+        integer, intent(out) :: st
+        if (redo) then
+            call db_redo(gdb, st)
+        else
+            call db_undo(gdb, st)
+        end if
+    end subroutine hist_apply
+
+    ! True when the gesture's effect is in the store: Zoe present, row 2 gone.
+    logical function hist_has_gesture() result(yes)
+        integer :: st, ti
+        integer(int32) :: r
+        logical :: has_zoe, has_bob
+        character(len=:), allocatable :: buf
+        ti = db_table_index(gdb, 'people')
+        call db_find_by_int(gdb, 'people', 'age', 99_int32, r, st)
+        has_zoe = st == SQR_OK .and. r /= 0
+        call row_alloc(buf, gdb%tables(ti)%record_size)
+        call db_get(gdb, 'people', 2_int32, buf, st)
+        has_bob = st == SQR_OK
+        yes = has_zoe .and. .not. has_bob
+    end function hist_has_gesture
+
+    ! True when the open store is coherent and stands where it should after an
+    ! undo/redo that went through (`applied`) or was rolled back: the gesture
+    ! in or out as a whole, and its step on the matching stack.
+    logical function hist_landed(redo, applied) result(ok)
+        logical, intent(in) :: redo, applied
+        logical :: want
+        integer :: st, ti
+        character(len=128) :: emsg
+        want = applied .eqv. redo
+        ti = db_table_index(gdb, 'people')
+        call db_verify(gdb, 'people', st, emsg)
+        ok = st == SQR_OK
+        ok = ok .and. (hist_has_gesture() .eqv. want)
+        ok = ok .and. gdb%tables(ti)%live_count == 3
+        ok = ok .and. (db_can_undo(gdb) .eqv. want) .and. (db_can_redo(gdb) .neqv. want)
+    end function hist_landed
 
     ! H1 recovery-failure path.  A transient I/O error while replaying the undo
     ! set must NOT void the journal: it stays hot so the next open retries the

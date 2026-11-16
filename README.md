@@ -138,6 +138,30 @@ call db_begin(db, st)
 call db_commit(db, st)     ! durable here; or db_rollback(db, st)
 ```
 
+Give the transaction a `label` and it becomes a *gesture*: one step on an
+in-memory Undo/Redo history, for an application that offers Undo.
+
+```fortran
+call db_begin(db, st, label='Move point')
+! ... the changes that make up one user action ...
+call db_commit(db, st)
+
+call db_undo(db, st, label)    ! the gesture is gone; label = 'Move point'
+call db_redo(db, st, label)    ! ...and back
+```
+
+- The history lives for the session. Applying a step is itself a journalled
+  transaction, so an undo or redo is all-or-nothing and survives a crash like
+  any other commit.
+- A step restores the bytes its gesture changed, so it is only valid while
+  nothing else has changed them. **A committed change that is not a gesture —
+  any auto-committed mutator, any `db_begin` without a label — empties the
+  history**, as do the structural operations (`db_compact`, `db_create_index`,
+  column changes, ...). An application that offers Undo makes every write a
+  gesture.
+- `db_undo` and `db_redo` are refused inside an open transaction
+  (`SQR_INVALID`), and return `SQR_NO_UNDO` when there is nothing to apply.
+
 ---
 
 ## Public API surface
@@ -157,6 +181,8 @@ call db_commit(db, st)     ! durable here; or db_rollback(db, st)
 - **Range scans / cursors:** `db_open_cursor`, `db_find_range`,
   `db_cursor_next`
 - **Transactions:** `db_begin`, `db_commit`, `db_rollback`
+- **Undo / Redo history:** `db_undo`, `db_redo`, `db_can_undo`, `db_can_redo`,
+  `db_reset_history`
 - **Row buffers:** `row_alloc`, `row_clear`, `row_status`, `row_set_status`,
   `row_set_null`, `row_clear_null`, `row_is_null`, `row_set_int` /
   `row_get_int`, `row_set_real` / `row_get_real`, `row_set_char` /

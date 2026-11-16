@@ -46,6 +46,14 @@ program utest_journal
     call one_case('huge plen (>int32) -> voided, safe',  perturb_plen_huge, .false.)
     call one_case('negative plen -> voided, safe',       perturb_plen_neg,  .false.)
 
+    ! Tail records: the bytes a truncation removes come back on recovery, at
+    ! the point the file was cut to and nowhere else.
+    call tail_case('tail: truncated file restored',            8_int64, .true.)
+    call tail_case('tail: truncation never happened',         16_int64, .true.)
+    call tail_case('tail: interrupted re-append completed',   12_int64, .true.)
+    call tail_case('tail: file cut short of the record',       4_int64, .false.)
+    call tail_rollback()
+
     ios = c_rmtree(DIR)
     print '(a,i0,a,i0,a)', 'sqr journal tests: ', pass, ' passed, ', fail, ' failed'
     if (fail > 0) error stop 1
@@ -110,6 +118,57 @@ contains
         end if
         call db_close(db2)
     end subroutine one_case
+
+    ! Log the tail of a 16-byte file beyond byte 8, leave the file `left`
+    ! bytes long (8 = the truncation the record guards; 16 = it never
+    ! happened; 12 = a replay re-appended half and died; 4 = not a state the
+    ! record describes), crash, and recover through a fresh open.
+    subroutine tail_case(label, left, expect_whole)
+        character(len=*), intent(in) :: label
+        integer(int64),   intent(in) :: left
+        logical,          intent(in) :: expect_whole
+        type(db_t) :: db, db2
+        integer :: st, r
+        r = c_rmtree(DIR)
+        call db_open(db, DIR, stat=st)
+        call jwrite_file(FULL, 'ABCDEFGHIJKLMNOP')
+        call txn_begin(db, st)
+        call jrnl_log_tail(db, REL, 8_int64, st)
+        call check(st == SQR_OK .and. jrnl_hot(db), label // ': tail logged, journal hot')
+        r = int(c_truncate(FULL, left))
+        call c_lock_release(db%lock_tok)
+        call jrnl_close_unit(db)
+        call db_open(db2, DIR, stat=st)
+        call check(st == SQR_OK .and. .not. jrnl_hot(db2), label // ': recovered, journal not hot')
+        if (expect_whole) then
+            call check(jfile_size(FULL) == 16_int64, label // ': length restored')
+            call check(jread_file(FULL, 16) == 'ABCDEFGHIJKLMNOP', label // ': bytes restored')
+        else
+            call check(jfile_size(FULL) == left, label // ': left alone, no hole made')
+        end if
+        call db_close(db2)
+    end subroutine tail_case
+
+    ! The same record through an in-process rollback.
+    subroutine tail_rollback()
+        type(db_t) :: db
+        integer :: st, r
+        r = c_rmtree(DIR)
+        call db_open(db, DIR, stat=st)
+        call jwrite_file(FULL, 'ABCDEFGHIJKLMNOP')
+        call txn_begin(db, st)
+        call jrnl_log_tail(db, REL, 8_int64, st)
+        r = int(c_truncate(FULL, 8_int64))
+        call txn_rollback(db, st)
+        call check(st == SQR_OK .and. .not. jrnl_hot(db), 'tail: rollback succeeds, journal not hot')
+        call check(jfile_size(FULL) == 16_int64, 'tail: rollback restores the length')
+        call check(jread_file(FULL, 16) == 'ABCDEFGHIJKLMNOP', 'tail: rollback restores the bytes')
+        call txn_begin(db, st)
+        call jrnl_log_tail(db, REL, 16_int64, st)
+        call check(st == SQR_OK .and. .not. jrnl_hot(db), 'tail: nothing beyond the cut logs nothing')
+        call txn_rollback(db, st)
+        call db_close(db)
+    end subroutine tail_rollback
 
     ! ---- perturbations of the on-disk journal header ----
 

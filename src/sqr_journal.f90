@@ -10,7 +10,8 @@
 ! Design: a physical *undo* journal with strict write-ahead ordering.  Before
 ! a transaction overwrites any region of a base file, the original bytes
 ! (REGION) or the original file length (EXTEND, for appends/growth) are
-! captured.  Capture happens through jrnl_log_region/jrnl_log_extend, which
+! captured; a truncation captures the bytes it removes (TAIL).  Capture
+! happens through jrnl_log_region/jrnl_log_extend/jrnl_log_tail, which
 ! every base-write site calls *before* its write — and each of those calls
 ! re-serialises the undo set to the hot journal and fsyncs it before
 ! returning.  So the undo image of a region is always durable before that
@@ -39,6 +40,7 @@ submodule (sqr:sqr_base) sqr_journal
     integer,          parameter :: JSTATE_HOT  = 1        ! valid undo set present
     integer,          parameter :: UNDO_REGION = 1        ! original bytes captured
     integer,          parameter :: UNDO_EXTEND = 2        ! original length captured
+    integer,          parameter :: UNDO_TAIL   = 3        ! truncated-away bytes captured
     integer(int64),   parameter :: JHEADER     = 64_int64 ! reserved header size
     integer(int64),   parameter :: JPRESIZE    = 131072_int64  ! 128 KiB pre-allocation
     ! Fixed parts of a serialised undo record. The variable-length path sits
@@ -97,7 +99,9 @@ contains
         class(db_t), intent(inout) :: db
         integer,    intent(out), optional :: stat
         character(len=*), intent(inout), optional :: errmsg
-        integer :: cst
+        integer :: cst, st
+        logical :: pushed
+        type(hist_step_t) :: dead
         call clear_last_err(db)
         call report(db, SQR_OK, stat, errmsg)
         if (.not. (db%jrnl%active .and. db%jrnl%explicit)) then
@@ -110,9 +114,19 @@ contains
         ! A capture failure only costs the (session-only) history — capture_step
         ! discards it and resets to empty; the commit's own durability stands, so
         ! db_commit still returns txn_commit's status.
-        if (db%hist%capturing) call capture_step(db, cst)
+        pushed = .false.
+        if (db%hist%capturing) then
+            call capture_step(db, cst, pushed)
+            ! Captured — or the capture failed and emptied the history itself.
+            ! Either way this commit is one the history has accounted for.
+            db%hist%tracked = .true.
+        end if
         db%hist%capturing = .false.
-        call txn_commit(db, stat)         ! also clears the explicit latch
+        call txn_commit(db, st)           ! also clears the explicit latch
+        ! A commit that fails has rolled the gesture back, so the step captured
+        ! for it describes a change that never happened: take it off again.
+        if (st /= SQR_OK .and. pushed) call pop_step(db%hist%undo, dead)
+        if (st /= SQR_OK) call report(db, st, stat, errmsg)
     end subroutine
 
     module subroutine db_rollback(db, stat, errmsg)
@@ -226,6 +240,106 @@ contains
         call txn_arm(db, stat)
     end subroutine
 
+    module subroutine jrnl_log_tail(db, path, keep_len, stat)
+        class(db_t),      intent(inout)         :: db
+        character(len=*), intent(in)            :: path
+        integer(int64),   intent(in)            :: keep_len
+        integer,          intent(out), optional :: stat
+        integer :: st, before
+        if (present(stat)) stat = SQR_OK
+        if (.not. db%jrnl%active) then
+            if (present(stat)) stat = SQR_INVALID
+            return
+        end if
+        st = SQR_OK
+        before = db%jrnl%nrec
+        call stage_tail(db, trim(path), keep_len, st)
+        if (st /= SQR_OK) then
+            if (present(stat)) stat = st
+            return
+        end if
+        ! Write-ahead: the removed bytes are durable before the truncation.
+        ! (A file with nothing beyond keep_len staged nothing: nothing to arm.)
+        if (db%jrnl%nrec > before) call txn_arm(db, stat)
+    end subroutine
+
+    ! ---- staged capture (history apply) ----
+    ! The stage_* helpers append one undo record holding the file's CURRENT
+    ! state and do not arm.  A history step knows every range it is about to
+    ! write before it writes any, so apply_step stages them all, arms once
+    ! (one journal write, one pair of syncs) and only then touches a base
+    ! file — the same write-ahead guarantee as jrnl_log_*, without an arm
+    ! per range.  `st` is sticky: a failed stage makes the rest no-ops.
+
+    ! Stage the current bytes of [offset, offset+length-1].
+    subroutine stage_region(db, rel, offset, length, st)
+        class(db_t),      intent(inout) :: db
+        character(len=*), intent(in)    :: rel
+        integer(int64),   intent(in)    :: offset, length
+        integer,          intent(inout) :: st
+        type(undo_rec_t) :: r
+        integer :: ios
+        if (st /= SQR_OK .or. length <= 0_int64) return
+        if (have_rec(db%jrnl, UNDO_REGION, rel, offset, length)) return
+        r%kind   = UNDO_REGION
+        r%path   = rel
+        r%offset = offset
+        r%length = length
+        call read_region(db, rel, offset, length, r%bytes, ios)
+        call io_check(ios)
+        if (ios /= 0) then
+            st = SQR_ERR
+            return
+        end if
+        r%orig_len = file_len(pathjoin(db%dir, rel))
+        call append_rec(db%jrnl, r)
+    end subroutine
+
+    ! Stage the file's current length (a write is about to grow it).
+    subroutine stage_extend(db, rel, st)
+        class(db_t),      intent(inout) :: db
+        character(len=*), intent(in)    :: rel
+        integer,          intent(inout) :: st
+        type(undo_rec_t) :: r
+        if (st /= SQR_OK) return
+        if (have_rec(db%jrnl, UNDO_EXTEND, rel, 0_int64, 0_int64)) return
+        r%kind     = UNDO_EXTEND
+        r%path     = rel
+        r%orig_len = file_len(pathjoin(db%dir, rel))
+        r%bytes    = ''
+        call append_rec(db%jrnl, r)
+    end subroutine
+
+    ! Stage the bytes beyond keep_len (a truncation is about to remove them).
+    subroutine stage_tail(db, rel, keep_len, st)
+        class(db_t),      intent(inout) :: db
+        character(len=*), intent(in)    :: rel
+        integer(int64),   intent(in)    :: keep_len
+        integer,          intent(inout) :: st
+        type(undo_rec_t) :: r
+        integer(int64)   :: cur
+        integer :: ios
+        if (st /= SQR_OK) return
+        if (keep_len < 0_int64) then
+            st = SQR_INVALID
+            return
+        end if
+        cur = file_len(pathjoin(db%dir, rel))
+        if (cur <= keep_len) return
+        r%kind     = UNDO_TAIL
+        r%path     = rel
+        r%orig_len = keep_len
+        r%offset   = keep_len + 1_int64
+        r%length   = cur - keep_len
+        call read_region(db, rel, r%offset, r%length, r%bytes, ios)
+        call io_check(ios)
+        if (ios /= 0) then
+            st = SQR_ERR
+            return
+        end if
+        call append_rec(db%jrnl, r)
+    end subroutine
+
     module subroutine txn_arm(db, stat)
         class(db_t), intent(inout)        :: db
         integer,    intent(out), optional :: stat
@@ -324,11 +438,13 @@ contains
         class(db_t), intent(inout)        :: db
         integer,    intent(out), optional :: stat
         integer :: st, rst
+        logical :: changed
         if (.not. db%jrnl%active) then
             if (present(stat)) stat = SQR_INVALID
             return
         end if
         st = SQR_OK
+        changed = db%jrnl%nrec > 0
         ! Clear hooks first: the committed files are the new truth, so the cached
         ! tree state already matches disk — no reload needed.
         call clear_index_hooks(db, reload=.false., stat=st)
@@ -357,6 +473,16 @@ contains
                 if (rst /= SQR_OK) st = rst
             end if
         end if
+        ! A history step holds absolute byte images of the files as they were
+        ! around its gesture.  A commit that changed the files and is neither a
+        ! captured gesture nor an undo/redo being applied (an auto-committed
+        ! mutator, an unlabelled db_begin) is a change the history has no
+        ! record of; replaying a step over it would silently destroy it.  So
+        ! such a commit empties the history, as every structural operation
+        ! already does (coherent-or-empty).  A commit that failed was rolled
+        ! back and changed nothing.
+        if (changed .and. st == SQR_OK .and. .not. db%hist%tracked) &
+            call db_reset_history(db)
         call clear_txn_state(db)
         if (present(stat)) stat = st
     end subroutine
@@ -425,6 +551,7 @@ contains
         db%jrnl%explicit = .false.
         db%jrnl%armed    = .false.
         db%jrnl%nrec     = 0
+        db%hist%tracked  = .false.
         if (allocated(db%jrnl%recs))  deallocate(db%jrnl%recs)
         if (allocated(db%jrnl%snaps)) deallocate(db%jrnl%snaps)
         call reset_jrnl_arm_state(db%jrnl)
@@ -853,8 +980,24 @@ contains
         integer,          intent(inout) :: st
         character(len=:), allocatable :: full
         integer :: ios
+        integer(int64) :: cur
         full = pathjoin(db%dir, r%path)
         select case (r%kind)
+        case (UNDO_TAIL)
+            ! Put back what a truncation removed.  The bytes go on only at the
+            ! point the file was cut to: a file at least as long as it was
+            ! before the cut needs nothing (the truncation never happened, or
+            ! an earlier replay finished), one cut short of that point is not
+            ! a state this record describes and would need a hole to reach.
+            ! Between the two — cut, or cut and partly re-appended by a replay
+            ! that was itself interrupted — the whole tail is written again.
+            ! So a tail record can only restore a file to the length it had.
+            cur = file_len(full)
+            if (cur >= r%orig_len .and. cur < r%orig_len + r%length) then
+                call write_region(db, r%path, r%offset, r%bytes, ios)
+                call io_check(ios)
+                if (ios /= 0) st = SQR_ERR
+            end if
         case (UNDO_REGION)
             call restore_region(db, r%path, r%offset, r%bytes, ios)
             call io_check(ios)
@@ -1089,11 +1232,12 @@ contains
     ! it needs to parse the payload safely; this checks what those fields
     ! *mean*, once, before any of them reaches a base file:
     !
-    !   * kind is one of the two this library writes
+    !   * kind is one of the three this library writes
     !   * a region starts at or after byte 1 and carries exactly the bytes its
     !     length claims (both operands are already bounded, so the offset +
     !     length test below cannot wrap)
     !   * a captured file length is a real length
+    !   * a tail starts exactly where its file was cut and is not empty
     !
     ! Deliberately no bound against the target file's current size — that is
     ! apply_undo's business, and a legitimate region can sit past a crashed
@@ -1106,17 +1250,28 @@ contains
         if (nrec < 0 .or. nrec > size(recs)) return
         recs_loop: do i = 1, nrec
             associate (r => recs(i))
-                if (r%kind /= UNDO_REGION .and. r%kind /= UNDO_EXTEND) return
+                if (r%kind /= UNDO_REGION .and. r%kind /= UNDO_EXTEND .and. &
+                    r%kind /= UNDO_TAIL) return
                 if (.not. sane_relpath(r%path)) return
                 if (r%orig_len < 0_int64) return
-                if (r%kind == UNDO_REGION) then
+                if (carries_bytes(r%kind)) then
                     if (r%offset < 1_int64) return
                     if (r%length /= int(len(r%bytes), int64)) return
                     if (r%offset > huge(0_int64) - r%length) return
                 end if
+                if (r%kind == UNDO_TAIL) then
+                    if (r%length < 1_int64) return
+                    if (r%offset - 1_int64 /= r%orig_len) return
+                end if
             end associate
         end do recs_loop
         ok = .true.
+    end function
+
+    ! True for the record kinds whose captured bytes are serialised.
+    pure logical function carries_bytes(kind) result(yes)
+        integer, intent(in) :: kind
+        yes = kind == UNDO_REGION .or. kind == UNDO_TAIL
     end function
 
     ! A journal path names one file directly inside the database directory:
@@ -1139,7 +1294,7 @@ contains
         type(undo_rec_t), intent(in) :: r
         integer(int64) :: blen
         blen = 0_int64
-        if (r%kind == UNDO_REGION) blen = int(len(r%bytes), int64)
+        if (carries_bytes(r%kind)) blen = int(len(r%bytes), int64)
         n = int(MIN_REC, int64) + int(len(r%path), int64) + blen
     end function
 
@@ -1152,7 +1307,7 @@ contains
         integer(int64) :: blen
         integer :: plen
         blen = 0_int64
-        if (r%kind == UNDO_REGION) blen = int(len(r%bytes), int64)
+        if (carries_bytes(r%kind)) blen = int(len(r%bytes), int64)
         plen = len(r%path)
         call put_i32(buf, p, r%kind)
         call put_i32(buf, p, plen)
@@ -1501,7 +1656,10 @@ contains
     ! from the flushed files) into one bidirectional hist_step_t; db_undo/db_redo
     ! write the chosen side's bytes and reuse the rollback path's coherence dance
     ! (restore counters, reopen units, reload index trees) to bring the in-memory
-    ! db back into step.  Session-only: never serialised, never crash-durable.
+    ! db back into step.  The STACKS are session-only: never serialised, gone
+    ! at close.  APPLYING a step is an ordinary journalled transaction
+    ! (apply_step), so its effect on the files is atomic and, on a durable
+    ! handle, synced like any other commit.
 
     module subroutine db_undo(db, stat, label, errmsg)
         class(db_t), intent(inout) :: db
@@ -1509,7 +1667,7 @@ contains
         character(len=*), intent(inout), optional :: errmsg
         character(len=:), allocatable, intent(out), optional :: label
         type(hist_step_t) :: step
-        integer :: st
+        integer :: st, epoch
         call clear_last_err(db)
         st = SQR_OK
         if (present(label)) label = ''
@@ -1517,14 +1675,30 @@ contains
             call report(db, SQR_READONLY, stat, errmsg)
             return
         end if
+        ! Applying a step is a transaction of its own, and it reopens every
+        ! index tree: inside an open transaction that would drop the journal
+        ! hooks the transaction installed and leave its later writes unlogged.
+        if (db%jrnl%active) then
+            call raise_db(db, SQR_INVALID, stat, errmsg, &
+                'undo is not allowed inside a transaction')
+            return
+        end if
         if (.not. db_can_undo(db)) then
             call report(db, SQR_NO_UNDO, stat, errmsg)
             return
         end if
+        epoch = db%hist%epoch
         call pop_step(db%hist%undo, step)
         call apply_step(db, step, redo=.false., st=st)
-        if (present(label) .and. allocated(step%label)) label = step%label
-        call push_step(db%hist%redo, step, db%hist%cap)   ! empties step
+        if (st == SQR_OK) then
+            if (present(label) .and. allocated(step%label)) label = step%label
+            call push_step(db%hist%redo, step, db%hist%cap)   ! empties step
+        else if (db%hist%epoch == epoch) then
+            ! The apply was rolled back and nothing changed: the step goes back
+            ! where it came from.  (A changed epoch means the unwind itself
+            ! failed and emptied the history; the step is dropped with it.)
+            call push_step(db%hist%undo, step, db%hist%cap)
+        end if
         call report(db, st, stat, errmsg)
     end subroutine
 
@@ -1534,7 +1708,7 @@ contains
         character(len=*), intent(inout), optional :: errmsg
         character(len=:), allocatable, intent(out), optional :: label
         type(hist_step_t) :: step
-        integer :: st
+        integer :: st, epoch
         call clear_last_err(db)
         st = SQR_OK
         if (present(label)) label = ''
@@ -1542,14 +1716,30 @@ contains
             call report(db, SQR_READONLY, stat, errmsg)
             return
         end if
+        ! Applying a step is a transaction of its own, and it reopens every
+        ! index tree: inside an open transaction that would drop the journal
+        ! hooks the transaction installed and leave its later writes unlogged.
+        if (db%jrnl%active) then
+            call raise_db(db, SQR_INVALID, stat, errmsg, &
+                'redo is not allowed inside a transaction')
+            return
+        end if
         if (.not. db_can_redo(db)) then
             call report(db, SQR_NO_UNDO, stat, errmsg)
             return
         end if
+        epoch = db%hist%epoch
         call pop_step(db%hist%redo, step)
         call apply_step(db, step, redo=.true., st=st)
-        if (present(label) .and. allocated(step%label)) label = step%label
-        call push_step(db%hist%undo, step, db%hist%cap)   ! empties step
+        if (st == SQR_OK) then
+            if (present(label) .and. allocated(step%label)) label = step%label
+            call push_step(db%hist%undo, step, db%hist%cap)   ! empties step
+        else if (db%hist%epoch == epoch) then
+            ! The apply was rolled back and nothing changed: the step goes back
+            ! where it came from.  (A changed epoch means the unwind itself
+            ! failed and emptied the history; the step is dropped with it.)
+            call push_step(db%hist%redo, step, db%hist%cap)
+        end if
         call report(db, st, stat, errmsg)
     end subroutine
 
@@ -1571,6 +1761,7 @@ contains
         call reset_stack(db%hist%redo)
         if (allocated(db%hist%pending_label)) deallocate(db%hist%pending_label)
         db%hist%capturing = .false.
+        db%hist%epoch     = db%hist%epoch + 1
     end subroutine
 
     ! Snapshot the committed gesture as one bidirectional history step and push
@@ -1579,12 +1770,14 @@ contains
     ! post-gesture ("redo") bytes from disk, so flush every base unit AND sync
     ! the index trees first (fsync_base_files does the tree sync at commit, but
     ! that is after this point).
-    subroutine capture_step(db, stat)
+    subroutine capture_step(db, stat, pushed)
         class(db_t), intent(inout) :: db
         integer,     intent(out)   :: stat
+        logical,     intent(out)   :: pushed   ! a step went onto the undo stack
         type(hist_step_t) :: step
         integer :: ti, j, bs
-        stat = SQR_OK
+        stat   = SQR_OK
+        pushed = .false.
         if (db%jrnl%nrec == 0) return          ! a gesture that changed nothing
         call flush_base_files(db)
         do ti = 1, db%ntables
@@ -1612,6 +1805,7 @@ contains
         end if
         call reset_stack(db%hist%redo)         ! a new gesture forks the timeline
         call push_step(db%hist%undo, step, db%hist%cap)
+        pushed = .true.
     end subroutine
 
     ! Group the undo set by base file into per-path deltas, each holding both the
@@ -1679,50 +1873,184 @@ contains
         end if
     end subroutine
 
-    ! Write one history step's bytes in the chosen direction, then restore the
-    ! matching counters and resync the open units + index trees from the bytes
-    ! just written — the same coherence sequence apply_rollback runs, but driven
-    ! by a stored step rather than the live undo set, and with no active txn.
+    ! Apply one history step in the chosen direction, as a journalled
+    ! transaction of its own:
+    !
+    !   1. lower any schema whose row counter the step is about to take below
+    !      what the schema file holds (lower_schemas);
+    !   2. stage the current bytes of everything the step will change, and arm
+    !      the journal once;
+    !   3. write the step's images, truncate what an undo removes;
+    !   4. restore the matching counters and resync the open units and index
+    !      trees from the bytes just written — the coherence sequence
+    !      apply_rollback runs;
+    !   5. commit: sync the files, void the journal.
+    !
+    ! A failure anywhere after 2 rolls the whole step back, and a crash leaves
+    ! a hot journal the next open replays, so the files hold the step wholly or
+    ! not at all.  On failure `st` is the error and nothing has changed (or,
+    ! if the unwind itself failed, the history has been emptied).
     subroutine apply_step(db, step, redo, st)
-        class(db_t),       intent(inout) :: db
+        class(db_t),       intent(inout), target :: db
         type(hist_step_t), intent(in)    :: step
         logical,           intent(in)    :: redo
         integer,           intent(inout) :: st
-        character(len=:), allocatable :: full, img
-        integer :: di, k, ios
-        call flush_base_files(db)
-        do di = 1, size(step%deltas)
-            associate (d => step%deltas(di))
-                full = pathjoin(db%dir, d%path)
-                do k = 1, size(d%ranges)
-                    if (redo) then
-                        img = d%ranges(k)%redo_bytes
-                    else
-                        img = d%ranges(k)%undo_bytes
-                    end if
-                    if (len(img) > 0) then
-                        call write_region(db, d%path, d%ranges(k)%offset, img, ios)
-                        call io_check(ios)
-                        if (ios /= 0) st = SQR_ERR
-                    end if
-                end do
-                ! Undo shrinks a grown file back to its pre-gesture length; redo's
-                ! tail write has already grown it, so no truncate is needed there.
-                if (.not. redo .and. d%redo_len > d%undo_len) then
-                    ios = c_truncate(full, d%undo_len)
-                    call io_check(ios)
-                    if (ios /= 0) st = SQR_ERR
-                end if
-            end associate
-        end do
+        integer :: di, rst
+        ! Every pre-image below is read from disk, so disk must be the truth.
+        call flush_base_files(db, st)
+        call flush_index_trees(db, st)
+        if (st /= SQR_OK) return
         if (redo) then
-            call restore_counters_from(db, step%after)
+            call lower_schemas(db, step%after, st)
         else
-            call restore_counters_from(db, step%before)
+            call lower_schemas(db, step%before, st)
         end if
-        call resync_base_files(db, st)
-        call resync_index_trees(db, st)
+        if (st /= SQR_OK) return
+        call txn_begin(db, st)
+        if (st /= SQR_OK) return
+        db%hist%tracked = .true.     ! this commit is the history's own
+        do di = 1, size(step%deltas)
+            call stage_delta(db, step%deltas(di), redo, st)
+        end do
+        if (st == SQR_OK .and. db%jrnl%nrec > 0) call txn_arm(db, st)
+        do di = 1, size(step%deltas)
+            call write_delta(db, step%deltas(di), redo, st)
+        end do
+        if (st == SQR_OK) then
+            if (redo) then
+                call restore_counters_from(db, step%after)
+            else
+                call restore_counters_from(db, step%before)
+            end if
+            call resync_base_files(db, st)
+            call resync_index_trees(db, st)
+        end if
+        if (st == SQR_OK) then
+            call txn_commit(db, st)       ! rolls back itself if it cannot commit
+        else
+            call txn_rollback(db, rst)
+            ! Files and memory are back as they were unless the unwind failed
+            ! too; then the journal is still hot, the state is whatever the
+            ! next open recovers, and no stored step can be trusted against it.
+            if (rst /= SQR_OK) call db_reset_history(db)
+        end if
         db%generation = db%generation + 1      ! invalidate any open cursors
+    end subroutine
+
+    ! How many bytes of range k the step writes in this direction.  Redo writes
+    ! the whole post-image.  Undo writes the pre-image only up to the
+    ! pre-gesture length: anything captured beyond it lies in the tail the undo
+    ! cuts off.
+    pure integer(int64) function image_len(d, k, redo) result(n)
+        type(path_delta_t), intent(in) :: d
+        integer,            intent(in) :: k
+        logical,            intent(in) :: redo
+        if (redo) then
+            n = int(len(d%ranges(k)%redo_bytes), int64)
+        else
+            n = min(int(len(d%ranges(k)%undo_bytes), int64), &
+                    d%undo_len - d%ranges(k)%offset + 1_int64)
+        end if
+    end function
+
+    ! Stage the current state of everything the step will change in one file:
+    ! the bytes under each image (as far as the file reaches), the file's
+    ! length where an image runs past its end, and the tail an undo cuts off.
+    subroutine stage_delta(db, d, redo, st)
+        class(db_t),        intent(inout) :: db
+        type(path_delta_t), intent(in)    :: d
+        logical,            intent(in)    :: redo
+        integer,            intent(inout) :: st
+        integer(int64) :: cur, n
+        integer :: k
+        if (st /= SQR_OK) return
+        cur = file_len(pathjoin(db%dir, d%path))
+        ranges: do k = 1, size(d%ranges)
+            n = image_len(d, k, redo)
+            if (n <= 0_int64) cycle ranges
+            associate (off => d%ranges(k)%offset)
+                call stage_region(db, d%path, off, min(n, cur - off + 1_int64), st)
+                if (off + n - 1_int64 > cur) call stage_extend(db, d%path, st)
+            end associate
+        end do ranges
+        if (.not. redo .and. d%redo_len > d%undo_len) &
+            call stage_tail(db, d%path, d%undo_len, st)
+    end subroutine
+
+    ! Write one file's images.  Redo writes them in capture order: every
+    ! post-image was read from the same final state, so overlaps agree.  Undo
+    ! writes them in REVERSE capture order, as apply_rollback does: where two
+    ! captures overlap, the later one saw the earlier one's change already
+    ! made, so the earliest capture must land last.  Undo then cuts the file
+    ! back to its pre-gesture length.
+    subroutine write_delta(db, d, redo, st)
+        class(db_t),        intent(in)    :: db
+        type(path_delta_t), intent(in)    :: d
+        logical,            intent(in)    :: redo
+        integer,            intent(inout) :: st
+        character(len=:), allocatable :: full
+        integer(int64) :: n
+        integer :: k, ios
+        if (st /= SQR_OK) return
+        full = pathjoin(db%dir, d%path)
+        if (redo) then
+            forward: do k = 1, size(d%ranges)
+                if (len(d%ranges(k)%redo_bytes) == 0) cycle forward
+                call write_region(db, d%path, d%ranges(k)%offset, d%ranges(k)%redo_bytes, ios)
+                call io_check(ios)
+                if (ios /= 0) then
+                    st = SQR_ERR
+                    return
+                end if
+            end do forward
+        else
+            backward: do k = size(d%ranges), 1, -1
+                n = image_len(d, k, redo)
+                if (n <= 0_int64) cycle backward
+                call write_region(db, d%path, d%ranges(k)%offset, &
+                                  d%ranges(k)%undo_bytes(1:int(n)), ios)
+                call io_check(ios)
+                if (ios /= 0) then
+                    st = SQR_ERR
+                    return
+                end if
+            end do backward
+            if (d%redo_len > d%undo_len .and. file_len(full) > d%undo_len) then
+                ios = c_truncate(full, d%undo_len)
+                call io_check(ios)
+                if (ios /= 0) st = SQR_ERR
+            end if
+        end if
+    end subroutine
+
+    ! open_data takes a table's row counter from the data file's size and
+    ! refuses a schema that claims MORE rows than the file holds.  A step that
+    ! shortens a data file below what the schema file last recorded (an undo,
+    ! after something wrote the schema: db_pack_live, a quiesce) would
+    ! therefore leave a database that cannot be opened if the process ended
+    ! before the next schema write.  So the schema is written with the step's
+    ! counters BEFORE the step: a schema that is too low is the ordinary
+    ! crash-stale case, which open_data repairs from the file — whichever way
+    ! the step then goes.  The in-memory counters are left as they are; the
+    ! step sets them when it lands.
+    subroutine lower_schemas(db, snaps, st)
+        class(db_t),      intent(inout) :: db
+        type(tbl_snap_t), intent(in)    :: snaps(:)
+        integer,          intent(inout) :: st
+        integer :: ti, rs, keep_next, keep_live
+        tables: do ti = 1, min(db%ntables, size(snaps))
+            associate (t => db%tables(ti))
+                if (snaps(ti)%next_id >= t%disk_next_id) cycle tables
+                keep_next    = t%next_id
+                keep_live    = t%live_count
+                t%next_id    = snaps(ti)%next_id
+                t%live_count = snaps(ti)%live_count
+                call write_schema(db, t, rs)
+                t%next_id    = keep_next
+                t%live_count = keep_live
+                if (rs /= SQR_OK .and. st == SQR_OK) st = rs
+            end associate
+        end do tables
     end subroutine
 
     ! Reopen every live index tree from its (just-restored) file — the index

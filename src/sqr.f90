@@ -199,15 +199,17 @@ module sqr
     !! One undo record captured before a transaction overwrites part of a
     !! base file.  A REGION record stores the original bytes of an in-place
     !! overwrite (rollback writes them back); an EXTEND record stores only
-    !! the original file length (rollback truncates appended bytes away).
+    !! the original file length (rollback truncates appended bytes away); a
+    !! TAIL record stores the bytes a truncation is about to remove (rollback
+    !! appends them again).
     !! Module-private — exposed only as a component of `journal_t`.
     type :: undo_rec_t
-        integer :: kind = 0  !! `UNDO_REGION` or `UNDO_EXTEND`
+        integer :: kind = 0  !! `UNDO_REGION`, `UNDO_EXTEND` or `UNDO_TAIL`
         character(len=:), allocatable :: path  !! File path, relative to the db directory
-        integer(int64) :: orig_len = 0  !! File length when first touched this txn
-        integer(int64) :: offset   = 0  !! 1-based byte offset of the region (REGION only)
-        integer(int64) :: length   = 0  !! Region length in bytes (REGION only)
-        character(len=:), allocatable :: bytes  !! Original region bytes (REGION only)
+        integer(int64) :: orig_len = 0  !! File length when first touched this txn (TAIL: the length truncated to)
+        integer(int64) :: offset   = 0  !! 1-based byte offset of the region (REGION, TAIL)
+        integer(int64) :: length   = 0  !! Region length in bytes (REGION, TAIL)
+        character(len=:), allocatable :: bytes  !! Original region bytes (REGION, TAIL)
     end type
 
     !! Pre-transaction snapshot of one table's in-memory counters.  The undo
@@ -292,12 +294,19 @@ module sqr
     !! crash-durable rollback of the in-flight transaction; this is the
     !! multi-level, session-only history of COMMITTED gestures.  A gesture is
     !! recorded only when `db_begin` was given a `label`; `capturing` latches
-    !! that intent until the matching `db_commit` snapshots the step.
+    !! that intent until the matching `db_commit` snapshots the step.  A step
+    !! holds absolute byte images, so the stacks are valid only while every
+    !! change to the files is one the history knows about: `tracked` marks the
+    !! in-flight transaction as such (a captured gesture, or an undo/redo
+    !! being applied), and a commit that changed something without it empties
+    !! both stacks.
     type, public :: history_t
         type(hist_stack_t) :: undo  !! Committed steps (newest on top)
         type(hist_stack_t) :: redo  !! Undone steps (newest on top)
         integer        :: cap        = SQR_HISTORY_DEFAULT  !! Max retained undo steps (oldest dropped)
         logical        :: capturing  = .false.    !! The in-flight explicit txn is a labelled gesture
+        logical        :: tracked    = .false.    !! The in-flight txn's changes are accounted for by the history
+        integer        :: epoch      = 0          !! Bumped by every `db_reset_history` (tells a caller holding a popped step that the stacks were emptied under it)
         character(len=:), allocatable :: pending_label  !! Label stashed by db_begin until commit
     end type
 
@@ -455,7 +464,7 @@ module sqr
     ! them — application code should use the db_begin/commit/rollback façade
     ! above, not these primitives directly.
     public :: txn_begin, txn_arm, txn_commit, txn_rollback
-    public :: jrnl_log_region, jrnl_log_extend, jrnl_recover, jrnl_hot, jrnl_close_unit
+    public :: jrnl_log_region, jrnl_log_extend, jrnl_log_tail, jrnl_recover, jrnl_hot, jrnl_close_unit
     public :: bt_journal_adapter
 
     !! Create a secondary index.  Accepts either a single column name or a
@@ -1304,7 +1313,11 @@ module sqr
         !! `SQR_INVALID`.  Maps onto SQL `BEGIN`.  When `label` is supplied the
         !! transaction is a user GESTURE: `db_commit` records it as one
         !! Undo/Redo step under that name (see `db_undo`).  Without `label` the
-        !! transaction commits with no history entry (the SQL path).
+        !! transaction commits with no history entry (the SQL path) — and, like
+        !! every auto-committed write outside a gesture, it EMPTIES the undo and
+        !! redo history if it changed anything: a step restores absolute byte
+        !! images, which a change the history did not record would invalidate.
+        !! An application that offers Undo therefore makes every write a gesture.
         module subroutine db_begin(db, stat, label, errmsg)
             class(db_t), intent(inout), target :: db  !! Database handle
             integer,    intent(out),  optional :: stat  !! `SQR_OK` or an error code
@@ -1315,8 +1328,13 @@ module sqr
         !! Undo the most recent committed gesture: restore every base file and
         !! in-memory counter to its pre-gesture state and move the step onto the
         !! redo history.  Returns `SQR_NO_UNDO` (and an empty `label`) when the
-        !! undo history is empty, `SQR_READONLY` on a read-only handle.  `label`
-        !! returns the undone gesture's name (for menu feedback).
+        !! undo history is empty, `SQR_READONLY` on a read-only handle and
+        !! `SQR_INVALID` inside an open transaction.  `label` returns the undone
+        !! gesture's name (for menu feedback).  The undo is itself a journalled
+        !! transaction: it is applied as a unit and, on a durable handle, synced
+        !! before it returns, so a crash leaves the gesture wholly undone or
+        !! wholly in place.  A failed undo changes nothing and leaves the step
+        !! on the undo history.
         module subroutine db_undo(db, stat, label, errmsg)
             class(db_t), intent(inout) :: db  !! Database handle
             integer,    intent(out), optional :: stat  !! `SQR_OK`, `SQR_NO_UNDO`, ...
@@ -1325,8 +1343,8 @@ module sqr
         end subroutine
 
         !! Redo the most recently undone gesture: re-apply it and move the step
-        !! back onto the undo history.  Mirror of `db_undo`; `SQR_NO_UNDO` when
-        !! the redo history is empty.
+        !! back onto the undo history.  Mirror of `db_undo` in every respect;
+        !! `SQR_NO_UNDO` when the redo history is empty.
         module subroutine db_redo(db, stat, label, errmsg)
             class(db_t), intent(inout) :: db  !! Database handle
             integer,    intent(out), optional :: stat  !! `SQR_OK`, `SQR_NO_UNDO`, ...
@@ -1409,6 +1427,17 @@ module sqr
         module subroutine jrnl_log_extend(db, path, stat)
             class(db_t),      intent(inout)         :: db  !! Database handle (transaction active)
             character(len=*), intent(in)            :: path  !! Base file, relative to the db directory
+            integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
+        end subroutine
+
+        !! Capture the bytes of `path` beyond `keep_len` before the caller
+        !! truncates the file to that length; rollback appends them again.
+        !! One per `path` within a transaction.  A file no longer than
+        !! `keep_len` records nothing.
+        module subroutine jrnl_log_tail(db, path, keep_len, stat)
+            class(db_t),      intent(inout)         :: db  !! Database handle (transaction active)
+            character(len=*), intent(in)            :: path  !! Base file, relative to the db directory
+            integer(int64),   intent(in)            :: keep_len  !! Length the file is about to be cut to
             integer,          intent(out), optional :: stat  !! `SQR_OK` or an error code
         end subroutine
 

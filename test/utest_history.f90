@@ -5,11 +5,15 @@
 ! as one unit (including a multi-row cascade and a row insert that grows the
 ! file), that the redo branch is dropped by a fresh gesture, that the depth cap
 ! and the read-only / empty-history guards hold, and that data AND index stay
-! coherent across the round-trip.
+! coherent across the round-trip.  They also pin the contract around a
+! gesture: a committed change that is NOT a gesture empties the history
+! rather than being overwritten by a later undo, undo/redo are refused inside
+! a transaction, overlapping captures undo correctly, and an undo is applied
+! through the journal and keeps the schema file openable.
 program utest_history
     use, intrinsic :: iso_fortran_env, only: int32, int64
     use sqr
-    use clib_wrap, only: c_rmtree
+    use clib_wrap, only: c_rmtree, c_remove
     implicit none
 
     integer :: pass = 0, fail = 0
@@ -23,6 +27,10 @@ program utest_history
     call test_empty_and_readonly()
     call test_reset_history()
     call test_structural_ops_reset_history()
+    call test_plain_commit_resets()
+    call test_refused_inside_txn()
+    call test_overlapping_captures()
+    call test_apply_is_journalled()
 
     print '(a,i0,a,i0,a)', 'sqr history tests: ', pass, ' passed, ', fail, ' failed'
     if (fail > 0) error stop 1
@@ -372,6 +380,160 @@ contains
         call db_drop_table(db, 't', rs)
         call check(rs == SQR_OK .and. .not. db_can_undo(db), 'struct: db_drop_table clears history')
         call db_close(db); ios = c_rmtree('utest_hist_struct')
+    end subroutine
+
+    ! C1: a step holds absolute byte images, so a committed change the history
+    ! did not record must empty it — otherwise the next undo writes the old
+    ! images back over that change and reports SQR_OK.
+    subroutine test_plain_commit_resets()
+        type(db_t), target :: db
+        integer :: r1, r2, r3, rs, ios
+        character(len=128) :: emsg
+        call make_db(db, 'utest_hist_plain')
+        r1 = ins(db, 1)
+        call db_begin(db, rs, label='A'); r2 = ins(db, 2); call db_commit(db, rs)
+        call check(db_can_undo(db), 'plain: gesture recorded')
+        r3 = ins(db, 30)                                   ! auto-commit, no gesture
+        call check(.not. db_can_undo(db) .and. .not. db_can_redo(db), &
+                   'plain: an auto-committed write empties the history')
+        call db_undo(db, rs)
+        call check(rs == SQR_NO_UNDO,   'plain: undo then reports nothing to undo')
+        call check(getv(db, r3) == 30 .and. findv(db, 30) == r3, &
+                   'plain: the plain row survives, data and index')
+        call check(getv(db, r2) == 2,   'plain: the gesture row is still there too')
+        call db_verify(db, 't', rs, emsg)
+        call check(rs == SQR_OK,        'plain: db_verify clean')
+
+        ! An unlabelled explicit transaction is the same kind of change.
+        call db_begin(db, rs, label='B'); call setv(db, r1, 5); call db_commit(db, rs)
+        call db_begin(db, rs); call setv(db, r1, 6); call db_commit(db, rs)
+        call check(.not. db_can_undo(db), 'plain: an unlabelled commit empties the history')
+
+        ! ...and it takes the redo side with it.
+        call db_begin(db, rs, label='C'); call setv(db, r1, 7); call db_commit(db, rs)
+        call db_undo(db, rs)
+        call check(db_can_redo(db),     'plain: redo available after an undo')
+        r3 = ins(db, 31)
+        call check(.not. db_can_redo(db), 'plain: a plain write empties the redo side as well')
+
+        ! What changes nothing keeps the history: an empty unlabelled
+        ! transaction, and a plain change that is rolled back.
+        call db_begin(db, rs, label='D'); call setv(db, r1, 8); call db_commit(db, rs)
+        call db_begin(db, rs); call db_commit(db, rs)
+        call check(db_can_undo(db),     'plain: an empty unlabelled transaction keeps the history')
+        call db_begin(db, rs); call setv(db, r1, 9); call db_rollback(db, rs)
+        call check(db_can_undo(db),     'plain: a rolled-back change keeps the history')
+        call db_undo(db, rs)
+        call check(rs == SQR_OK .and. getv(db, r1) == 6, 'plain: the kept step still undoes correctly')
+        call db_close(db)
+        ios = c_rmtree('utest_hist_plain')
+    end subroutine
+
+    ! C2: undo/redo inside an open transaction are refused, the transaction is
+    ! unharmed (its later writes still roll back) and the history is intact.
+    subroutine test_refused_inside_txn()
+        type(db_t), target :: db
+        integer :: r1, r2, r3, rs, ios
+        character(len=128) :: emsg
+        call make_db(db, 'utest_hist_intxn')
+        r1 = ins(db, 10)
+        call db_begin(db, rs, label='A'); call setv(db, r1, 20); call db_commit(db, rs)
+        call db_begin(db, rs)
+        r2 = ins(db, 21)
+        call db_undo(db, rs)
+        call check(rs == SQR_INVALID,   'intxn: undo refused inside a transaction')
+        call db_redo(db, rs)
+        call check(rs == SQR_INVALID,   'intxn: redo refused inside a transaction')
+        r3 = ins(db, 22)
+        call db_rollback(db, rs)
+        call check(rs == SQR_OK,        'intxn: the transaction still rolls back')
+        call db_verify(db, 't', rs, emsg)
+        call check(rs == SQR_OK,        'intxn: db_verify clean after the rollback')
+        call check(findv(db, 21) == 0 .and. findv(db, 22) == 0, 'intxn: both inserts rolled back')
+        call check(findv(db, 20) == r1, 'intxn: the gesture is still in place')
+        call check(db_can_undo(db),     'intxn: the history is intact')
+        call db_undo(db, rs)
+        call check(rs == SQR_OK .and. getv(db, r1) == 10 .and. findv(db, 10) == r1, &
+                   'intxn: undo works once the transaction is over')
+        call db_close(db)
+        ios = c_rmtree('utest_hist_intxn')
+    end subroutine
+
+    ! C3: one gesture doing a single insert (captures one index page) and then
+    ! a bulk insert (captures the whole index file, already holding that
+    ! modified page).  Undo must let the EARLIER capture win.
+    subroutine test_overlapping_captures()
+        type(db_t), target :: db
+        integer :: r1, ra, rs, ios, ti, i
+        integer(int32) :: rids(3)
+        character(len=:), allocatable :: bufs(:)
+        character(len=128) :: emsg
+        call make_db(db, 'utest_hist_overlap')
+        r1 = ins(db, 1)
+        ti = db_table_index(db, 't')
+        allocate(character(len=db%tables(ti)%record_size) :: bufs(3))
+        do i = 1, 3
+            bufs(i) = repeat(achar(0), db%tables(ti)%record_size)
+            call row_set_int(bufs(i), db%tables(ti)%cols(1), int(100 + i, int32))
+        end do
+        call db_begin(db, rs, label='Mixed')
+        ra = ins(db, 50)
+        call db_insert_many(db, 't', bufs, rids, rs)
+        call check(rs == SQR_OK,        'overlap: bulk insert inside the gesture')
+        call db_commit(db, rs)
+        call db_verify(db, 't', rs, emsg)
+        call check(rs == SQR_OK,        'overlap: db_verify clean after the gesture')
+
+        call db_undo(db, rs)
+        call check(rs == SQR_OK,        'overlap: undo succeeds')
+        call db_verify(db, 't', rs, emsg)
+        call check(rs == SQR_OK,        'overlap: db_verify clean after undo')
+        call check(findv(db, 50) == 0 .and. findv(db, 102) == 0, 'overlap: every inserted row gone')
+        call check(findv(db, 1) == r1,  'overlap: the earlier row still indexed')
+        call check(db%tables(ti)%live_count == 1, 'overlap: live_count back to 1')
+
+        call db_redo(db, rs)
+        call check(rs == SQR_OK,        'overlap: redo succeeds')
+        call db_verify(db, 't', rs, emsg)
+        call check(rs == SQR_OK,        'overlap: db_verify clean after redo')
+        call check(findv(db, 50) == ra .and. findv(db, 102) == int(rids(2)), &
+                   'overlap: every inserted row back')
+        call db_close(db)
+        ios = c_rmtree('utest_hist_overlap')
+    end subroutine
+
+    ! C4 / D2: an undo or redo is a transaction of its own — the journal is
+    ! voided when it returns — and an undo that shortens a data file first
+    ! lowers a schema file that records more rows than will remain, so the
+    ! database opens whether or not the process reaches db_close.
+    subroutine test_apply_is_journalled()
+        type(db_t), target :: db
+        integer :: r1, r2, r3, rs, ios, ti
+        character(len=*), parameter :: PK = 'utest_hist_apply.sqr'
+        call make_db(db, 'utest_hist_apply')
+        r1 = ins(db, 1)
+        ti = db_table_index(db, 't')
+        call db_begin(db, rs, label='Two')
+        r2 = ins(db, 2); r3 = ins(db, 3)
+        call db_commit(db, rs)
+        ios = c_remove(PK)
+        call db_pack_live(db, PK, rs)                      ! writes the schema: 3 rows
+        call check(rs == SQR_OK,        'apply: db_pack_live after the gesture')
+        call check(db%tables(ti)%disk_next_id == r3 + 1, 'apply: schema file records the gesture rows')
+        call db_undo(db, rs)
+        call check(rs == SQR_OK,        'apply: undo succeeds')
+        call check(.not. jrnl_hot(db),  'apply: journal not hot after undo')
+        call check(.not. db_in_txn(db), 'apply: no transaction left open by undo')
+        call check(db%tables(ti)%disk_next_id <= db%tables(ti)%next_id, &
+                   'apply: schema file no longer ahead of the data file')
+        call check(db%tables(ti)%next_id == r2, 'apply: next_id back to the pre-gesture value')
+        call db_redo(db, rs)
+        call check(rs == SQR_OK .and. .not. jrnl_hot(db), 'apply: redo succeeds, journal not hot')
+        call check(getv(db, r3) == 3 .and. findv(db, 3) == r3, 'apply: redo restored the rows')
+        call check(db_can_undo(db),     'apply: undo/redo themselves keep the history')
+        call db_close(db)
+        ios = c_remove(PK)
+        ios = c_rmtree('utest_hist_apply')
     end subroutine
 
 end program utest_history
