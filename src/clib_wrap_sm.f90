@@ -307,6 +307,13 @@ contains
         if (sqr_os_sock_send(sock, bytes, int(len(bytes), c_int64_t)) /= len(bytes)) ierr = 1
     end function
 
+    module function c_sock_send_timeout(sock, timeout_ms) result(ierr)
+        integer(c_int64_t), intent(in) :: sock
+        integer,            intent(in) :: timeout_ms
+        integer                        :: ierr
+        ierr = int(sqr_os_sock_send_timeout(sock, int(timeout_ms, c_int)))
+    end function
+
     module subroutine c_sock_close(sock)
         integer(c_int64_t), intent(inout) :: sock
         call sqr_os_sock_close(sock)

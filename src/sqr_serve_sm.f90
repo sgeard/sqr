@@ -12,6 +12,7 @@ submodule (sqr_serve) sqr_serve_impl
                           net_recv_line, net_recv_payload, NET_OK
     use :: sqr_consts, only: I32_BYTES, CH_LF, PATH_SEPS, INT_TEXT_LEN
     use :: clib_wrap, only: c_sock_listen, c_sock_port, c_sock_accept, c_sock_poll, c_sock_close, &
+                            c_sock_send_timeout, &
                             c_realpath, c_joincwd
     implicit none
 
@@ -113,11 +114,14 @@ contains
     subroutine accept_new(srv)
         type(server_t), intent(inout) :: srv
         integer(c_int64_t) :: sock
-        integer :: i
+        integer :: i, rc
         sock = c_sock_accept(srv%lsock)
         if (sock < 0) return
         do i = 1, SQRD_MAX_SESSIONS
             if (.not. srv%sessions(i)%active) then
+                ! A stalled reply must not hold the server for ever.  A
+                ! socket that refuses the option is served without the limit.
+                rc = c_sock_send_timeout(sock, srv%send_timeout_ms)
                 call net_attach(srv%sessions(i)%conn, sock)
                 srv%sessions(i)%active  = .true.
                 srv%sessions(i)%greeted = .false.
@@ -158,12 +162,12 @@ contains
             call do_pack(srv, i, rest)
         case ('PING')
             ne = net_send_line(srv%sessions(i)%conn, 'NONE')
-            if (ne /= NET_OK) call drop_session(srv, i)
+            call sent(srv, i, ne)
         case ('QUIT')
             ne = net_send_line(srv%sessions(i)%conn, 'NONE')
             call drop_session(srv, i)
         case default
-            call send_err(srv%sessions(i), SQR_INVALID, 'unknown request: ' // w1)
+            call send_err(srv, i, SQR_INVALID, 'unknown request: ' // w1)
         end select
     end subroutine
 
@@ -179,6 +183,17 @@ contains
         srv%sessions(i)%greeted = .false.
     end subroutine
 
+    ! The one rule for a reply: if it did not go out (`ne` is its send
+    ! status), the session is over.  The client is gone, or has stopped
+    ! reading for longer than the send limit, and either way a transaction it
+    ! holds must not outlive it.  Every reply goes through here.
+    subroutine sent(srv, i, ne)
+        type(server_t), intent(inout) :: srv
+        integer,        intent(in)    :: i
+        integer,        intent(in)    :: ne
+        if (ne /= NET_OK) call drop_session(srv, i)
+    end subroutine
+
     ! ---- requests ----
 
     subroutine do_hello(srv, i, w1, rest)
@@ -191,12 +206,12 @@ contains
         call split2(rest, vtok, cname)   ! cname: client's free-text identity, unused in v1
         call parse_uint(vtok, ver, ok)
         if (w1 /= 'HELLO' .or. .not. ok) then
-            call send_err(srv%sessions(i), SQR_INVALID, 'expected HELLO <version> <name>')
+            call send_err(srv, i, SQR_INVALID, 'expected HELLO <version> <name>')
             call drop_session(srv, i)
             return
         end if
         if (ver /= SQRD_PROTOCOL) then
-            call send_err(srv%sessions(i), SQR_INVALID, 'unsupported protocol version ' &
+            call send_err(srv, i, SQR_INVALID, 'unsupported protocol version ' &
                 // vtok // ' (server speaks ' // itoa(SQRD_PROTOCOL) // ')')
             call drop_session(srv, i)
             return
@@ -204,7 +219,7 @@ contains
         srv%sessions(i)%greeted = .true.
         ne = net_send_line(srv%sessions(i)%conn, 'OK ' // itoa(SQRD_PROTOCOL) &
             // ' sqrd ' // SQRD_VERSION // ' ' // srv%dbname)
-        if (ne /= NET_OK) call drop_session(srv, i)
+        call sent(srv, i, ne)
     end subroutine
 
     subroutine do_sql(srv, i, rest)
@@ -235,12 +250,12 @@ contains
         emsg = ''
         call sql_parse(text, stmt, rs, emsg)
         if (rs /= SQR_OK) then
-            call send_err(srv%sessions(i), rs, trim(emsg))
+            call send_err(srv, i, rs, trim(emsg))
             return
         end if
         if (srv%txn_owner /= 0 .and. srv%txn_owner /= i .and. stmt%kind /= ST_SELECT) then
             if (db_in_txn(srv%db)) then
-                call send_err(srv%sessions(i), SQRD_STAT_BUSY, &
+                call send_err(srv, i, SQRD_STAT_BUSY, &
                     'busy: a transaction is open on another connection')
                 return
             end if
@@ -249,7 +264,7 @@ contains
         emsg = ''
         call sql_exec(srv%db, stmt, res, rs, emsg, binary_cells=.true.)
         if (rs /= SQR_OK) then
-            call send_err(srv%sessions(i), rs, trim(emsg))
+            call send_err(srv, i, rs, trim(emsg))
             return
         end if
         select case (stmt%kind)
@@ -258,7 +273,7 @@ contains
         case (ST_COMMIT, ST_ROLLBACK)
             srv%txn_owner = 0
         end select
-        call send_result(srv%sessions(i), res)
+        call send_result(srv, i, res)
     end subroutine
 
     subroutine do_tables(srv, i)
@@ -276,7 +291,7 @@ contains
         end do
         call buf_add(b, 'END' // LF)
         ne = net_send_payload(srv%sessions(i)%conn, b%s(1:b%n))
-        if (ne /= NET_OK) call drop_session(srv, i)
+        call sent(srv, i, ne)
     end subroutine
 
     subroutine do_columns(srv, i, rest)
@@ -294,12 +309,12 @@ contains
         integer :: ti, k, ki, m, ne
         tname = trim(adjustl(rest))
         if (len(tname) == 0) then
-            call send_err(srv%sessions(i), SQR_INVALID, 'usage: COLUMNS <table>')
+            call send_err(srv, i, SQR_INVALID, 'usage: COLUMNS <table>')
             return
         end if
         ti = db_table_index(srv%db, tname)
         if (ti == 0) then
-            call send_err(srv%sessions(i), SQR_NOT_FOUND, 'no such table: ' // tname)
+            call send_err(srv, i, SQR_NOT_FOUND, 'no such table: ' // tname)
             return
         end if
         call db_describe(srv%db, tname, cols)
@@ -343,7 +358,7 @@ contains
         end do
         call buf_add(b, 'END' // LF)
         ne = net_send_payload(srv%sessions(i)%conn, b%s(1:b%n))
-        if (ne /= NET_OK) call drop_session(srv, i)
+        call sent(srv, i, ne)
     end subroutine
 
     ! Where this server's database physically is, and what state it is in.
@@ -367,7 +382,7 @@ contains
         call buf_add(b, 'readonly = ' // yesno(srv%db%readonly) // LF)
         call buf_add(b, 'txn = '      // yesno(db_in_txn(srv%db)) // LF)
         call buf_add(b, 'tables = '   // itoa(srv%db%ntables) // LF)
-        call send_msg(srv%sessions(i), b%s(1:b%n))
+        call send_msg(srv, i, b%s(1:b%n))
     end subroutine
 
     ! Write a consistent snapshot of the served database to a container file,
@@ -395,7 +410,7 @@ contains
         end if
         file = trim(file)
         if (len(file) == 0 .or. .not. is_absolute(file)) then
-            call send_err(srv%sessions(i), SQR_INVALID, &
+            call send_err(srv, i, SQR_INVALID, &
                 'PACK needs an absolute destination path (sqrd''s working directory is not yours)')
             return
         end if
@@ -407,7 +422,7 @@ contains
         ! through some third symlink still slips past, which is the caller's
         ! business, not something to resolve every path in the system over.
         if (is_within(file, srv%dbpath) .or. is_within(file, srv%dbreal)) then
-            call send_err(srv%sessions(i), SQR_INVALID, &
+            call send_err(srv, i, SQR_INVALID, &
                 'PACK destination is inside the database directory')
             return
         end if
@@ -415,62 +430,72 @@ contains
         ! the on-disk state is mid-gesture, so there is nothing worth archiving
         ! until it ends.  Same stat code as a refused write, for the same reason.
         if (srv%txn_owner /= 0 .and. db_in_txn(srv%db)) then
-            call send_err(srv%sessions(i), SQRD_STAT_BUSY, &
+            call send_err(srv, i, SQRD_STAT_BUSY, &
                 'busy: a transaction is open on another connection')
             return
         end if
         emsg = ''
         call db_pack_live(srv%db, file, rs, emsg)
         if (rs /= SQR_OK) then
-            call send_err(srv%sessions(i), rs, trim(emsg))
+            call send_err(srv, i, rs, trim(emsg))
             return
         end if
-        call send_msg(srv%sessions(i), 'packed ' // srv%dbpath // ' -> ' // file)
+        call send_msg(srv, i, 'packed ' // srv%dbpath // ' -> ' // file)
     end subroutine
 
     ! ---- responses ----
 
-    subroutine send_err(sess, stat, msg)
-        type(session_t),  intent(inout) :: sess
+    subroutine send_err(srv, i, stat, msg)
+        type(server_t),   intent(inout) :: srv
+        integer,          intent(in)    :: i
         integer,          intent(in)    :: stat
         character(len=*), intent(in)    :: msg
         integer :: ne
-        ne = net_send_line(sess%conn, 'ERR ' // itoa(stat) // ' ' // itoa(len(msg)))
-        if (ne == NET_OK .and. len(msg) > 0) ne = net_send_payload(sess%conn, msg)
+        associate (conn => srv%sessions(i)%conn)
+            ne = net_send_line(conn, 'ERR ' // itoa(stat) // ' ' // itoa(len(msg)))
+            if (ne == NET_OK .and. len(msg) > 0) ne = net_send_payload(conn, msg)
+        end associate
+        call sent(srv, i, ne)
     end subroutine
 
-    subroutine send_msg(sess, msg)
-        type(session_t),  intent(inout) :: sess
+    subroutine send_msg(srv, i, msg)
+        type(server_t),   intent(inout) :: srv
+        integer,          intent(in)    :: i
         character(len=*), intent(in)    :: msg
         integer :: ne
-        ne = net_send_line(sess%conn, 'MSG ' // itoa(len(msg)))
-        if (ne == NET_OK .and. len(msg) > 0) ne = net_send_payload(sess%conn, msg)
+        associate (conn => srv%sessions(i)%conn)
+            ne = net_send_line(conn, 'MSG ' // itoa(len(msg)))
+            if (ne == NET_OK .and. len(msg) > 0) ne = net_send_payload(conn, msg)
+        end associate
+        call sent(srv, i, ne)
     end subroutine
 
-    subroutine send_result(sess, res)
-        type(session_t),    intent(inout) :: sess
+    subroutine send_result(srv, i, res)
+        type(server_t),     intent(inout) :: srv
+        integer,            intent(in)    :: i
         type(sql_result_t), intent(in)    :: res
         integer :: ne
         select case (res%kind)
         case (SQLRES_ROWS)
-            call send_rows_result(sess, res)
+            call send_rows_result(srv, i, res)
         case (SQLRES_COUNT)
-            ne = net_send_line(sess%conn, 'COUNT ' // itoa(res%count))
+            ne = net_send_line(srv%sessions(i)%conn, 'COUNT ' // itoa(res%count))
+            call sent(srv, i, ne)
         case (SQLRES_MSG)
-            block
-                character(len=:), allocatable :: msg
-                msg = ''
-                if (allocated(res%message)) msg = res%message
-                ne = net_send_line(sess%conn, 'MSG ' // itoa(len(msg)))
-                if (ne == NET_OK .and. len(msg) > 0) ne = net_send_payload(sess%conn, msg)
-            end block
+            if (allocated(res%message)) then
+                call send_msg(srv, i, res%message)
+            else
+                call send_msg(srv, i, '')
+            end if
         case default
-            ne = net_send_line(sess%conn, 'NONE')
+            ne = net_send_line(srv%sessions(i)%conn, 'NONE')
+            call sent(srv, i, ne)
         end select
     end subroutine
 
-    subroutine send_rows_result(sess, res)
-        type(session_t),    intent(inout) :: sess
+    subroutine send_rows_result(srv, i, res)
+        type(server_t),     intent(inout) :: srv
+        integer,            intent(in)    :: i
         type(sql_result_t), intent(in)    :: res
         type(buf_t) :: b
         integer :: r, j, ne
@@ -488,8 +513,8 @@ contains
             end do
         end do
         call buf_add(b, 'END' // LF)
-        ne = net_send_payload(sess%conn, b%s(1:b%n))
-        if (ne /= NET_OK) call net_close(sess%conn)
+        ne = net_send_payload(srv%sessions(i)%conn, b%s(1:b%n))
+        call sent(srv, i, ne)
     end subroutine
 
     pure subroutine add_cell(b, cell)

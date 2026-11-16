@@ -352,6 +352,34 @@ if {$nbytes < 0} {
     puts "sqrd functional: $npass passed, $nfail failed"
     exit 1
 }
+
+# A client that opens a transaction, asks for that reply and goes away
+# without reading it.  The server cannot deliver the reply, so the session
+# must end as a dropped one does: the transaction rolled back and other
+# clients free to write.  (Closing with unread data resets the connection.)
+set c3 [dial $port]
+sendline $c3 "HELLO 1 vanishing"
+gets $c3
+reply [sendsql $c3 "BEGIN"]
+lassign [reply [sendsql $c3 "INSERT INTO big VALUES (9001, 'gone')"]] hdr payload
+check {$hdr eq "COUNT 1"} "vanishing client has a row pending in a transaction"
+sendsql $c3 "SELECT * FROM big"
+after 200
+close $c3
+# The server answers requests in turn, so this one waits behind the failing
+# reply; a few attempts allow for it being read first.
+set hdr ""
+for {set try 0} {$try < 20} {incr try} {
+    lassign [reply [sendsql $c "INSERT INTO big VALUES (9002, 'here')"]] hdr payload
+    if {$hdr eq "COUNT 1"} break
+    after 100
+}
+check {$hdr eq "COUNT 1"} "another client can write after the reply failed to send"
+sendline $c "INFO"
+lassign [reply $c] hdr payload
+check {[string first "txn = no" $payload] >= 0} "INFO reports no transaction in flight afterwards"
+sendsql $c "SELECT a FROM big WHERE a = 9001"
+check {[lindex [rows $c] 0] == 0} "the vanished client's row was rolled back"
 lassign [reply [sendsql $c "DROP TABLE big"]] hdr payload
 
 sendline $c "QUIT"

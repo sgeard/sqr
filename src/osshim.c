@@ -335,6 +335,12 @@ int64_t sqr_os_sock_send(int64_t s, const char *buf, int64_t len) {
     return len;
 }
 
+int sqr_os_sock_send_timeout(int64_t s, int timeout_ms) {
+    /* Winsock takes the limit as a DWORD of milliseconds; 0 means none. */
+    DWORD ms = timeout_ms > 0 ? (DWORD)timeout_ms : 0;
+    return setsockopt((SOCKET)s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&ms, sizeof ms) == 0 ? 0 : -1;
+}
+
 void sqr_os_sock_close(int64_t *s) {
     if (*s >= 0) closesocket((SOCKET)*s);
     *s = -1;
@@ -350,6 +356,7 @@ void sqr_os_sock_close(int64_t *s) {
 #include <ftw.h>            /* nftw */
 #include <sys/file.h>       /* flock */
 #include <sys/socket.h>     /* socket, bind, listen, accept, connect, recv, send */
+#include <sys/time.h>       /* struct timeval (SO_SNDTIMEO) */
 #include <netinet/in.h>     /* sockaddr_in, htons, INADDR_LOOPBACK */
 #include <arpa/inet.h>      /* inet_pton */
 #include <poll.h>           /* poll */
@@ -596,6 +603,16 @@ int64_t sqr_os_sock_send(int64_t s, const char *buf, int64_t len) {
         done += n;
     }
     return len;
+}
+
+int sqr_os_sock_send_timeout(int64_t s, int timeout_ms) {
+    /* A send that makes no progress for this long fails (EAGAIN), which
+       sqr_os_sock_send reports as an error; 0 means no limit. */
+    struct timeval tv;
+    int ms = timeout_ms > 0 ? timeout_ms : 0;
+    tv.tv_sec  = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    return setsockopt((int)s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv) == 0 ? 0 : -1;
 }
 
 void sqr_os_sock_close(int64_t *s) {

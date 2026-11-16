@@ -45,6 +45,7 @@ module clib_wrap
     public :: c_sock_poll   !! wait for sockets to become readable
     public :: c_sock_recv   !! receive up to len(buf) bytes
     public :: c_sock_send   !! send all bytes
+    public :: c_sock_send_timeout !! limit how long a send may stall
     public :: c_sock_close  !! close a socket
 
     ! ----- Private bind(c) interfaces to osshim.c -----
@@ -226,6 +227,14 @@ module clib_wrap
             character(kind=c_char), intent(in) :: buf(*)
             integer(c_int64_t),     value      :: nbytes
             integer(c_int64_t)                 :: n
+        end function
+
+        ! Limit, in milliseconds, on a send that makes no progress (0 = none).
+        function sqr_os_sock_send_timeout(s, timeout_ms) bind(c, name='sqr_os_sock_send_timeout') result(rc)
+            import :: c_int, c_int64_t
+            integer(c_int64_t), value :: s
+            integer(c_int),     value :: timeout_ms
+            integer(c_int)            :: rc
         end function
 
         subroutine sqr_os_sock_close(s) bind(c, name='sqr_os_sock_close')
@@ -466,6 +475,16 @@ module clib_wrap
             integer(c_int64_t), intent(in) :: sock   !! Connected socket
             character(len=*),   intent(in) :: bytes  !! Bytes to send
             integer                        :: ierr   !! 0 on success, nonzero on failure
+        end function
+
+        !! Limit how long a send on `sock` may make no progress: after
+        !! `timeout_ms` milliseconds a stalled `c_sock_send` fails instead of
+        !! blocking for as long as the peer declines to read.  0 removes the
+        !! limit.  Returns 0 on success, nonzero on failure.
+        module function c_sock_send_timeout(sock, timeout_ms) result(ierr)
+            integer(c_int64_t), intent(in) :: sock        !! Connected socket
+            integer,            intent(in) :: timeout_ms  !! Limit in milliseconds (0 = none)
+            integer                        :: ierr        !! 0 on success, nonzero on failure
         end function
 
         !! Close a socket.  A no-op for an unheld (-1) token; resets `sock`

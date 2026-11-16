@@ -163,6 +163,14 @@ statements.
 
 A dropped connection with an open transaction is rolled back by the server.
 
+A reply that cannot be delivered ends the session in the same way, whatever
+the reply. That covers a client that has gone away and one that has stopped
+reading: the server is single-threaded and its sends block, so a send that
+makes no progress for 10 seconds (`SQRD_SEND_TIMEOUT_MS`) fails, the
+session is dropped and its transaction rolled back. A client must therefore
+read a reply it has asked for; one that is merely slow is not affected, as
+the limit is on a send making no progress at all.
+
 ## Backup
 
 Agreed 2026-08-15. `PACK` produces a consistent snapshot **without closing the

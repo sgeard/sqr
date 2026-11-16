@@ -14,6 +14,11 @@
 !! refused with stat `SQRD_STAT_BUSY` while it stays open, and a session that
 !! disconnects holding it is rolled back.  Reads from other sessions are
 !! allowed (and see the uncommitted state — one engine handle, one storage).
+!!
+!! A reply that cannot be sent ends its session, whatever the reply: the
+!! session is dropped and any transaction it holds is rolled back.  That
+!! covers a client that has gone away and one that has stopped reading —
+!! a send that makes no progress for `SQRD_SEND_TIMEOUT_MS` fails.
 module sqr_serve
     use, intrinsic :: iso_c_binding, only: c_int64_t
     use :: sqr,     only: db_t
@@ -31,6 +36,13 @@ module sqr_serve
 
     integer, parameter, public :: SQRD_MAX_SESSIONS = 16  !! Concurrent-connection cap
 
+    !! Default limit, in milliseconds, on a reply that makes no progress
+    !! because its client has stopped reading.  The server is single-threaded
+    !! and its sends block, so this bounds how long one such client can hold
+    !! up every other; when it expires the send fails and the session is
+    !! dropped.  `server_t%send_timeout_ms` carries the value in use.
+    integer, parameter, public :: SQRD_SEND_TIMEOUT_MS = 10000
+
     !! One client connection and its protocol state.
     type, public :: session_t
         type(net_conn_t) :: conn  !! Framed connection
@@ -47,6 +59,9 @@ module sqr_serve
         integer             :: port  = 0     !! Actual bound port
         type(session_t)     :: sessions(SQRD_MAX_SESSIONS)  !! Session slots
         integer             :: txn_owner = 0  !! Session slot holding the open transaction (0 = none)
+        !! Send stall limit applied to each connection as it is accepted
+        !! (milliseconds; 0 = none).  Set after `serve_open` to change it.
+        integer             :: send_timeout_ms = SQRD_SEND_TIMEOUT_MS
         character(len=:), allocatable :: dbname  !! Name advertised in `OK` (db dir basename)
         !! The database directory as the caller named it, made absolute but
         !! NOT resolved — a symlink here is usually the name that matters

@@ -6,9 +6,12 @@
 ! throughout is: client writes a complete request, pump() runs serve_step
 ! until the server goes idle, client reads the complete response.  That is
 ! deadlock-free single-threaded because requests and responses here are far
-! smaller than the socket buffers.
+! smaller than the socket buffers.  The two exceptions are deliberate:
+! t_failed_send and t_stalled_reader ask for a reply far larger than the
+! buffers and never read it, to see what the server does when a reply cannot
+! be delivered.
 program utest_serve
-    use, intrinsic :: iso_fortran_env, only: int32, real64
+    use, intrinsic :: iso_fortran_env, only: int32, int64, real64
     use, intrinsic :: iso_c_binding,   only: c_int64_t
     use :: sqr
     use :: sqr_net
@@ -22,6 +25,7 @@ program utest_serve
     type(db_t), target, save :: db
     type(server_t) :: srv
     type(net_conn_t) :: cli1, cli2   ! shared across the ordered tests below
+    type(net_conn_t) :: cli3         ! the client whose reply is never delivered
     integer :: rs
 
     call cleanup_dir()
@@ -39,6 +43,8 @@ program utest_serve
     call t_errors()
     call t_busy()
     call t_rollback_on_drop()
+    call t_failed_send()
+    call t_stalled_reader()
     call t_quit()
 
     call serve_close(srv)
@@ -458,6 +464,102 @@ contains
         call send_sql(cli2, 'SELECT id FROM t WHERE id = 99')
         call read_rows(cli2, nr, nc, collines, isnull, cells, ok)
         call check(ok .and. nr == 0, 'drop: the pending row is gone')
+    end subroutine
+
+    ! A table whose SELECT * is far more than the loopback socket buffers
+    ! hold (about 32 MB), filled through the engine in one transaction.
+    subroutine make_big()
+        integer, parameter :: BIG_ROWS = 8000, BIG_WIDTH = 4000
+        type(column_t) :: c(2)
+        character(len=:), allocatable :: buf
+        integer(int32) :: rid
+        integer :: r, ti, st
+        if (db_table_index(db, 'big') > 0) return
+        c(1)%name = 'a'; c(1)%dtype = DT_INT ; c(1)%csize = 4
+        c(2)%name = 'c'; c(2)%dtype = DT_CHAR; c(2)%csize = BIG_WIDTH
+        call db_create_table(db, 'big', c, st)
+        ti = db_table_index(db, 'big')
+        call row_alloc(buf, db%tables(ti)%record_size)
+        call db_begin(db, st)
+        fill: do r = 1, BIG_ROWS
+            call row_set_status(buf, ROW_ALIVE)
+            call row_set_int (buf, db%tables(ti)%cols(1), int(r, int32))
+            call row_set_char(buf, db%tables(ti)%cols(2), repeat('x', BIG_WIDTH))
+            call db_insert(db, 'big', buf, rid, st)
+        end do fill
+        call db_commit(db, st)
+    end subroutine
+
+    ! Send a request for the whole of `big` without pumping the server: the
+    ! caller decides what the client does before the reply is attempted.
+    subroutine ask_for_big(cli)
+        type(net_conn_t), intent(inout) :: cli
+        character(len=*), parameter :: q = 'SELECT * FROM big'
+        character(len=12) :: nb
+        integer :: ne
+        write(nb, '(i0)') len(q)
+        ne = net_send_line(cli, 'SQL ' // trim(nb))
+        ne = net_send_payload(cli, q)
+    end subroutine
+
+    ! A client that opens a transaction, asks for a large reply and goes away
+    ! without reading it.  The send fails part way; the session must end as
+    ! any dropped session does: transaction rolled back, slot free.
+    subroutine t_failed_send()
+        character(len=:), allocatable :: okline, hdr, payload
+        character(len=64), allocatable :: collines(:), cells(:,:)
+        logical,           allocatable :: isnull(:,:)
+        integer :: nr, nc, nact
+        logical :: ok
+        call make_big()
+        call new_client(cli3, okline)
+        nact = count(srv%sessions%active)
+        call send_sql(cli3, 'BEGIN')
+        call read_reply(cli3, hdr, payload)
+        call send_sql(cli3, "INSERT INTO t VALUES (77, 7.7, 'Gone', 'g')")
+        call read_reply(cli3, hdr, payload)
+        call check(hdr == 'COUNT 1' .and. db_in_txn(db), 'failed send: transaction open with a pending row')
+        call ask_for_big(cli3)
+        call net_close(cli3)          ! gone before the reply is written
+        call pump()
+        call check(.not. db_in_txn(db), 'failed send: the transaction is rolled back')
+        call check(count(srv%sessions%active) == nact - 1, 'failed send: the session slot is free')
+        call send_sql(cli2, "INSERT INTO t VALUES (78, 7.8, 'Here', 'h')")
+        call read_reply(cli2, hdr, payload)
+        call check(hdr == 'COUNT 1', 'failed send: another client can write')
+        call send_sql(cli2, 'SELECT id FROM t WHERE id = 77')
+        call read_rows(cli2, nr, nc, collines, isnull, cells, ok)
+        call check(ok .and. nr == 0, 'failed send: the pending row is gone')
+    end subroutine
+
+    ! A client that asks for a large reply and then neither reads nor
+    ! disconnects.  The send stalls once the socket buffers are full; the
+    ! send limit must fail it, and the session then ends like any other whose
+    ! reply could not be delivered.  The limit is shortened for the test.
+    subroutine t_stalled_reader()
+        character(len=:), allocatable :: okline, hdr, payload
+        integer(int64) :: t0, t1, rate
+        integer :: nact, ne
+        call make_big()
+        srv%send_timeout_ms = 200
+        call new_client(cli3, okline)
+        nact = count(srv%sessions%active)
+        call send_sql(cli3, 'BEGIN')
+        call read_reply(cli3, hdr, payload)
+        call check(db_in_txn(db), 'stall: transaction open on the stalling client')
+        call ask_for_big(cli3)        ! and then read nothing
+        call system_clock(t0, rate)
+        call pump()
+        call system_clock(t1)
+        call check(count(srv%sessions%active) == nact - 1, 'stall: the stalled session is dropped')
+        call check(.not. db_in_txn(db), 'stall: its transaction is rolled back')
+        call check(t1 - t0 < 5 * rate, 'stall: the server is held for the send limit, not for ever')
+        ne = net_send_line(cli2, 'PING')
+        call pump()
+        call read_reply(cli2, hdr, payload)
+        call check(hdr == 'NONE', 'stall: another client is answered afterwards')
+        call net_close(cli3)
+        srv%send_timeout_ms = SQRD_SEND_TIMEOUT_MS
     end subroutine
 
     subroutine t_quit()
