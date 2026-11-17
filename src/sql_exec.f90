@@ -26,6 +26,13 @@ submodule (sql:sql_base) sql_executor
     ! Rows the gather buffers start with; they double as they fill.
     integer, parameter :: GATHER_INIT_CAP = 16
 
+    ! What a client is told about a transaction doomed by a statement that
+    ! failed after it had begun to write.
+    character(len=*), parameter :: DOOMED_STMT = &
+        'an earlier statement in this transaction failed part-way; ROLLBACK is required'
+    character(len=*), parameter :: DOOMED_COMMIT = &
+        'not committed: a statement in this transaction failed part-way; it has been rolled back'
+
     !! Gathering context for a `db_scan` (and reused by the cursor path): the
     !! table's column metadata (a `db_describe` snapshot — valid for the
     !! statement, since no DDL can interleave), the WHERE clause to apply,
@@ -214,6 +221,11 @@ contains
             call db_begin(db, rs)
             if (rs == SQR_OK) call msg_result(res, 'transaction started')
         case (ST_COMMIT)
+            if (db_txn_doomed(db)) then
+                call db_commit(db, rs)       ! rolls back; rs says whether that worked
+                call set_err(stat, errmsg, rs, DOOMED_COMMIT)
+                return
+            end if
             call db_commit(db, rs)
             if (rs == SQR_OK) call msg_result(res, 'committed')
         case (ST_ROLLBACK)
@@ -238,6 +250,7 @@ contains
         character(len=:), allocatable :: buf
         integer(int32) :: rid
         logical :: own
+        integer(int64) :: mark
         character(len=SQR_ERRMSG_LEN) :: em
 
         ti = require_table(db, stmt%table, stat, errmsg)
@@ -273,6 +286,8 @@ contains
         end if
 
         own = .not. db_in_txn(db)            ! own the txn unless inside an explicit one
+        if (doomed_block(db, own, stat, errmsg)) return
+        mark = db_txn_mark(db)
         if (own) then
             call db_begin(db, rs)
             if (rs /= SQR_OK) then
@@ -292,14 +307,14 @@ contains
                 em = ''
                 call put_lit(buf, cols(target(c)), stmt%values(r, c), rs, em)
                 if (rs /= SQR_OK) then
-                    call fail_txn(db, own)
+                    call fail_txn(db, own, mark)
                     call set_err(stat, errmsg, rs, trim(em))
                     return
                 end if
             end do
             call db_insert(db, trim(stmt%table), buf, rid, rs)
             if (rs /= SQR_OK) then
-                call fail_txn(db, own)
+                call fail_txn(db, own, mark)
                 call set_err(stat, errmsg, rs, 'insert failed (duplicate key or I/O error)')
                 return
             end if
@@ -310,7 +325,7 @@ contains
                 call db_set_text(db, trim(stmt%table), rid, &
                     trim(cols(target(c))%name), stmt%values(r, c)%sval, rs)
                 if (rs /= SQR_OK) then
-                    call fail_txn(db, own)
+                    call fail_txn(db, own, mark)
                     call set_err(stat, errmsg, rs, 'failed to write text value')
                     return
                 end if
@@ -339,6 +354,7 @@ contains
         integer :: ti, rs, k
         type(column_t), allocatable :: cols(:)
         logical :: own
+        integer(int64) :: mark
         ti = require_table(db, stmt%table, stat, errmsg)
         if (ti == 0) return
         call db_describe(db, trim(stmt%table), cols)
@@ -349,6 +365,8 @@ contains
             return
         end if
         own = .not. db_in_txn(db)
+        if (doomed_block(db, own, stat, errmsg)) return
+        mark = db_txn_mark(db)
         if (own) then
             call db_begin(db, rs)
             if (rs /= SQR_OK) then; call set_err(stat, errmsg, rs, 'cannot begin transaction'); return; end if
@@ -356,7 +374,7 @@ contains
         do k = 1, g%n
             call db_delete(db, trim(stmt%table), g%rids(k), rs)
             if (rs /= SQR_OK) then
-                call fail_txn(db, own)
+                call fail_txn(db, own, mark)
                 call set_err(stat, errmsg, rs, 'delete failed')
                 return
             end if
@@ -382,6 +400,7 @@ contains
         type(column_t), allocatable :: cols(:)
         character(len=:), allocatable :: buf
         logical :: own
+        integer(int64) :: mark
         character(len=SQR_ERRMSG_LEN) :: em
 
         ti = require_table(db, stmt%table, stat, errmsg)
@@ -404,6 +423,8 @@ contains
         if (rs /= SQR_OK) then; if (present(stat)) stat = rs; return; end if
 
         own = .not. db_in_txn(db)
+        if (doomed_block(db, own, stat, errmsg)) return
+        mark = db_txn_mark(db)
         if (own) then
             call db_begin(db, rs)
             if (rs /= SQR_OK) then; call set_err(stat, errmsg, rs, 'cannot begin transaction'); return; end if
@@ -419,14 +440,14 @@ contains
                 em = ''
                 call put_lit(buf, cols(setcol(s)), stmt%set_vals(s), rs, em)
                 if (rs /= SQR_OK) then
-                    call fail_txn(db, own); call set_err(stat, errmsg, rs, trim(em)); return
+                    call fail_txn(db, own, mark); call set_err(stat, errmsg, rs, trim(em)); return
                 end if
             end do
             call db_update(db, trim(stmt%table), g%rids(k), buf, rs)
             if (rs /= SQR_OK) then
                 ! db_update re-validates liveness, so a row that vanished
                 ! between gather and here surfaces as SQR_NOT_FOUND.
-                call fail_txn(db, own)
+                call fail_txn(db, own, mark)
                 if (rs == SQR_NOT_FOUND) then
                     call set_err(stat, errmsg, rs, 'update: row vanished')
                 else
@@ -441,7 +462,7 @@ contains
                 call db_set_text(db, trim(stmt%table), g%rids(k), &
                     trim(cols(setcol(s))%name), stmt%set_vals(s)%sval, rs)
                 if (rs /= SQR_OK) then
-                    call fail_txn(db, own); call set_err(stat, errmsg, rs, 'failed to write text value'); return
+                    call fail_txn(db, own, mark); call set_err(stat, errmsg, rs, 'failed to write text value'); return
                 end if
             end do
         end do rows
@@ -1527,13 +1548,37 @@ contains
         end associate
     end function
 
-    ! Abort an owned transaction on an error path (best effort).
-    subroutine fail_txn(db, own)
-        type(db_t), intent(inout) :: db
-        logical,    intent(in)    :: own
+    ! A statement failed part-way.  A transaction the statement opened is
+    ! rolled back (best effort).  Inside the caller's BEGIN the rows already
+    ! written cannot be taken back on their own, so if the statement wrote
+    ! anything since `mark` the transaction is doomed: every later write is
+    ! refused and COMMIT rolls back.  A statement that failed before its first
+    ! write leaves the transaction usable.
+    subroutine fail_txn(db, own, mark)
+        type(db_t),     intent(inout) :: db
+        logical,        intent(in)    :: own
+        integer(int64), intent(in)    :: mark
         integer :: rs
-        if (own) call db_rollback(db, rs)
+        if (own) then
+            call db_rollback(db, rs)
+        else
+            call db_doom_txn(db, mark)
+        end if
     end subroutine
+
+    ! Refuse a write statement inside a doomed transaction before it writes,
+    ! with a message that says what to do.
+    function doomed_block(db, own, stat, errmsg) result(blocked)
+        type(db_t),       intent(in)              :: db
+        logical,          intent(in)              :: own
+        integer,          intent(out),   optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
+        logical :: blocked
+        blocked = .false.
+        if (own) return
+        blocked = db_txn_doomed(db)
+        if (blocked) call set_err(stat, errmsg, SQR_INVALID, DOOMED_STMT)
+    end function
 
     subroutine msg_result(res, text)
         type(sql_result_t), intent(out) :: res

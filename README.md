@@ -138,6 +138,15 @@ call db_begin(db, st)
 call db_commit(db, st)     ! durable here; or db_rollback(db, st)
 ```
 
+Outside a transaction every call is atomic by itself. Inside one, a call that
+fails after it has begun to write cannot be taken back on its own, so it
+*dooms* the transaction: every later write returns `SQR_INVALID`, reads still
+work, and `db_commit` rolls the transaction back and returns `SQR_INVALID`
+instead of committing a half-applied change. A call that fails before it
+writes anything (a duplicate key, a missing row) leaves the transaction
+usable. A caller whose own statement spans several calls can apply the same
+rule with `db_txn_mark` and `db_doom_txn`, as the SQL layer does.
+
 Give the transaction a `label` and it becomes a *gesture*: one step on an
 in-memory Undo/Redo history, for an application that offers Undo.
 
@@ -180,7 +189,8 @@ call db_redo(db, st, label)    ! ...and back
   `db_update_by_key`, `db_delete_by_key`
 - **Range scans / cursors:** `db_open_cursor`, `db_find_range`,
   `db_cursor_next`
-- **Transactions:** `db_begin`, `db_commit`, `db_rollback`
+- **Transactions:** `db_begin`, `db_commit`, `db_rollback`, `db_in_txn`,
+  `db_txn_mark`, `db_doom_txn`, `db_txn_doomed`
 - **Undo / Redo history:** `db_undo`, `db_redo`, `db_can_undo`, `db_can_redo`,
   `db_reset_history`
 - **Row buffers:** `row_alloc`, `row_clear`, `row_status`, `row_set_status`,
@@ -298,6 +308,14 @@ The supported subset: DDL (`CREATE`/`DROP TABLE`, `CREATE [UNIQUE] INDEX`,
 `UPDATE`), `SELECT item,…|* … [WHERE][ORDER BY col [ASC|DESC]][LIMIT n]`, and
 `BEGIN`/`COMMIT`/`ROLLBACK`. Types are `INTEGER`/`INT`, `REAL`, `CHAR(n)`,
 `TEXT`.
+
+A statement is atomic. Outside `BEGIN` a statement that fails changes
+nothing. Inside `BEGIN`, a statement that fails after writing some of its
+rows (the third row of a multi-row `INSERT` is a duplicate, say) dooms the
+transaction: later `INSERT`/`UPDATE`/`DELETE` statements are refused,
+`SELECT` still works, and `COMMIT` reports an error and rolls back. Issue
+`ROLLBACK` and start again. A statement that fails before it writes anything
+leaves the transaction as it was.
 
 A projection `item` is a column, a literal or an aggregate, optionally
 renamed with `AS name`:

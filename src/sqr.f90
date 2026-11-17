@@ -237,6 +237,9 @@ module sqr
         logical        :: sized    = .false.  !! File created + pre-sized this session
         integer(int64) :: capacity = 0        !! Pre-allocated size in bytes
         integer        :: nrec     = 0        !! Live undo-record count for the current txn
+        logical        :: doomed   = .false.  !! A write failed part-way inside the explicit txn: it can only be rolled back
+        integer(int64) :: nwrites  = 0        !! Base writes announced to the journal this txn (deduplicated captures included)
+        integer(int64) :: op_mark  = 0        !! `nwrites` when the mutator now running inside an explicit txn began
         type(undo_rec_t), allocatable :: recs(:)  !! In-memory undo set for the current txn
         type(tbl_snap_t), allocatable :: snaps(:)  !! Per-table counter snapshot, by table position, for the current txn
         integer, allocatable :: hslot(:)      !! Open-addressed dedup index into recs (record index, 0 = empty); power-of-two size
@@ -383,6 +386,9 @@ module sqr
         procedure :: begin        => db_begin
         procedure :: commit       => db_commit
         procedure :: rollback     => db_rollback
+        procedure :: txn_mark     => db_txn_mark
+        procedure :: doom_txn     => db_doom_txn
+        procedure :: txn_doomed   => db_txn_doomed
         procedure :: undo         => db_undo
         procedure :: redo         => db_redo
         procedure :: can_undo     => db_can_undo
@@ -456,7 +462,7 @@ module sqr
     public :: db_open_cursor, db_find_range, db_cursor_next
     public :: db_insert_many, db_verify
     ! Explicit transaction façade (what SQL BEGIN/COMMIT/ROLLBACK maps onto).
-    public :: db_begin, db_commit, db_rollback
+    public :: db_begin, db_commit, db_rollback, db_txn_mark, db_doom_txn, db_txn_doomed
     ! In-memory Undo/Redo history of committed (labelled) gestures.
     public :: db_undo, db_redo, db_can_undo, db_can_redo, db_reset_history
     ! Rollback-journal internals (durability/atomicity layer). Public only so
@@ -821,6 +827,30 @@ module sqr
             class(db_t),      intent(in) :: db  !! Database handle
             character(len=*), intent(in) :: table_name  !! Table to count
             integer(int32)               :: n  !! Live rows, 0 if absent
+        end function
+
+        !! A mark for `db_doom_txn`: the number of base writes the open
+        !! transaction has made so far (0 when none is in flight).  A front-end
+        !! takes it before a statement made of several mutator calls.
+        pure module function db_txn_mark(db) result(mark)
+            class(db_t), intent(in) :: db  !! Database handle
+            integer(int64)          :: mark  !! Writes so far in this transaction
+        end function
+
+        !! Doom the open explicit transaction (see `db_commit`), so that it can
+        !! only be rolled back.  With `since` (from `db_txn_mark`) it is doomed
+        !! only if it has written since that mark: a statement that failed
+        !! before changing anything leaves the transaction usable.  No effect
+        !! outside an explicit transaction.
+        module subroutine db_doom_txn(db, since)
+            class(db_t),    intent(inout)        :: db  !! Database handle
+            integer(int64), intent(in), optional :: since  !! Mark taken before the failed statement
+        end subroutine
+
+        !! `.true.` if the open explicit transaction is doomed.
+        pure module function db_txn_doomed(db) result(doomed)
+            class(db_t), intent(in) :: db  !! Database handle
+            logical                 :: doomed
         end function
 
         !! `.true.` while a transaction is in flight on this handle — for
@@ -1374,6 +1404,13 @@ module sqr
         !! Commit the explicit transaction opened by `db_begin`, keeping every
         !! change and discarding the undo set.  Fails `SQR_INVALID` if no
         !! explicit transaction is in flight.  Maps onto SQL `COMMIT`.
+        !!
+        !! A DOOMED transaction is not committed: it is rolled back and
+        !! `SQR_INVALID` is returned.  A transaction is doomed when a mutator
+        !! inside it failed after it had begun to write (its partial effects
+        !! cannot be undone on their own), or when the caller said so with
+        !! `db_doom_txn`.  Until it ends, every further write in it is refused
+        !! with `SQR_INVALID`; reads still work.
         module subroutine db_commit(db, stat, errmsg)
             class(db_t), intent(inout) :: db  !! Database handle
             integer,    intent(out), optional :: stat  !! `SQR_OK` or an error code

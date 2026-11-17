@@ -92,6 +92,7 @@ program utest_sqr
     call test_txn_record_rollback()
     call test_txn_insert_many_rollback()
     call test_explicit_txn()
+    call test_doomed_txn()
     call test_close_rolls_back_open_txn()
     call test_txn_structural_block()
     call test_locking()
@@ -622,6 +623,100 @@ contains
     ! commit/rollback without an open explicit txn are rejected, and that a
     ! multi-op explicit transaction is atomic both ways — committed changes kept,
     ! rolled-back changes fully reverted (files + counters via db_verify).
+    ! A transaction doomed by db_doom_txn refuses writes, still reads, and is
+    ! rolled back by db_commit (review findings Q1 / D4).
+    subroutine test_doomed_txn()
+        character(len=*), parameter :: XDIR = TEST_DIR // '_doomed'
+        type(db_t), target :: db
+        type(column_t)     :: c(1)
+        character(len=:), allocatable :: buf, got, lbl
+        integer        :: rs, ti, i, ios
+        integer(int32) :: rid
+        integer(int64) :: mark
+        character(len=128) :: emsg
+        ios = c_rmtree(XDIR)
+        c(1)%name = 'id'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        call db_open(db, XDIR, rs, emsg)
+        call db_create_table(db, 't', c, rs, emsg)
+        call db_create_index(db, 't', 'id', rs, unique=.true.)
+        ti = db_table_index(db, 't')
+        call row_alloc(buf, db%tables(ti)%record_size)
+        call row_alloc(got, db%tables(ti)%record_size)
+        do i = 1, 3
+            call row_set_int(buf, db%tables(ti)%cols(1), int(i, int32))
+            call db_insert(db, 't', buf, rid, rs)
+        end do
+
+        ! Outside a transaction there is nothing to doom.
+        call db_doom_txn(db)
+        call check(.not. db_txn_doomed(db), 'doomed: no effect outside a transaction')
+        call check(db_txn_mark(db) == 0_int64, 'doomed: mark is 0 outside a transaction')
+
+        ! A statement that fails before it writes does not doom.
+        call db_begin(db, rs)
+        mark = db_txn_mark(db)
+        call row_set_int(buf, db%tables(ti)%cols(1), 2_int32)
+        call db_insert(db, 't', buf, rid, rs)
+        call check(rs == SQR_DUP, 'doomed: a duplicate is refused')
+        call db_doom_txn(db, mark)
+        call check(.not. db_txn_doomed(db), 'doomed: a clean failure leaves the transaction usable')
+        call row_set_int(buf, db%tables(ti)%cols(1), 4_int32)
+        call db_insert(db, 't', buf, rid, rs)
+        call check(rs == SQR_OK, 'doomed: the transaction still accepts a write')
+        call db_commit(db, rs)
+        call check(rs == SQR_OK .and. db_row_count(db, 't') == 4, 'doomed: and commits')
+
+        ! A statement that wrote and then failed dooms.
+        call db_begin(db, rs)
+        mark = db_txn_mark(db)
+        call row_set_int(buf, db%tables(ti)%cols(1), 5_int32)
+        call db_insert(db, 't', buf, rid, rs)
+        call check(db_txn_mark(db) > mark, 'doomed: a write moves the mark')
+        call db_doom_txn(db, mark)
+        call check(db_txn_doomed(db), 'doomed: a failure after a write dooms')
+        call row_set_int(buf, db%tables(ti)%cols(1), 6_int32)
+        emsg = ''
+        call db_insert(db, 't', buf, rid, rs, emsg)
+        call check(rs == SQR_INVALID .and. rid == 0, 'doomed: insert refused')
+        call check(index(emsg, 'roll it back') > 0, 'doomed: the refusal says why')
+        call db_update(db, 't', 1_int32, buf, rs)
+        call check(rs == SQR_INVALID, 'doomed: update refused')
+        call db_delete(db, 't', 1_int32, rs)
+        call check(rs == SQR_INVALID, 'doomed: delete refused')
+        call db_get(db, 't', 1_int32, got, rs)
+        call check(rs == SQR_OK, 'doomed: reads still work')
+        call check(db_txn_doomed(db), 'doomed: a refused write leaves it doomed')
+        emsg = ''
+        call db_commit(db, rs, emsg)
+        call check(rs == SQR_INVALID, 'doomed: commit is refused')
+        call check(index(emsg, 'rolled back') > 0, 'doomed: commit says it rolled back')
+        call check(.not. db_in_txn(db), 'doomed: the transaction is over')
+        call check(db_row_count(db, 't') == 4, 'doomed: nothing it wrote survives')
+        call db_verify(db, 't', rs, emsg)
+        call check(rs == SQR_OK, 'doomed: table verifies after the rollback')
+
+        ! The next transaction starts clean, and ROLLBACK clears a doomed one.
+        call db_begin(db, rs)
+        call check(.not. db_txn_doomed(db), 'doomed: the next transaction is not doomed')
+        call db_doom_txn(db)
+        call check(db_txn_doomed(db), 'doomed: unconditional doom')
+        call db_rollback(db, rs)
+        call check(rs == SQR_OK .and. .not. db_txn_doomed(db), 'doomed: rollback ends it')
+
+        ! A doomed gesture records no history step.
+        call db_begin(db, rs, label='G')
+        call row_set_int(buf, db%tables(ti)%cols(1), 7_int32)
+        call db_insert(db, 't', buf, rid, rs)
+        call db_doom_txn(db)
+        call db_commit(db, rs)
+        call check(rs == SQR_INVALID .and. .not. db_can_undo(db), &
+                   'doomed: a doomed gesture leaves no undo step')
+        call db_undo(db, rs, lbl)
+        call check(rs == SQR_NO_UNDO, 'doomed: nothing to undo')
+        call db_close(db)
+        ios = c_rmtree(XDIR)
+    end subroutine
+
     subroutine test_explicit_txn()
         character(len=*), parameter :: XDIR = TEST_DIR // '_exptxn'
         type(db_t), target :: db

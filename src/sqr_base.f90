@@ -77,6 +77,9 @@ submodule (sqr) sqr_base
     integer, parameter :: SCHEMA_VERSION_UNFLAGGED = 1
     character(len=*), parameter :: CATALOG_FILE  = '_catalog.dat'
     character(len=*), parameter :: LOCK_FILE     = '_lock'
+    ! Sticky text for a write refused inside a doomed transaction (see ac_begin).
+    character(len=*), parameter :: DOOMED_MSG = &
+        'refused: a write in this transaction failed part-way; roll it back'
 
     ! checksum_fold: a polynomial fold, acc = (acc*CKSUM_MULT + byte) mod
     ! CKSUM_MOD. The result is stored in journal and pack files, so both
@@ -1327,13 +1330,27 @@ contains
     ! dereferences between these two calls (during the body's page writes), so
     ! `db` need not be `target` here — that is required only for the cross-call
     ! explicit-transaction path, which already declares it.
+    !
+    ! Inside an explicit transaction a failed body cannot be undone on its own.
+    ! If it had begun to write (jrnl%nwrites moved past the mark ac_begin took)
+    ! ac_end DOOMS the transaction: ac_begin then refuses every later mutator
+    ! and db_commit rolls back.  A body that failed before writing anything
+    ! (a duplicate key, a missing row) leaves the transaction usable.
     subroutine ac_begin(db, owns, stat)
         type(db_t), intent(inout) :: db
         logical,    intent(out)   :: owns
         integer,    intent(out)   :: stat
         stat = SQR_OK
         owns = .false.
-        if (db%jrnl%active .or. db%readonly) return   ! nested, or read-only: no-op
+        if (db%jrnl%active) then                      ! nested: the owner decides
+            if (db%jrnl%doomed) then
+                stat = SQR_INVALID
+                call set_last_err(db, SQR_INVALID, DOOMED_MSG)
+            end if
+            db%jrnl%op_mark = db%jrnl%nwrites
+            return
+        end if
+        if (db%readonly) return                       ! read-only: no-op
         call txn_begin(db, stat)
         owns = (stat == SQR_OK)
     end subroutine
@@ -1347,7 +1364,12 @@ contains
         logical,    intent(in)    :: owns
         integer,    intent(inout) :: stat
         integer :: st
-        if (.not. owns) return
+        if (.not. owns) then
+            if (stat /= SQR_OK .and. db%jrnl%active) then
+                if (db%jrnl%nwrites > db%jrnl%op_mark) db%jrnl%doomed = .true.
+            end if
+            return
+        end if
         if (stat == SQR_OK) then
             call txn_commit(db, st)
             stat = st

@@ -86,6 +86,9 @@ program utest_fault
     call history_atomicity(redo=.false.)
     call history_atomicity(redo=.true.)
 
+    ! D4: a mutator that fails part-way inside an explicit transaction.
+    call doomed_by_fault()
+
     ! H1: a faulted undo replay must leave the journal hot, never voided.
     call recover_fault()
     call check(no_stranded_units(), 'all: no unit left connected after faulted runs')
@@ -1012,6 +1015,82 @@ contains
         call check(bad == 0, 'history_atomicity: every mid-' // what // &
                              ' fault leaves the gesture wholly applied or wholly not')
     end subroutine history_atomicity
+
+    ! Review finding D4.  Inside an explicit transaction a fault is injected at
+    ! every I/O of an indexed insert.  The insert cannot be undone on its own,
+    ! so once it has begun to write the transaction must be doomed: the next
+    ! write refused, db_commit rolling back, and the store as it was.  A fault
+    ! before the first write may leave the transaction usable; committing it
+    ! must then leave a store that verifies, with no trace of the insert.
+    subroutine doomed_by_fault()
+        integer :: rs, k, nops, bad, ndoomed
+        integer(int32) :: rid
+
+        call prep_indexed()
+        call db_open(gdb, DBDIR, rs)
+        gopen = rs == SQR_OK
+        call db_begin(gdb, rs)
+        call fault_arm(BIG)                      ! never fires; just counts
+        call insert_zoe(gdb, rid, rs)
+        nops = fault_count()
+        call fault_disarm()
+        call check(rs == SQR_OK .and. nops > 0, 'doomed: clean in-transaction insert performs I/O')
+        call check(.not. db_txn_doomed(gdb), 'doomed: a clean insert does not doom')
+        call db_rollback(gdb, rs)
+        call close_g()
+
+        bad = 0
+        ndoomed = 0
+        sweep: do k = 1, nops
+            call prep_indexed()
+            call db_open(gdb, DBDIR, rs)
+            gopen = rs == SQR_OK
+            call db_begin(gdb, rs)
+            call fault_arm(k)
+            call insert_zoe(gdb, rid, rs)
+            call fault_disarm()
+            if (rs == SQR_OK) then               ! the fault was not on this path
+                call db_rollback(gdb, rs)
+                call close_g()
+                cycle sweep
+            end if
+            if (db_txn_doomed(gdb)) then
+                ndoomed = ndoomed + 1
+                call db_delete(gdb, 'people', 2_int32, rs)
+                if (rs /= SQR_INVALID) bad = bad + 1
+                call db_commit(gdb, rs)
+                if (rs /= SQR_INVALID) bad = bad + 1
+            else
+                call db_commit(gdb, rs)
+                if (rs /= SQR_OK) bad = bad + 1
+            end if
+            if (db_in_txn(gdb)) bad = bad + 1
+            if (.not. no_zoe_and_sound()) bad = bad + 1
+            call close_g()
+            call db_open(gdb, DBDIR, rs)
+            gopen = rs == SQR_OK
+            if (rs /= SQR_OK) then
+                bad = bad + 1
+                cycle sweep
+            end if
+            if (.not. no_zoe_and_sound()) bad = bad + 1
+            call close_g()
+        end do sweep
+        call check(ndoomed > 0, 'doomed: a fault after the first write dooms the transaction')
+        call check(bad == 0, 'doomed: a part-applied insert is never committed, at any fault')
+    end subroutine doomed_by_fault
+
+    ! True when the open store verifies and holds the three fixture rows only.
+    logical function no_zoe_and_sound() result(ok)
+        integer :: st
+        integer(int32) :: r
+        character(len=128) :: emsg
+        call db_verify(gdb, 'people', st, emsg)
+        ok = st == SQR_OK
+        call db_find_by_int(gdb, 'people', 'age', 99_int32, r, st)
+        ok = ok .and. (st /= SQR_OK .or. r == 0)
+        ok = ok .and. db_row_count(gdb, 'people') == 3
+    end function no_zoe_and_sound
 
     ! Fresh fixture with one committed gesture on the undo stack (and, for the
     ! redo sweep, undone again so that it sits on the redo stack).

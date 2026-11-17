@@ -108,6 +108,20 @@ contains
             call report(db, SQR_INVALID, stat, errmsg)
             return
         end if
+        ! A doomed transaction holds the partial effects of a failed write:
+        ! committing it would make them durable.  Roll it back instead.
+        if (db%jrnl%doomed) then
+            db%hist%capturing = .false.
+            call txn_rollback(db, st)
+            call clear_last_err(db)
+            if (st == SQR_OK) then
+                call set_last_err(db, SQR_INVALID, &
+                    'transaction rolled back: a write in it had failed part-way')
+                st = SQR_INVALID
+            end if
+            call report(db, st, stat, errmsg)
+            return
+        end if
         ! Snapshot this gesture as one Undo step BEFORE txn_commit discards the
         ! in-memory undo set (jrnl%recs) and counters.  A no-op gesture (no
         ! recs) records nothing, so an empty bracket stays invisible to Undo.
@@ -189,6 +203,7 @@ contains
             if (present(stat)) stat = SQR_INVALID
             return
         end if
+        db%jrnl%nwrites = db%jrnl%nwrites + 1
         ! A caller-supplied pre-image dictates the region length; otherwise the
         ! requested length governs both the idempotency key and the re-read.
         if (present(bytes)) then
@@ -229,6 +244,7 @@ contains
             if (present(stat)) stat = SQR_INVALID
             return
         end if
+        db%jrnl%nwrites = db%jrnl%nwrites + 1
         if (have_rec(db%jrnl, UNDO_EXTEND, trim(path), 0_int64, 0_int64)) return
         r%kind     = UNDO_EXTEND
         r%path     = trim(path)
@@ -253,6 +269,7 @@ contains
         end if
         st = SQR_OK
         before = db%jrnl%nrec
+        db%jrnl%nwrites = db%jrnl%nwrites + 1
         call stage_tail(db, trim(path), keep_len, st)
         if (st /= SQR_OK) then
             if (present(stat)) stat = st
@@ -551,6 +568,9 @@ contains
         db%jrnl%explicit = .false.
         db%jrnl%armed    = .false.
         db%jrnl%nrec     = 0
+        db%jrnl%doomed   = .false.
+        db%jrnl%nwrites  = 0
+        db%jrnl%op_mark  = 0
         db%hist%tracked  = .false.
         if (allocated(db%jrnl%recs))  deallocate(db%jrnl%recs)
         if (allocated(db%jrnl%snaps)) deallocate(db%jrnl%snaps)

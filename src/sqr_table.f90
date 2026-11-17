@@ -1070,6 +1070,28 @@ contains
         active = db%jrnl%active .and. db%jrnl%explicit
     end function
 
+    pure module function db_txn_mark(db) result(mark)
+        class(db_t), intent(in) :: db
+        integer(int64)          :: mark
+        mark = merge(db%jrnl%nwrites, 0_int64, db%jrnl%active)
+    end function
+
+    module subroutine db_doom_txn(db, since)
+        class(db_t),    intent(inout)        :: db
+        integer(int64), intent(in), optional :: since
+        if (.not. (db%jrnl%active .and. db%jrnl%explicit)) return
+        if (present(since)) then
+            if (db%jrnl%nwrites <= since) return
+        end if
+        db%jrnl%doomed = .true.
+    end subroutine
+
+    pure module function db_txn_doomed(db) result(doomed)
+        class(db_t), intent(in) :: db
+        logical                 :: doomed
+        doomed = db%jrnl%active .and. db%jrnl%explicit .and. db%jrnl%doomed
+    end function
+
     ! ===== Schema evolution: add / drop column =====
 
     module subroutine db_add_column(db, table_name, col, stat, errmsg)

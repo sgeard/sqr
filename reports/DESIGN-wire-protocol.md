@@ -161,6 +161,13 @@ policy; a bounded wait can be added later without protocol change. ODBC
 autocommit on/off maps to the driver emitting BEGIN/COMMIT around
 statements.
 
+A statement that fails after writing some of its rows dooms its
+transaction: later writes on that connection get `ERR` 5 (`SQR_INVALID`)
+until it ends, SELECT still works, and COMMIT rolls back and replies `ERR` 5
+rather than committing part of a statement. A client should send ROLLBACK
+on any error inside a transaction, as the ODBC driver does. A statement that
+fails before it writes anything leaves the transaction open and usable.
+
 A dropped connection with an open transaction is rolled back by the server.
 
 A reply that cannot be delivered ends the session in the same way, whatever

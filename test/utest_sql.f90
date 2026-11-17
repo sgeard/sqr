@@ -45,6 +45,7 @@ program utest_sql
     call test_index_null_parity_sweep()
     call test_band_uses_index()
     call test_transactions()
+    call test_txn_statement_failure()
     call test_exec_errors()
     call test_insert_dup_column()
     call test_int_min_literal()
@@ -1344,6 +1345,91 @@ contains
         call run(db, "SELECT id FROM t ORDER BY id", res, rs)
         call check(res%nrows == 2, 'txn: committed insert persists')
 
+        call db_close(db)
+    end subroutine
+
+    ! Review finding Q1: inside BEGIN a statement that fails after writing some
+    ! of its rows dooms the transaction; one that fails before writing does not.
+    subroutine test_txn_statement_failure()
+        type(db_t) :: db
+        type(sql_result_t) :: res
+        integer :: rs
+        character(len=200) :: em
+
+        call fresh_db(db)
+        call run(db, "CREATE TABLE t (a INTEGER)", res, rs)
+        call run(db, "CREATE UNIQUE INDEX ON t (a)", res, rs)
+        call check(rs == SQR_OK, 'txnfail: unique index')
+        call run(db, "INSERT INTO t VALUES (10)", res, rs)
+
+        ! INSERT: rows 1 and 2 are written, the third is a duplicate.
+        call run(db, "BEGIN", res, rs)
+        call run(db, "INSERT INTO t VALUES (1), (2), (1)", res, rs)
+        call check(rs /= SQR_OK, 'txnfail: the multi-row insert fails')
+        call run(db, "SELECT a FROM t", res, rs)
+        call check(rs == SQR_OK, 'txnfail: a read still works')
+        call run(db, "INSERT INTO t VALUES (3)", res, rs, em)
+        call check(rs == SQR_INVALID .and. index(em, 'ROLLBACK') > 0, &
+                   'txnfail: the next insert is refused, and says why')
+        call run(db, "UPDATE t SET a = 11 WHERE a = 10", res, rs, em)
+        call check(rs == SQR_INVALID, 'txnfail: update refused')
+        call run(db, "DELETE FROM t WHERE a = 10", res, rs, em)
+        call check(rs == SQR_INVALID, 'txnfail: delete refused')
+        call run(db, "COMMIT", res, rs, em)
+        call check(rs == SQR_INVALID .and. index(em, 'rolled back') > 0, &
+                   'txnfail: COMMIT reports the rollback')
+        call run(db, "SELECT a FROM t", res, rs)
+        call check(res%nrows == 1, 'txnfail: no part of the failed insert was kept')
+        call run(db, "COMMIT", res, rs)
+        call check(rs /= SQR_OK, 'txnfail: the transaction is over')
+
+        ! UPDATE: the first row is changed, the second collides with it.
+        call run(db, "INSERT INTO t VALUES (20)", res, rs)
+        call run(db, "BEGIN", res, rs)
+        call run(db, "UPDATE t SET a = 5", res, rs)
+        call check(rs /= SQR_OK, 'txnfail: the two-row update fails')
+        call run(db, "COMMIT", res, rs)
+        call check(rs == SQR_INVALID, 'txnfail: COMMIT refused after the update')
+        call run(db, "SELECT a FROM t ORDER BY a", res, rs)
+        call check(res%nrows == 2, 'txnfail: both rows remain')
+        if (res%nrows == 2) call check(cell(res, 1, 1) == '10' .and. cell(res, 2, 1) == '20', &
+                   'txnfail: with their old values')
+
+        ! ROLLBACK after a doomed statement, then a clean transaction.
+        call run(db, "BEGIN", res, rs)
+        call run(db, "INSERT INTO t VALUES (1), (10)", res, rs)
+        call run(db, "ROLLBACK", res, rs)
+        call check(rs == SQR_OK, 'txnfail: ROLLBACK is accepted')
+        call run(db, "BEGIN", res, rs)
+        call run(db, "INSERT INTO t VALUES (30)", res, rs)
+        call check(rs == SQR_OK, 'txnfail: the next transaction writes')
+        call run(db, "COMMIT", res, rs)
+        call check(rs == SQR_OK, 'txnfail: and commits')
+
+        ! A statement that fails before its first write leaves the transaction
+        ! usable: a duplicate in the first row, a bad value, an unknown table.
+        call run(db, "BEGIN", res, rs)
+        call run(db, "INSERT INTO t VALUES (40)", res, rs)
+        call run(db, "INSERT INTO t VALUES (10), (41)", res, rs)
+        call check(rs /= SQR_OK, 'txnfail: duplicate in the first row fails')
+        call run(db, "INSERT INTO t VALUES ('x')", res, rs)
+        call check(rs /= SQR_OK, 'txnfail: a bad value fails')
+        call run(db, "INSERT INTO nowhere VALUES (1)", res, rs)
+        call check(rs /= SQR_OK, 'txnfail: an unknown table fails')
+        call run(db, "INSERT INTO t VALUES (42)", res, rs)
+        call check(rs == SQR_OK, 'txnfail: the transaction still accepts a write')
+        call run(db, "COMMIT", res, rs)
+        call check(rs == SQR_OK, 'txnfail: and commits')
+        call run(db, "SELECT a FROM t", res, rs)
+        call check(res%nrows == 5, 'txnfail: 10, 20, 30, 40, 42')
+
+        ! Auto-commit is unchanged: the statement is atomic and nothing lingers.
+        call run(db, "INSERT INTO t VALUES (50), (51), (50)", res, rs)
+        call check(rs /= SQR_OK, 'txnfail: auto-commit multi-row insert fails')
+        call run(db, "INSERT INTO t VALUES (52)", res, rs)
+        call check(rs == SQR_OK, 'txnfail: the next auto-commit statement is unaffected')
+        call run(db, "SELECT a FROM t", res, rs)
+        call check(res%nrows == 6, 'txnfail: only the one new row')
         call db_close(db)
     end subroutine
 

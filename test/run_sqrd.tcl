@@ -321,6 +321,26 @@ lassign [reply $c2] hdr payload
 check {$hdr eq "NONE"} "QUIT -> NONE"
 close $c2
 
+# A statement that fails part-way inside BEGIN dooms the transaction: the
+# next write is refused, COMMIT rolls back, and the connection no longer
+# holds the server's one transaction.
+reply [sendsql $c "CREATE TABLE dm (a INTEGER)"]
+reply [sendsql $c "CREATE UNIQUE INDEX ON dm (a)"]
+reply [sendsql $c "BEGIN"]
+lassign [reply [sendsql $c "INSERT INTO dm VALUES (1), (2), (1)"]] hdr payload
+check {[lindex $hdr 0] eq "ERR"} "part-applied INSERT in a transaction -> ERR"
+lassign [reply [sendsql $c "INSERT INTO dm VALUES (3)"]] hdr payload
+check {[lrange $hdr 0 1] eq "ERR 5" && [string match "*ROLLBACK is required*" $payload]} \
+    "next write in the doomed transaction -> ERR 5, naming the remedy"
+lassign [reply [sendsql $c "COMMIT"]] hdr payload
+check {[lrange $hdr 0 1] eq "ERR 5" && [string match "*rolled back*" $payload]} \
+    "COMMIT of the doomed transaction -> ERR 5, rolled back"
+lassign [reply [sendsql $c "BEGIN"]] hdr payload
+check {[lindex $hdr 0] eq "MSG"} "a new transaction can start afterwards"
+lassign [reply [sendsql $c "INSERT INTO dm VALUES (1)"]] hdr payload
+check {[lindex $hdr 0] ne "ERR"} "and row 1 is free again: the failed statement left nothing"
+reply [sendsql $c "COMMIT"]
+
 # A large reply: 4,000 rows of a full CHAR(2000) is about 7.6 MB of cells,
 # more than a default 8 MB stack can hold beside anything else.  The reply
 # must arrive whole, whatever the compiler does with temporaries.

@@ -152,6 +152,26 @@ namespace eval shelltest {
         check {[regexp -line {^t  \(2 rows, 2 cols\)$} [dict get $r out]]} "tables: lists the table with its row and column counts"
     }
 
+    # A statement that fails part-way inside BEGIN dooms the transaction: the
+    # shell says so, refuses the next write, and COMMIT rolls back.
+    proc t_txn_fail {} {
+        set db [fresh_db txnfail]
+        set sql ".open $db\nCREATE TABLE t(a INTEGER)\nCREATE UNIQUE INDEX ON t (a)\nINSERT INTO t VALUES(10)\n"
+        append sql "BEGIN\nINSERT INTO t VALUES(1), (2), (1)\nINSERT INTO t VALUES(3)\nCOMMIT\n"
+        append sql "SELECT COUNT(*) FROM t\n"
+        append sql "BEGIN\nINSERT INTO t VALUES(10), (11)\nINSERT INTO t VALUES(12)\nCOMMIT\n"
+        append sql "SELECT a FROM t ORDER BY a\n.quit\n"
+        set r [run [utf8 $sql]]
+        set err [dict get $r err]
+        set out [dict get $r out]
+        check {[dict get $r status] == 0}                     "txn fail: exit status 0"
+        check {[regexp {ROLLBACK is required} $err]}          "txn fail: the next write is refused, with the remedy"
+        check {[regexp {not committed.*rolled back} $err]}    "txn fail: COMMIT reports the rollback"
+        check {[regexp -line {^1 *$} $out]}                   "txn fail: no row of the failed statement was kept"
+        check {[regexp {committed} $out]}                     "txn fail: a failure before the first write leaves the transaction usable"
+        check {[regexp {10\s+12\s} $out] && ![regexp -line {^(2|3|11) *$} $out]} "txn fail: final rows are 10 and 12"
+    }
+
     proc t_utf8_bom {} {
         variable BOM_UTF8
         set db [fresh_db utf8bom]
@@ -323,6 +343,7 @@ namespace eval shelltest {
 
         try {
             t_tables
+            t_txn_fail
             t_utf8_bom
             t_utf8_bom_alone
             t_wide
