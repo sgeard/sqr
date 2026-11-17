@@ -406,24 +406,74 @@ contains
 
     ! Why a NEW table may not be called `name`, or '' if it may.  A table's
     ! name becomes file names, so new names are held to a plain set: ASCII
-    ! letters and digits, space and _ - ! + . , - with no space at either end
-    ! and no dot at the end.  (A leading '_' is refused separately, as
-    ! reserved.)  Applied by db_create_table only: valid_name stays the rule
-    ! for names read back from an existing catalog.
+    ! letters and digits, space and _ - ! + . , and any non-ASCII character
+    ! written as well-formed UTF-8 (the C1 controls U+0080..U+009F apart) -
+    ! with no space at either end and no dot at the end.  (A leading '_' is
+    ! refused separately, as reserved.)  Applied by db_create_table only:
+    ! valid_name stays the rule for names read back from an existing catalog.
     pure function new_name_fault(name) result(why)
         character(len=*), intent(in)  :: name
         character(len=:), allocatable :: why
-        integer :: n
+        integer :: n, k, nb
         n = len_trim(name)
         why = ''
         if (n == 0) return                       ! valid_name has refused it
-        if (verify(name(1:n), NAME_CHARS) /= 0) then
-            why = 'only letters, digits, space and _ - ! + . , are allowed'
-        else if (name(1:1) == ' ') then
+        k = 1
+        each_char: do while (k <= n)
+            if (iachar(name(k:k)) < 128) then
+                if (index(NAME_CHARS, name(k:k)) == 0) then
+                    why = 'of ASCII, only letters, digits, space and _ - ! + . , are allowed'
+                    return
+                end if
+                nb = 1
+            else
+                nb = utf8_seq_len(name(k:n))
+                if (nb == 0) then
+                    why = 'not valid UTF-8'
+                    return
+                else if (nb == 2 .and. iachar(name(k:k)) == 194) then
+                    if (iachar(name(k+1:k+1)) < 160) then      ! U+0080..U+009F
+                        why = 'control characters are not allowed'
+                        return
+                    end if
+                end if
+            end if
+            k = k + nb
+        end do each_char
+        if (name(1:1) == ' ') then
             why = 'a name may not begin with a space'
         else if (name(n:n) == '.') then
             why = 'a name may not end with a dot'
         end if
+    end function
+
+    ! Length in bytes (2..4) of the well-formed UTF-8 sequence that begins
+    ! `s`, whose first byte is not ASCII; 0 if there is none.  Strict: no
+    ! overlong form, no surrogate, nothing above U+10FFFF.
+    pure integer function utf8_seq_len(s) result(nb)
+        character(len=*), intent(in) :: s
+        integer :: b1, lo, hi, j
+        nb = 0
+        b1 = iachar(s(1:1))
+        lo = 128; hi = 191                       ! bounds of the SECOND byte
+        select case (b1)
+        case (194:223); nb = 2
+        case (224);     nb = 3; lo = 160         ! below would be overlong
+        case (237);     nb = 3; hi = 159         ! above would be a surrogate
+        case (225:236, 238:239); nb = 3
+        case (240);     nb = 4; lo = 144         ! below would be overlong
+        case (244);     nb = 4; hi = 143         ! above is past U+10FFFF
+        case (241:243); nb = 4
+        case default;   return                   ! stray continuation, C0/C1, F5..FF
+        end select
+        if (len(s) < nb) then
+            nb = 0
+            return
+        end if
+        if (iachar(s(2:2)) < lo .or. iachar(s(2:2)) > hi) nb = 0
+        tail: do j = 3, nb
+            if (iachar(s(j:j)) < 128 .or. iachar(s(j:j)) > 191) nb = 0
+        end do tail
     end function
 
     ! ASCII lower-case copy, for comparing table names without regard to case.

@@ -615,10 +615,12 @@ module sqr
         !! `SQR_DUP` if the table already exists, `SQR_INVALID` for a bad
         !! name or column set.  A table's files are named after it, so a new
         !! name is held to a plain set: ASCII letters and digits, space and
-        !! `_ - ! + . ,`, with no space at either end, no dot at the end and no
-        !! `..`.  It may not begin with `_`, the prefix of the engine's own
+        !! `_ - ! + . ,`, and any non-ASCII character written as well-formed
+        !! UTF-8 (control characters apart), with no space at either end, no
+        !! dot at the end and no `..`.  It may not begin with `_`, the prefix of the engine's own
         !! files (`_catalog.dat`, `_journal.dat`, ...).  A name that differs
-        !! only in case from an existing table's is refused with `SQR_DUP`.
+        !! only in the case of its ASCII letters from an existing table's is
+        !! refused with `SQR_DUP`.
         !! These rules apply to creation: a table already in a database opens
         !! under whatever name it has.
         module subroutine db_create_table(db, name, cols, stat, errmsg)

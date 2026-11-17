@@ -460,14 +460,22 @@ A database is a directory containing:
 A table's files are named after it, so `db_create_table` and
 `CREATE TABLE` hold a new table's name to a plain set:
 
-- ASCII letters and digits, space and `_ - ! + . ,` only (in SQL, anything
-  beyond letters, digits and `_` needs a quoted name);
+- of ASCII, only letters, digits, space and `_ - ! + . ,`;
+- any non-ASCII character, written as well-formed UTF-8 (the control
+  characters U+0080 to U+009F apart);
 - no space at either end, no dot at the end, no `..`;
 - no leading `_`: that prefix belongs to the engine's own files;
 - not the name of an existing table in a different case (`SQR_DUP`). Lookup
   itself stays case-sensitive.
 
-The first three return `SQR_INVALID`. The rules apply to creation only: a
+The first four return `SQR_INVALID`. In SQL, a name with anything beyond
+ASCII letters, digits and `_` must be quoted: `CREATE TABLE "café" (...)`.
+
+sqr compares names as bytes and carries no Unicode tables. The case rule
+therefore folds ASCII letters only (`café` and `CAFÉ` are two tables), and
+two spellings of one accented letter - precomposed, or a letter followed by
+a combining accent - are two names. A name is at most 32 bytes, which is
+fewer than 32 characters once any of them is non-ASCII. The rules apply to creation only: a
 table already in a database opens under whatever name it has. Column names
 are not restricted in this way.
 

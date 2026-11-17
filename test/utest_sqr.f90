@@ -790,11 +790,24 @@ contains
     ! existing table in another case.  An existing table is exempt.
     subroutine test_table_name_rules()
         character(len=*), parameter :: XDIR = TEST_DIR // '_names'
-        character(len=*), parameter :: GOOD(8) = [character(len=12) :: &
-            'Plain9', 'two words', 'a-b', 'a!b', 'a+b', 'a.b', 'a,b', '.hidden']
-        character(len=*), parameter :: BAD(12) = [character(len=12) :: &
-            'a:b', 'a*b', 'a?b', 'a"b', 'a<b', 'a>b', 'a|b', 'a#b', 'caf' // char(233), &
+        ! UTF-8: e-acute (2 bytes), its capital, a CJK character (3), an emoji (4).
+        character(len=*), parameter :: E_ACUTE = char(195) // char(169)
+        character(len=*), parameter :: E_ACUTE_UC = char(195) // char(137)
+        character(len=*), parameter :: CJK = char(230) // char(151) // char(165)
+        character(len=*), parameter :: EMOJI = char(240) // char(159) // char(152) // char(128)
+        character(len=*), parameter :: GOOD(12) = [character(len=12) :: &
+            'Plain9', 'two words', 'a-b', 'a!b', 'a+b', 'a.b', 'a,b', '.hidden', &
+            'caf' // E_ACUTE, 'CAF' // E_ACUTE_UC, CJK // CJK, 'x' // EMOJI]
+        character(len=*), parameter :: BAD(11) = [character(len=12) :: &
+            'a:b', 'a*b', 'a?b', 'a"b', 'a<b', 'a>b', 'a|b', 'a#b', &
             ' lead', 'trail.', 'a..b']
+        ! Not UTF-8: a Latin-1 byte, a cut-off sequence, a stray continuation
+        ! byte, an overlong form, a surrogate, past U+10FFFF, an impossible lead.
+        character(len=*), parameter :: NOT_UTF8(8) = [character(len=12) :: &
+            'caf' // char(233), 'caf' // char(195), 'a' // char(169) // 'b', &
+            char(192) // char(128), char(224) // char(128) // char(128), &
+            char(237) // char(160) // char(128), &
+            char(244) // char(144) // char(128) // char(128), char(245) // 'abc']
         type(db_t), target :: db
         type(column_t)     :: c(1)
         character(len=:), allocatable :: buf, cat
@@ -818,6 +831,22 @@ contains
         emsg = ''
         call db_create_table(db, 'a*b', c, rs, emsg)
         call check(index(emsg, 'only letters, digits') > 0, 'names: the refusal lists what is allowed')
+        do i = 1, size(NOT_UTF8)
+            emsg = ''
+            call db_create_table(db, trim(NOT_UTF8(i)), c, rs, emsg)
+            call check(rs == SQR_INVALID .and. index(emsg, 'not valid UTF-8') > 0, &
+                       'names: ill-formed UTF-8 refused (case ' // achar(48 + i) // ')')
+        end do
+        emsg = ''
+        call db_create_table(db, 'a' // char(194) // char(133), c, rs, emsg)
+        call check(rs == SQR_INVALID .and. index(emsg, 'control characters') > 0, &
+                   'names: a C1 control character is refused')
+        call db_create_table(db, 'a' // char(194) // char(160), c, rs, emsg)
+        call check(rs == SQR_OK, 'names: the first character after the C1 controls is accepted')
+        call db_create_table(db, repeat(CJK, 11), c, rs, emsg)
+        call check(rs == SQR_INVALID, 'names: the length limit counts bytes, not characters')
+        call check(db_table_index(db, 'caf' // E_ACUTE) > 0 .and. db_table_index(db, 'CAF' // E_ACUTE_UC) > 0, &
+                   'names: the case rule folds ASCII letters only')
 
         ! Case: the same name is a duplicate as before; another case is too.
         call db_create_table(db, 'Plain9', c, rs, emsg)

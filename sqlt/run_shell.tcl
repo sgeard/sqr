@@ -190,7 +190,9 @@ namespace eval shelltest {
     proc t_table_names {} {
         set db [fresh_db names]
         set sql ".open $db\nCREATE TABLE Notes(a INTEGER)\nCREATE TABLE \"my notes, v1.2\"(a INTEGER)\n"
-        append sql "CREATE TABLE \"a:b\"(a INTEGER)\nCREATE TABLE NOTES(a INTEGER)\n.tables\n.quit\n"
+        append sql "CREATE TABLE \"a:b\"(a INTEGER)\nCREATE TABLE NOTES(a INTEGER)\n"
+        append sql "CREATE TABLE \"café\"(a INTEGER)\nINSERT INTO \"café\" VALUES(1)\nCREATE TABLE café2(a INTEGER)\n"
+        append sql ".tables\n.quit\n"
         set r [run [utf8 $sql]]
         set err [dict get $r err]
         set out [dict get $r out]
@@ -198,7 +200,9 @@ namespace eval shelltest {
         check {[regexp {invalid table name: "a:b"} $err]}                 "table names: a colon is refused, by name"
         check {[regexp {differs only in case from "Notes"} $err]}         "table names: a case variant is refused, naming the other"
         check {[regexp -line {^my notes, v1\.2  \(0 rows} $out]}           "table names: space, comma and dot are accepted in a quoted name"
-        check {[llength [regexp -all -inline -line {rows, 1 cols\)$} $out]] == 2} "table names: two tables exist"
+        check {[regexp -line {^café  \(1 rows} $out]}                      "table names: a non-ASCII name is accepted when quoted, and usable"
+        check {![regexp {café2} $out]}                                    "table names: a bare non-ASCII word is not a name in SQL"
+        check {[llength [regexp -all -inline -line {rows, 1 cols\)$} $out]] == 3} "table names: three tables exist"
     }
 
     proc t_utf8_bom {} {
