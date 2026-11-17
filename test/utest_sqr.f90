@@ -94,6 +94,7 @@ program utest_sqr
     call test_explicit_txn()
     call test_doomed_txn()
     call test_reserved_names()
+    call test_table_name_rules()
     call test_close_rolls_back_open_txn()
     call test_txn_structural_block()
     call test_locking()
@@ -780,6 +781,87 @@ contains
         call check(rs == SQR_OK, 'reserved: and is readable')
         call db_insert(db, '_notes', buf, rid, rs)
         call check(rs == SQR_OK .and. rid == 2, 'reserved: and writable')
+        call db_close(db, rs)
+        ios = c_rmtree(XDIR)
+    end subroutine
+
+    ! A new table's name: ASCII letters and digits, space and _ - ! + . , only,
+    ! no space at either end, no dot at the end, and not the name of an
+    ! existing table in another case.  An existing table is exempt.
+    subroutine test_table_name_rules()
+        character(len=*), parameter :: XDIR = TEST_DIR // '_names'
+        character(len=*), parameter :: GOOD(8) = [character(len=12) :: &
+            'Plain9', 'two words', 'a-b', 'a!b', 'a+b', 'a.b', 'a,b', '.hidden']
+        character(len=*), parameter :: BAD(12) = [character(len=12) :: &
+            'a:b', 'a*b', 'a?b', 'a"b', 'a<b', 'a>b', 'a|b', 'a#b', 'caf' // char(233), &
+            ' lead', 'trail.', 'a..b']
+        type(db_t), target :: db
+        type(column_t)     :: c(1)
+        character(len=:), allocatable :: buf, cat
+        integer        :: rs, i, ios, u, p
+        integer(int32) :: rid
+        integer(int64) :: sz
+        character(len=128) :: emsg
+        ios = c_rmtree(XDIR)
+        c(1)%name = 'a:b'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        call db_open(db, XDIR, rs, emsg)
+        do i = 1, size(GOOD)
+            call db_create_table(db, trim(GOOD(i)), c, rs, emsg)
+            call check(rs == SQR_OK, 'names: "' // trim(GOOD(i)) // '" accepted')
+        end do
+        do i = 1, size(BAD)
+            emsg = ''
+            call db_create_table(db, trim(BAD(i)), c, rs, emsg)
+            call check(rs == SQR_INVALID .and. index(emsg, 'invalid table name') > 0, &
+                       'names: "' // trim(BAD(i)) // '" refused')
+        end do
+        emsg = ''
+        call db_create_table(db, 'a*b', c, rs, emsg)
+        call check(index(emsg, 'only letters, digits') > 0, 'names: the refusal lists what is allowed')
+
+        ! Case: the same name is a duplicate as before; another case is too.
+        call db_create_table(db, 'Plain9', c, rs, emsg)
+        call check(rs == SQR_DUP, 'names: an existing name is a duplicate')
+        emsg = ''
+        call db_create_table(db, 'PLAIN9', c, rs, emsg)
+        call check(rs == SQR_DUP .and. index(emsg, 'differs only in case from "Plain9"') > 0, &
+                   'names: a name differing only in case is refused, naming the other')
+        call check(db_table_index(db, 'PLAIN9') == 0, 'names: lookup stays case-sensitive')
+        call db_drop_table(db, 'Plain9', rs)
+        call db_create_table(db, 'PLAIN9', c, rs, emsg)
+        call check(rs == SQR_OK, 'names: free again once the other is dropped')
+
+        call row_alloc(buf, db_record_size(db, 'a.b'))
+        call row_set_int(buf, db%tables(db_table_index(db, 'a.b'))%cols(1), 7_int32)
+        call db_insert(db, 'a.b', buf, rid, rs)
+        call db_close(db, rs)
+
+        ! A database from before the rules: 'a.b' becomes 'a:b' and 'a+b'
+        ! becomes 'A,B' (so that 'a,b' and 'A,B' coexist) behind the engine's
+        ! back.  Both must open and work.
+        ios = c_rename(XDIR // '/a.b.dat',    XDIR // '/a:b.dat')
+        ios = c_rename(XDIR // '/a.b.schema', XDIR // '/a:b.schema')
+        ios = c_rename(XDIR // '/a+b.dat',    XDIR // '/A,B.dat')
+        ios = c_rename(XDIR // '/a+b.schema', XDIR // '/A,B.schema')
+        inquire(file=XDIR // '/_catalog.dat', size=sz)
+        allocate(character(len=int(sz)) :: cat)
+        open(newunit=u, file=XDIR // '/_catalog.dat', access='stream', form='unformatted', &
+             status='old', action='readwrite')
+        read(u) cat
+        p = index(cat, 'a.b')
+        if (p > 0) write(u, pos=p) 'a:b'
+        i = index(cat, 'a+b')
+        if (i > 0) write(u, pos=i) 'A,B'
+        close(u)
+        call check(p > 0 .and. i > 0, 'names: catalog entries found')
+        call db_open(db, XDIR, rs, emsg)
+        call check(rs == SQR_OK, 'names: a database with older names still opens')
+        call db_get(db, 'a:b', 1_int32, buf, rs)
+        call check(rs == SQR_OK, 'names: a table with a now-refused character is readable')
+        call db_insert(db, 'a:b', buf, rid, rs)
+        call check(rs == SQR_OK, 'names: and writable')
+        call check(db_table_index(db, 'a,b') > 0 .and. db_table_index(db, 'A,B') > 0, &
+                   'names: two existing tables differing in case both open')
         call db_close(db, rs)
         ios = c_rmtree(XDIR)
     end subroutine

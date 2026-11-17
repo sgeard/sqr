@@ -541,8 +541,9 @@ contains
         character(len=*), intent(inout), optional :: errmsg
         type(table_t), allocatable :: new_tables(:)
         type(table_t) :: tbl
-        integer :: rs
+        integer :: rs, other
         character(len=SQR_ERRMSG_LEN) :: em
+        character(len=:), allocatable :: fault
 
         call clear_last_err(db)
         if (readonly_block(db, stat, errmsg)) return
@@ -559,6 +560,12 @@ contains
         ! with '_'.  The prefix is therefore the engine's: a table called
         ! _journal would BE the journal.  Checked on creation only - a table
         ! of an existing database is still opened under whatever name it has.
+        fault = new_name_fault(name)
+        if (len(fault) > 0) then
+            call raise_db(db, SQR_INVALID, stat, errmsg, &
+                       'invalid table name: "' // trim(name) // '" (' // fault // ')')
+            return
+        end if
         if (reserved_name(name)) then
             call raise_db(db, SQR_INVALID, stat, errmsg, &
                        'reserved table name: "' // trim(name) // &
@@ -579,6 +586,15 @@ contains
         if (db_table_index(db, name) > 0) then
             call raise_db(db, SQR_DUP, stat, errmsg, &
                        'table already exists: ' // trim(name))
+            return
+        end if
+        ! Two tables whose names differ only in case would be one file on a
+        ! file system that ignores case, and are a trap for readers anywhere.
+        other = table_index_nocase(db, name)
+        if (other > 0) then
+            call raise_db(db, SQR_DUP, stat, errmsg, &
+                       'table name "' // trim(name) // '" differs only in case from "' // &
+                       trim(db%tables(other)%name) // '"')
             return
         end if
 

@@ -185,6 +185,22 @@ namespace eval shelltest {
         check {[regexp -line {^t  \(1 rows, 1 cols\)$} [dict get $r out]]}   "reserved name: with its one table intact"
     }
 
+    # A new table's name is held to a plain character set, and may not differ
+    # only in case from an existing table's.
+    proc t_table_names {} {
+        set db [fresh_db names]
+        set sql ".open $db\nCREATE TABLE Notes(a INTEGER)\nCREATE TABLE \"my notes, v1.2\"(a INTEGER)\n"
+        append sql "CREATE TABLE \"a:b\"(a INTEGER)\nCREATE TABLE NOTES(a INTEGER)\n.tables\n.quit\n"
+        set r [run [utf8 $sql]]
+        set err [dict get $r err]
+        set out [dict get $r out]
+        check {[dict get $r status] == 0}                                 "table names: exit status 0"
+        check {[regexp {invalid table name: "a:b"} $err]}                 "table names: a colon is refused, by name"
+        check {[regexp {differs only in case from "Notes"} $err]}         "table names: a case variant is refused, naming the other"
+        check {[regexp -line {^my notes, v1\.2  \(0 rows} $out]}           "table names: space, comma and dot are accepted in a quoted name"
+        check {[llength [regexp -all -inline -line {rows, 1 cols\)$} $out]] == 2} "table names: two tables exist"
+    }
+
     proc t_utf8_bom {} {
         variable BOM_UTF8
         set db [fresh_db utf8bom]
@@ -358,6 +374,7 @@ namespace eval shelltest {
             t_tables
             t_txn_fail
             t_reserved_name
+            t_table_names
             t_utf8_bom
             t_utf8_bom_alone
             t_wide

@@ -77,6 +77,9 @@ submodule (sqr) sqr_base
     integer, parameter :: SCHEMA_VERSION_UNFLAGGED = 1
     character(len=*), parameter :: CATALOG_FILE  = '_catalog.dat'
     character(len=*), parameter :: LOCK_FILE     = '_lock'
+    ! Characters a new table's name may contain (see new_name_fault).
+    character(len=*), parameter :: NAME_CHARS = &
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 _-!+.,'
     ! Sticky text for a write refused inside a doomed transaction (see ac_begin).
     character(len=*), parameter :: DOOMED_MSG = &
         'refused: a write in this transaction failed part-way; roll it back'
@@ -399,6 +402,55 @@ contains
         logical :: reserved
         reserved = .false.
         if (len(name) > 0) reserved = name(1:1) == '_'
+    end function
+
+    ! Why a NEW table may not be called `name`, or '' if it may.  A table's
+    ! name becomes file names, so new names are held to a plain set: ASCII
+    ! letters and digits, space and _ - ! + . , - with no space at either end
+    ! and no dot at the end.  (A leading '_' is refused separately, as
+    ! reserved.)  Applied by db_create_table only: valid_name stays the rule
+    ! for names read back from an existing catalog.
+    pure function new_name_fault(name) result(why)
+        character(len=*), intent(in)  :: name
+        character(len=:), allocatable :: why
+        integer :: n
+        n = len_trim(name)
+        why = ''
+        if (n == 0) return                       ! valid_name has refused it
+        if (verify(name(1:n), NAME_CHARS) /= 0) then
+            why = 'only letters, digits, space and _ - ! + . , are allowed'
+        else if (name(1:1) == ' ') then
+            why = 'a name may not begin with a space'
+        else if (name(n:n) == '.') then
+            why = 'a name may not end with a dot'
+        end if
+    end function
+
+    ! ASCII lower-case copy, for comparing table names without regard to case.
+    pure function lower_ascii(s) result(r)
+        character(len=*), intent(in) :: s
+        character(len=len(s)) :: r
+        integer :: k, c
+        do k = 1, len(s)
+            c = iachar(s(k:k))
+            if (c >= iachar('A') .and. c <= iachar('Z')) c = c + (iachar('a') - iachar('A'))
+            r(k:k) = achar(c)
+        end do
+    end function
+
+    ! Position of a table whose name equals `name` when case is ignored, or 0.
+    pure function table_index_nocase(db, name) result(idx)
+        type(db_t),       intent(in) :: db
+        character(len=*), intent(in) :: name
+        integer :: idx
+        character(len=:), allocatable :: want
+        idx = 0
+        if (.not. allocated(db%tables)) return
+        want = lower_ascii(trim(name))
+        do idx = 1, size(db%tables)
+            if (lower_ascii(trim(db%tables(idx)%name)) == want) return
+        end do
+        idx = 0
     end function
 
     ! Accept non-empty names up to SQR_NAME_LEN bytes, with no path separators,
