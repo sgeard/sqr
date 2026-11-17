@@ -172,6 +172,19 @@ namespace eval shelltest {
         check {[regexp {10\s+12\s} $out] && ![regexp -line {^(2|3|11) *$} $out]} "txn fail: final rows are 10 and 12"
     }
 
+    # A table name beginning with '_' is the engine's: CREATE TABLE _journal
+    # is refused, and the database is still there on the next start.
+    proc t_reserved_name {} {
+        set db [fresh_db reserved]
+        set r [run [utf8 ".open $db\nCREATE TABLE t(a INTEGER)\nINSERT INTO t VALUES(1)\nCREATE TABLE _journal(a INTEGER)\nCREATE TABLE _catalog(a INTEGER)\n.quit\n"]]
+        check {[dict get $r status] == 0}                                   "reserved name: exit status 0"
+        check {[regexp {reserved table name: "_journal"} [dict get $r err]]} "reserved name: _journal refused, by name"
+        check {[regexp {reserved table name: "_catalog"} [dict get $r err]]} "reserved name: _catalog refused, by name"
+        set r [run [utf8 ".open $db\nSELECT a FROM t\n.tables\n.quit\n"]]
+        check {![regexp {error|cannot open} [dict get $r err]]}             "reserved name: the database opens on the next start"
+        check {[regexp -line {^t  \(1 rows, 1 cols\)$} [dict get $r out]]}   "reserved name: with its one table intact"
+    }
+
     proc t_utf8_bom {} {
         variable BOM_UTF8
         set db [fresh_db utf8bom]
@@ -344,6 +357,7 @@ namespace eval shelltest {
         try {
             t_tables
             t_txn_fail
+            t_reserved_name
             t_utf8_bom
             t_utf8_bom_alone
             t_wide

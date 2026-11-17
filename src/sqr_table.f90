@@ -554,6 +554,17 @@ contains
                        'invalid table name: "' // trim(name) // '"')
             return
         end if
+        ! A table's files are named after it, and the engine's own files in the
+        ! same directory (_catalog.dat, _journal.dat, _lock, ...) all begin
+        ! with '_'.  The prefix is therefore the engine's: a table called
+        ! _journal would BE the journal.  Checked on creation only - a table
+        ! of an existing database is still opened under whatever name it has.
+        if (reserved_name(name)) then
+            call raise_db(db, SQR_INVALID, stat, errmsg, &
+                       'reserved table name: "' // trim(name) // &
+                       '" (names beginning with "_" belong to the engine)')
+            return
+        end if
 
         ! validate_columns writes its own detailed message; thread it through
         ! a local so the detail reaches the sticky state even when the caller

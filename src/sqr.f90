@@ -613,7 +613,10 @@ module sqr
 
         !! Create a new table from a column-definition array.  Fails with
         !! `SQR_DUP` if the table already exists, `SQR_INVALID` for a bad
-        !! name or column set.
+        !! name or column set.  A name may not contain a path separator, `..`
+        !! or a control character, and may not begin with `_`: a table's files
+        !! are named after it and that prefix is the engine's own
+        !! (`_catalog.dat`, `_journal.dat`, ...).
         module subroutine db_create_table(db, name, cols, stat, errmsg)
             class(db_t),       intent(inout)           :: db  !! Database handle
             character(len=*), intent(in)              :: name  !! New table name

@@ -457,6 +457,12 @@ A database is a directory containing:
 | `_journal.dat`        | rollback (undo) journal; present only while a txn is open or pending recovery |
 | `_lock`               | zero-byte sentinel carrying the advisory open lock  |
 
+A table's files are named after it, and the engine's own files all begin
+with an underscore, so that prefix is reserved: `db_create_table` and
+`CREATE TABLE` refuse a table name beginning with `_` (`SQR_INVALID`). A
+table name also may not contain a path separator, `..` or a control
+character. Column names are not restricted in this way.
+
 Each record is: 1 status byte (`ROW_ALIVE` / `ROW_TOMBSTONE`), then a
 `(ncols+7)/8`-byte NULL bitmap, then column data at fixed offsets.
 

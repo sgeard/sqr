@@ -93,6 +93,7 @@ program utest_sqr
     call test_txn_insert_many_rollback()
     call test_explicit_txn()
     call test_doomed_txn()
+    call test_reserved_names()
     call test_close_rolls_back_open_txn()
     call test_txn_structural_block()
     call test_locking()
@@ -714,6 +715,72 @@ contains
         call db_undo(db, rs, lbl)
         call check(rs == SQR_NO_UNDO, 'doomed: nothing to undo')
         call db_close(db)
+        ios = c_rmtree(XDIR)
+    end subroutine
+
+    ! Review finding D1: a table may not take a name in the engine's namespace
+    ! (a leading '_'), since its files would be the engine's own.  The rule is
+    ! applied on creation only: an existing table with such a name still opens.
+    subroutine test_reserved_names()
+        character(len=*), parameter :: XDIR = TEST_DIR // '_reserved'
+        character(len=*), parameter :: BAD(4) = [character(len=8) :: '_journal', '_catalog', '_lock', '_x']
+        character(len=*), parameter :: EXT(2) = [character(len=7) :: '.dat', '.schema']
+        type(db_t), target :: db
+        type(column_t)     :: c(1)
+        character(len=:), allocatable :: buf, cat
+        character(len=SQR_NAME_LEN), allocatable :: names(:)
+        integer        :: rs, i, ios, u, p
+        integer(int32) :: rid
+        integer(int64) :: sz
+        character(len=128) :: emsg
+        ios = c_rmtree(XDIR)
+        c(1)%name = '_id'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        call db_open(db, XDIR, rs, emsg)
+        do i = 1, size(BAD)
+            call db_create_table(db, trim(BAD(i)), c, rs, emsg)
+            call check(rs == SQR_INVALID, 'reserved: "' // trim(BAD(i)) // '" refused')
+            call check(.not. c_path_exists(XDIR // '/' // trim(BAD(i)) // '.schema'), &
+                       'reserved: "' // trim(BAD(i)) // '" left no file')
+        end do
+        ! An underscore elsewhere, and in a column name, is ordinary.
+        call db_create_table(db, 'notes_', c, rs, emsg)
+        call check(rs == SQR_OK, 'reserved: a trailing underscore is allowed')
+        call db_create_table(db, 'xnotes', c, rs, emsg)
+        call check(rs == SQR_OK, 'reserved: a column may begin with an underscore')
+        call row_alloc(buf, db_record_size(db, 'xnotes'))
+        call row_set_int(buf, db%tables(db_table_index(db, 'xnotes'))%cols(1), 7_int32)
+        call db_insert(db, 'xnotes', buf, rid, rs)
+        call db_close(db, rs)
+        call check(rs == SQR_OK, 'reserved: database closes cleanly after the refusals')
+        call db_open(db, XDIR, rs, emsg)
+        call check(rs == SQR_OK, 'reserved: and reopens')
+        call db_verify(db, 'xnotes', rs, emsg)
+        call check(rs == SQR_OK, 'reserved: and verifies')
+        call db_close(db, rs)
+
+        ! A database made before the rule: rename xnotes to _notes behind the
+        ! engine's back (same length, so the catalog entry is patched in place).
+        do i = 1, size(EXT)
+            ios = c_rename(XDIR // '/xnotes' // trim(EXT(i)), XDIR // '/_notes' // trim(EXT(i)))
+        end do
+        inquire(file=XDIR // '/_catalog.dat', size=sz)
+        allocate(character(len=int(sz)) :: cat)
+        open(newunit=u, file=XDIR // '/_catalog.dat', access='stream', form='unformatted', &
+             status='old', action='readwrite')
+        read(u) cat
+        p = index(cat, 'xnotes')
+        call check(p > 0, 'reserved: catalog entry found')
+        if (p > 0) write(u, pos=p) '_notes'
+        close(u)
+        call db_open(db, XDIR, rs, emsg)
+        call check(rs == SQR_OK, 'reserved: an existing "_notes" table still opens')
+        call db_list_tables(db, names)
+        call check(any(names == '_notes'), 'reserved: and is listed')
+        call db_get(db, '_notes', 1_int32, buf, rs)
+        call check(rs == SQR_OK, 'reserved: and is readable')
+        call db_insert(db, '_notes', buf, rid, rs)
+        call check(rs == SQR_OK .and. rid == 2, 'reserved: and writable')
+        call db_close(db, rs)
         ios = c_rmtree(XDIR)
     end subroutine
 
@@ -5133,6 +5200,10 @@ contains
         emsg = ''
         call db_create_table(db, 'bad/name', c, rs, emsg)
         call check(index(emsg, 'invalid table name') > 0, 'errmsg: invalid name quoted')
+        emsg = ''
+        call db_create_table(db, '_journal', c, rs, emsg)
+        call check(rs == SQR_INVALID .and. index(emsg, 'reserved table name: "_journal"') > 0, &
+                   'errmsg: reserved name refused and quoted')
         call db_create_table(db, 't', c, rs, emsg)
         emsg = ''
         call db_create_table(db, 't', c, rs, emsg)

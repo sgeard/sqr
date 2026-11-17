@@ -392,6 +392,15 @@ contains
         end do comp_scan
     end function
 
+    ! True for a name in the engine's own namespace: one beginning with '_',
+    ! as every file the engine keeps beside the tables' does.
+    pure function reserved_name(name) result(reserved)
+        character(len=*), intent(in) :: name
+        logical :: reserved
+        reserved = .false.
+        if (len(name) > 0) reserved = name(1:1) == '_'
+    end function
+
     ! Accept non-empty names up to SQR_NAME_LEN bytes, with no path separators,
     ! no parent-directory traversal, and no control characters. Used as a guard
     ! before any name is concatenated into a filesystem path.
