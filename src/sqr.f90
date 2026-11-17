@@ -74,7 +74,7 @@ module sqr
     integer, parameter, public :: SQR_READONLY  = 6  !! Write attempted on a read-only open
     integer, parameter, public :: SQR_LOCKED    = 7  !! Database held by another connection
     integer, parameter, public :: SQR_NO_UNDO   = 8  !! Nothing on the undo (or redo) history to apply
-    integer, parameter, public :: SQR_FULL      = 9  !! Row-id space exhausted (`int32` ids: ~2.1e9 rows per table)
+    integer, parameter, public :: SQR_FULL      = 9  !! Row-id space exhausted (`int32` ids: ~2.1e9 rows per table), or a database too large for `db_pack`
 
     ! --- Release ---
     !! Release of the library and its programs, as `sqlsh --version` prints
@@ -676,7 +676,10 @@ module sqr
         !! the advisory `_lock` and the transient `_journal.dat`, and writes the
         !! container atomically (temp + rename + fsync).  Overwrites `file`.
         !! Fails with `SQR_NOT_FOUND` (no such database), `SQR_READONLY` (needs
-        !! recovery — reopen read-write first), `SQR_LOCKED`, or `SQR_ERR` (I/O).
+        !! recovery — reopen read-write first), `SQR_LOCKED`, `SQR_ERR` (I/O),
+        !! or `SQR_FULL`: the pack holds the database in memory, so a file
+        !! larger than 2 GiB, or a total larger than that, is refused and
+        !! nothing is written.
         module subroutine db_pack(dir, file, stat, errmsg)
             character(len=*), intent(in)            :: dir   !! Database directory to pack
             character(len=*), intent(in)            :: file  !! Container file to write
@@ -693,7 +696,8 @@ module sqr
         !! between, so the archive is a snapshot of a database that stayed open
         !! throughout.  Refused (`SQR_INVALID`) on a closed handle or while a
         !! transaction is live — an in-flight transaction's base images are in
-        !! the journal, so the directory is not a committed state.
+        !! the journal, so the directory is not a committed state.  The size
+        !! limit of `db_pack` applies (`SQR_FULL`).
         module subroutine db_pack_live(db, file, stat, errmsg)
             class(db_t),      intent(inout)           :: db    !! Open database handle
             character(len=*), intent(in)              :: file  !! Container file to write

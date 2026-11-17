@@ -88,7 +88,9 @@ Clients match permissively — any spelling that lands on the same directory is
 accepted, against either key.
 
 `PACK` writes a `.sqr` container — the same format `db_pack`/`db_unpack`
-already use — **without closing the database**. See "Backup" below.
+already use — **without closing the database**. See "Backup" below. A
+database too large to pack (a file, or the total, over 2 GiB) is refused with
+`ERR` carrying `SQR_FULL` (9) and the reason; nothing is written.
 
 `TABLES` and `COLUMNS` exist so the ODBC driver's `SQLTables`, `SQLColumns`
 and `SQLPrimaryKeys` are answered from `sqr_admin` — no catalogue SQL, no

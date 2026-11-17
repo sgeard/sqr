@@ -1593,7 +1593,7 @@ contains
         case (SQR_READONLY);  s = 'write attempted on a read-only open'
         case (SQR_LOCKED);    s = 'database held by another connection'
         case (SQR_NO_UNDO);   s = 'nothing on the undo/redo history to apply'
-        case (SQR_FULL);      s = 'row-id space exhausted'
+        case (SQR_FULL);      s = 'row-id space exhausted, or too large to pack'
         case default;         s = 'unknown status code'
         end select
     end function

@@ -538,6 +538,10 @@ All three take the optional `stat` and `errmsg` arguments.
   journal are not archived. The container is written to a temporary file,
   synced and renamed into place, so an existing `file` is replaced whole or
   not at all.
+- **Size limit: 2 GiB.** The pack holds the database in memory, so a
+  database with a file larger than 2 GiB, or more than 2 GiB in total, is
+  refused with `SQR_FULL` and nothing is written. Copy the directory instead
+  (with no writer attached).
 - **Unpack never overwrites.** An existing `dir` is `SQR_DUP`. The checksum
   is verified before anything is written, every archived name is checked
   against path traversal, and the files are extracted into a temporary

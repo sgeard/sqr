@@ -195,6 +195,7 @@ contains
         type(action_result_t) :: rv
         class(dlist_node_data_t), allocatable :: n
         character(len=:), allocatable :: dir, file
+        character(len=SQR_ERRMSG_LEN) :: emsg
         integer :: rs
         if (args%size() /= 2) then
             write(*,'(a)') 'usage: pack <dir> <file>'
@@ -202,9 +203,10 @@ contains
         end if
         n = args%get(1); dir  = node_as_char(n)
         n = args%get(2); file = node_as_char(n)
-        call db_pack(dir, file, rs)
+        emsg = ''
+        call db_pack(dir, file, rs, emsg)
         if (rs /= SQR_OK) then
-            write(*,'(3a,i0)') 'pack of "', dir, '" failed: ', rs
+            write(*,'(4a)') 'pack of "', dir, '" failed: ', trim(emsg)
             rv%errored = .true.
             return
         end if

@@ -55,6 +55,7 @@ program utest_sqr
     call test_schema_next_id()
     call test_corrupt_index()
     call test_pack()
+    call test_pack_too_large()
     call test_quiesce()
     call test_natural_keys()
     call test_null_columns()
@@ -3093,6 +3094,69 @@ contains
     ! it back. Round-trip (open + verify + query match), plus the guards:
     ! overwrite refusal, truncated-container rejection, hot-journal refusal, and
     ! path-traversal rejection of a crafted archive name.
+    ! Review finding A1: the pack holds each file, and the whole payload, in
+    ! one string, so sizes beyond a default integer are refused, not wrapped.
+    ! The big files are sparse (one byte written far out), so this is quick.
+    subroutine test_pack_too_large()
+        character(len=*), parameter :: PDIR  = 'utest_sqr_packbig_db'
+        character(len=*), parameter :: PFILE = 'utest_sqr_packbig.sqr'
+        integer(int64),   parameter :: GIB = 1073741824_int64
+        type(db_t) :: db
+        type(column_t) :: c(1)
+        character(len=128) :: emsg
+        integer :: rs, ios
+        ios = c_rmtree(PDIR)
+        ios = c_remove(PFILE)
+        ! TEXT tables: it is the blob files that are grown, because db_open
+        ! reads the whole of a data file that has grown, to recount its rows.
+        c(1)%name = 'v'; c(1)%dtype = DT_TEXT; c(1)%csize = SQR_TEXT_DESC
+        call db_open(db, PDIR, rs)
+        call db_create_table(db, 'big', c, rs)
+        call db_create_table(db, 'other', c, rs)
+        call db_close(db, rs)
+
+        ! Each file under the limit, the two together over it.
+        call stretch(PDIR // '/big.blob',   GIB + GIB / 2)
+        call stretch(PDIR // '/other.blob', GIB + GIB / 2)
+        emsg = ''
+        call db_pack(PDIR, PFILE, rs, emsg)
+        call check(rs == SQR_FULL .and. index(emsg, 'larger than 2 GiB in total') > 0, &
+                   'pack big: a total over 2 GiB is refused, and says so')
+        call check(.not. c_path_exists(PFILE) .and. .not. c_path_exists(PFILE // '.tmp'), &
+                   'pack big: nothing was written')
+
+        ! The open-handle pack shares the path, and the handle survives it.
+        call db_open(db, PDIR, rs)
+        call check(rs == SQR_OK, 'pack big: fixture handle open over the large files')
+        emsg = ''
+        call db_pack_live(db, PFILE, rs, emsg)
+        call check(rs == SQR_FULL .and. index(emsg, 'larger than 2 GiB in total') > 0, &
+                   'pack big: db_pack_live refuses the same way')
+        call check(db_row_count(db, 'other') == 0 .and. .not. c_path_exists(PFILE), &
+                   'pack big: the handle is still usable and nothing was written')
+        call db_close(db, rs)
+
+        ! One file of 5 GiB: the size that used to pack "successfully", cut to 1 GiB.
+        call stretch(PDIR // '/big.blob', 5 * GIB)
+        emsg = ''
+        call db_pack(PDIR, PFILE, rs, emsg)
+        call check(rs == SQR_FULL .and. index(emsg, '"big.blob" is larger than 2 GiB') > 0, &
+                   'pack big: a file over 2 GiB is refused, by name')
+        call check(.not. c_path_exists(PFILE), 'pack big: no container for the oversized file')
+        ios = c_rmtree(PDIR)
+    end subroutine
+
+    ! Grow `path` to `nbytes` by writing its last byte only (a sparse file).
+    subroutine stretch(path, nbytes)
+        character(len=*), intent(in) :: path
+        integer(int64),   intent(in) :: nbytes
+        integer :: u
+        open(newunit=u, file=path, access='stream', form='unformatted', &
+             status='old', action='readwrite')
+        write(u, pos=nbytes) char(0)
+        close(u)
+    end subroutine
+
     subroutine test_pack()
         character(len=*), parameter :: PDIR  = 'utest_sqr_pack_db'
         character(len=*), parameter :: PDIR2 = 'utest_sqr_pack_db2'

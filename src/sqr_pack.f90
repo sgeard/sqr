@@ -33,19 +33,44 @@ contains
 
     ! No handle is exposed here (the snapshot db_t is local), so there is no
     ! sticky state to record: route the code and its canonical text only.
-    subroutine pk_report(rs, stat, errmsg)
+    subroutine pk_report(rs, stat, errmsg, why)
         integer,          intent(in)              :: rs
         integer,          intent(out),   optional :: stat
         character(len=*), intent(inout), optional :: errmsg
+        character(len=*), intent(in),    optional :: why     ! detail, if any
         if (present(stat)) stat = rs
-        if (rs /= SQR_OK .and. present(errmsg)) errmsg = sqr_errstr(rs)
+        if (rs == SQR_OK .or. .not. present(errmsg)) return
+        errmsg = sqr_errstr(rs)
+        if (present(why)) then
+            if (len(why) > 0) errmsg = 'cannot pack: ' // why
+        end if
     end subroutine
+
+    ! Why files of these sizes cannot go into one container, or '' if they
+    ! can.  The pack holds each file, and then the whole payload, in one
+    ! character string, whose length is a default integer: a size beyond it
+    ! would wrap, and the pack would silently drop the rest of the file.
+    pure function pack_size_fault(names, sizes) result(why)
+        type(pfile_t),  intent(in) :: names(:)
+        integer(int64), intent(in) :: sizes(:)
+        character(len=:), allocatable :: why
+        integer(int64), parameter :: CAP = int(huge(0), int64)
+        integer :: k
+        why = ''
+        k = findloc(sizes > CAP, .true., dim=1)
+        if (k > 0) then
+            why = '"' // names(k)%name // '" is larger than 2 GiB'
+        else if (sum(sizes) > CAP) then        ! each is <= CAP here: no overflow
+            why = 'the database is larger than 2 GiB in total'
+        end if
+    end function
 
     module subroutine db_pack(dir, file, stat, errmsg)
         character(len=*), intent(in)            :: dir, file
         integer,          intent(out), optional :: stat
         character(len=*), intent(inout), optional :: errmsg
         type(db_t) :: sdb                     ! only %dir / %lock_tok are used
+        character(len=:), allocatable :: why
         integer    :: rs, lerr
 
         sdb%dir = trim(dir)
@@ -64,9 +89,9 @@ contains
             call pk_report(SQR_ERR, stat, errmsg)
             return
         end if
-        call pack_snapshot(sdb, file, rs)
+        call pack_snapshot(sdb, file, rs, why)
         call c_lock_release(sdb%lock_tok)       ! snapshot read; drop the shared lock
-        call pk_report(rs, stat, errmsg)
+        call pk_report(rs, stat, errmsg, why)
     end subroutine
 
     module subroutine db_pack_live(db, file, stat, errmsg)
@@ -75,7 +100,7 @@ contains
         integer,          intent(out),   optional :: stat
         character(len=*), intent(inout), optional :: errmsg
         type(db_t) :: sdb                     ! snapshot view: only %dir is used
-        character(len=:), allocatable :: detail
+        character(len=:), allocatable :: detail, why
         integer    :: rs, qs
         call clear_last_err(db)
         if (.not. db%opened) then
@@ -100,7 +125,7 @@ contains
             return
         end if
         sdb%dir = db%dir
-        call pack_snapshot(sdb, file, rs)
+        call pack_snapshot(sdb, file, rs, why)
         call db_resume(db, qs)
         ! A failed resume leaves the handle wedged (units = -1) and outranks a
         ! pack error: the archive may be perfectly good, but the caller must
@@ -113,7 +138,8 @@ contains
             return
         end if
         if (rs /= SQR_OK) then
-            call raise_db(db, rs, stat, errmsg, 'pack failed: ' // sqr_errstr(rs))
+            if (len(why) == 0) why = sqr_errstr(rs)
+            call raise_db(db, rs, stat, errmsg, 'pack failed: ' // why)
             return
         end if
         call report(db, SQR_OK, stat, errmsg)
@@ -123,19 +149,21 @@ contains
     ! one container at `file`.  The caller guarantees exclusion — either by
     ! holding the shared snapshot lock (offline `db_pack`) or by owning the
     ! exclusive lock of an open, quiesced handle (`db_pack_live`).
-    subroutine pack_snapshot(sdb, file, stat)
+    subroutine pack_snapshot(sdb, file, stat, why)
         type(db_t),       intent(inout) :: sdb
         character(len=*), intent(in)    :: file
         integer,          intent(out)   :: stat
+        character(len=:), allocatable, intent(out) :: why   ! detail of a refusal, else ''
         type(table_t), allocatable :: tbls(:)
         type(pfile_t), allocatable :: pf(:)
         character(len=SQR_NAME_LEN), allocatable :: names(:)
         character(len=:), allocatable :: payload
-        integer(int64), allocatable   :: offs(:)
+        integer(int64), allocatable   :: offs(:), sizes(:)
         integer(int64) :: total
         integer :: n, nf, i, j, k, rs, cks
 
         rs = SQR_OK
+        why = ''
         pack_body: block
             if (jrnl_hot(sdb)) then
                 rs = SQR_READONLY               ! needs recovery: reopen read-write first
@@ -174,6 +202,18 @@ contains
                     k = k + 1; pf(k)%name = index_relpath(trim(names(i)), j)
                 end do
             end do list_tables
+
+            ! Measure before reading anything: a file, or a total, beyond what
+            ! one string can hold is refused here rather than cut short below.
+            allocate(sizes(nf))
+            measure: do k = 1, nf
+                sizes(k) = max(0_int64, c_file_size(pathjoin(sdb%dir, pf(k)%name)))
+            end do measure
+            why = pack_size_fault(pf, sizes)
+            if (len(why) > 0) then
+                rs = SQR_FULL
+                exit pack_body
+            end if
 
             ! Read every file's bytes, sizing the payload from the running
             ! total, then assemble it in one allocation (no O(n^2) concat)
@@ -396,6 +436,11 @@ contains
             return
         end if
         inquire(unit=u, size=sz)
+        if (sz > int(huge(0), int64)) then       ! would wrap; pack_snapshot refuses earlier
+            close(u)
+            stat = SQR_FULL
+            return
+        end if
         allocate(character(len=int(sz)) :: bytes, stat=ios)
         if (ios /= 0) then
             close(u)

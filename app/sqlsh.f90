@@ -320,15 +320,17 @@ contains
     subroutine meta_pack(args)
         character(len=*), intent(in) :: args
         character(len=:), allocatable :: dir, file
+        character(len=SQR_ERRMSG_LEN) :: emsg
         integer :: rs
         call two_args(args, dir, file)
         if (len_trim(file) == 0) then
             write(error_unit,'(a)') 'usage: .pack <dir> <file>'
             return
         end if
-        call db_pack(dir, file, rs)
+        emsg = ''
+        call db_pack(dir, file, rs, emsg)
         if (rs /= SQR_OK) then
-            write(error_unit,'(3a,i0)') 'pack of "', trim(dir), '" failed: ', rs
+            write(error_unit,'(4a)') 'pack of "', trim(dir), '" failed: ', trim(emsg)
         else if (interactive) then
             write(error_unit,'(4a)') 'packed ', trim(dir), ' -> ', trim(file)
         end if

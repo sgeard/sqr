@@ -220,6 +220,23 @@ namespace eval shelltest {
         check {[regexp {verify: OK} $out]}             "readonly counters: verify is clean"
     }
 
+    # Review finding A1: a database too large to pack is refused with a
+    # message, not packed short.  The 5 GiB data file is sparse.
+    proc t_pack_too_large {} {
+        variable work
+        set db [fresh_db packbig]
+        set out [file join $work packbig.sqr]
+        run [utf8 ".open $db\nCREATE TABLE t(a INTEGER)\n.quit\n"]
+        set fh [open [file join $db t.dat] r+b]
+        seek $fh [expr {5 * 1024 * 1024 * 1024 - 1}]
+        puts -nonewline $fh \0
+        close $fh
+        set r [run [utf8 ".pack $db $out\n.quit\n"]]
+        check {[regexp {failed: cannot pack: "t\.dat" is larger than 2 GiB} [dict get $r err]]} \
+            "pack too large: refused, naming the file"
+        check {![file exists $out]} "pack too large: no container written"
+    }
+
     proc t_utf8_bom {} {
         variable BOM_UTF8
         set db [fresh_db utf8bom]
@@ -395,6 +412,7 @@ namespace eval shelltest {
             t_reserved_name
             t_table_names
             t_readonly_counters
+            t_pack_too_large
             t_utf8_bom
             t_utf8_bom_alone
             t_wide
