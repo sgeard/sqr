@@ -205,6 +205,21 @@ namespace eval shelltest {
         check {[llength [regexp -all -inline -line {rows, 1 cols\)$} $out]] == 3} "table names: three tables exist"
     }
 
+    # Review finding E2: `readonly` in sqrsh, then `close`, must not lose the
+    # row counters.  sqlsh builds the table; sqrsh deletes, demotes and closes.
+    proc t_readonly_counters {} {
+        variable sqrsh
+        set db [fresh_db rocount]
+        run [utf8 ".open $db\nCREATE TABLE t(a INTEGER)\nINSERT INTO t VALUES(1)\nINSERT INTO t VALUES(2)\nINSERT INTO t VALUES(3)\n.quit\n"]
+        set cmds "open $db\nuse t\ndelete 2\nback\nreadonly\nclose\nopen $db\ntables\nuse t\nverify\nquit\n"
+        set r [run [utf8 $cmds] $sqrsh]
+        set out [dict get $r out]
+        check {[dict get $r status] == 0}              "readonly counters: exit status 0"
+        check {[regexp {now read-only} $out]}          "readonly counters: the handle was demoted"
+        check {[regexp {\(2 rows, 1 cols\)} $out]}     "readonly counters: the delete is counted after reopen"
+        check {[regexp {verify: OK} $out]}             "readonly counters: verify is clean"
+    }
+
     proc t_utf8_bom {} {
         variable BOM_UTF8
         set db [fresh_db utf8bom]
@@ -379,6 +394,7 @@ namespace eval shelltest {
             t_txn_fail
             t_reserved_name
             t_table_names
+            t_readonly_counters
             t_utf8_bom
             t_utf8_bom_alone
             t_wide

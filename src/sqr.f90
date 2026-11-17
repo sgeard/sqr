@@ -601,10 +601,13 @@ module sqr
 
         !! Demote an open read-write handle to read-only: subsequent writes
         !! return `SQR_READONLY`, and the exclusive lock is downgraded to a
-        !! shared one so other read-only connections may attach.  Refused
-        !! (`SQR_INVALID`) on a closed handle or while a transaction is live;
-        !! a no-op on a handle already read-only.  A failure to downgrade the
-        !! lock leaves the handle safely read-only but reports `SQR_ERR`.
+        !! shared one so other read-only connections may attach.  The row
+        !! counters are saved first, since a read-only handle writes nothing
+        !! more, not even at `db_close`; if that fails the handle stays
+        !! read-write and the error is returned.  Refused (`SQR_INVALID`) on
+        !! a closed handle or while a transaction is live; a no-op on a
+        !! handle already read-only.  If the lock cannot be downgraded the
+        !! handle is closed and `SQR_ERR` returned: reopen it.
         module subroutine db_set_readonly(db, stat, errmsg)
             class(db_t), intent(inout)               :: db  !! Database handle
             integer,    intent(out),       optional :: stat  !! `SQR_OK` or an error code

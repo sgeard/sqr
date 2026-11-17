@@ -239,12 +239,14 @@ contains
         type(action_result_t) :: rv
         integer :: rs
         logical :: ok
+        character(len=:), allocatable :: why
         call require_db_open(ok); if (.not. ok) return
         call db_set_readonly(db, rs)
         if (rs == SQR_OK) then
             write(*,'(a)') 'database is now read-only (concurrent readers allowed)'
         else
-            write(*,'(a)') 'set read-only failed (a transaction may be open)'
+            call db_last_error(db, msg=why)
+            write(*,'(a)') 'set read-only failed: ' // why
             rv%errored = .true.
         end if
     end function

@@ -337,15 +337,15 @@ contains
             call txn_rollback(db, rs)
             if (rs /= SQR_OK .and. first == SQR_OK) first = rs
         end if
+        ! Schema counters (next_id/live_count) and a catalog whose last write
+        ! failed reach the disk here, so capture the first write failure for
+        ! the caller — but keep closing everything so units are not leaked.
+        if (.not. db%readonly) then
+            call settle_meta(db, rs)
+            if (rs /= SQR_OK .and. first == SQR_OK) first = rs
+        end if
         close_tables: do i = 1, db%ntables
             associate (t => db%tables(i))
-                ! Schema counters (next_id/live_count) are flushed only here,
-                ! so capture the first write failure for the caller — but keep
-                ! closing everything so units are not leaked.
-                if (.not. db%readonly .and. schema_stale(t)) then
-                    call write_schema(db, t, rs)
-                    if (rs /= SQR_OK .and. first == SQR_OK) first = rs
-                end if
                 ! A close performs the final flush; capture (never let it abort)
                 ! an ENOSPC/EIO there so it surfaces as a stat, not error stop.
                 if (t%unit /= -1) then
@@ -372,21 +372,11 @@ contains
             end associate
         end do close_tables
         if (.not. db%readonly) then
-            if (db%catalog_dirty) then
-                call write_catalog(db, rs)
-                if (rs /= SQR_OK .and. first == SQR_OK) first = rs
-            end if
             ! Any in-flight transaction was rolled back above, so a journal on
             ! disk is now a voided leftover: delete it so the next open does zero
             ! recovery work.  (Read-only opens never write, so they leave it.)
-            del_journal: block
-                character(len=:), allocatable :: jpath
-                call jrnl_close_unit(db)
-                jpath = pathjoin(db%dir, '_journal.dat')
-                if (c_path_exists(jpath)) then
-                    if (c_remove(jpath) /= 0 .and. first == SQR_OK) first = SQR_ERR
-                end if
-            end block del_journal
+            call remove_idle_journal(db, rs)
+            if (rs /= SQR_OK .and. first == SQR_OK) first = rs
         end if
         call jrnl_close_unit(db)      ! a read-only handle never opened one; harmless
         if (allocated(db%tables)) deallocate(db%tables)
@@ -425,12 +415,12 @@ contains
         ! Flush-and-close exactly what db_close does, minus the teardown: the
         ! tables array, the directory and the advisory lock all stay, so
         ! db_resume can reopen from the same in-memory schemas.
+        if (.not. db%readonly) then
+            call settle_meta(db, rs)           ! next_id/live_count live only in memory
+            if (rs /= SQR_OK) first = rs
+        end if
         quiesce_tables: do i = 1, db%ntables
             associate (t => db%tables(i))
-                if (.not. db%readonly .and. schema_stale(t)) then
-                    call write_schema(db, t, rs)   ! next_id/live_count live only in memory
-                    if (rs /= SQR_OK .and. first == SQR_OK) first = rs
-                end if
                 if (t%unit /= -1) then
                     close(t%unit, iostat=cs)
                     if (cs /= 0 .and. first == SQR_OK) first = SQR_ERR
@@ -448,10 +438,6 @@ contains
                 end do quiesce_indices
             end associate
         end do quiesce_tables
-        if (.not. db%readonly .and. db%catalog_dirty) then
-            call write_catalog(db, rs)
-            if (rs /= SQR_OK .and. first == SQR_OK) first = rs
-        end if
         call jrnl_close_unit(db)     ! reopened lazily by the next arm or void
         ! Quiesced even on a partial failure: some units are already closed, so
         ! db_resume (or db_close) is the only safe continuation either way.
@@ -507,17 +493,32 @@ contains
         class(db_t), intent(inout)        :: db
         integer,    intent(out), optional :: stat
         character(len=*), intent(inout), optional :: errmsg
+        integer :: rs
         call clear_last_err(db)
         call report(db, SQR_OK, stat, errmsg)
         if (.not. db%opened) then
-            call report(db, SQR_INVALID, stat, errmsg)
+            call raise_db(db, SQR_INVALID, stat, errmsg, 'database is not open')
             return
         end if
         if (db%readonly) return            ! already read-only: nothing to do
         ! A live transaction owns uncommitted state; demoting now would strand
         ! it.  The caller must commit or roll back first.
         if (db%jrnl%active) then
-            call report(db, SQR_INVALID, stat, errmsg)
+            call raise_db(db, SQR_INVALID, stat, errmsg, &
+                'cannot set read-only while a transaction is open')
+            return
+        end if
+        ! Bring the disk level with memory while the lock is still exclusive:
+        ! a read-only handle never writes again, not even at db_close, so the
+        ! row counters (and a catalog whose last write failed) would otherwise
+        ! be lost.  The voided journal goes too, as at a writable close.  On a
+        ! failure the handle stays writable and exclusive: nothing is lost, and
+        ! the caller may retry or close.
+        call settle_meta(db, rs)
+        if (rs == SQR_OK) call remove_idle_journal(db, rs)
+        if (rs /= SQR_OK) then
+            call raise_db(db, rs, stat, errmsg, &
+                'cannot set read-only: the schema counters could not be saved')
             return
         end if
         db%readonly = .true.               ! mutators now refuse via readonly_block
@@ -529,7 +530,8 @@ contains
         ! and report the failure; the caller must reopen.
         if (c_lock_share(db%lock_tok) /= 0) then
             call abandon_open(db)
-            call report(db, SQR_ERR, stat, errmsg)
+            call raise_db(db, SQR_ERR, stat, errmsg, &
+                'the lock could not be shared; the database has been closed')
         end if
     end subroutine
 

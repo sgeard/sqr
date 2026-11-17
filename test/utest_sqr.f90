@@ -99,6 +99,7 @@ program utest_sqr
     call test_txn_structural_block()
     call test_locking()
     call test_set_readonly()
+    call test_set_readonly_counters()
     call test_accessors()
     call test_last_error()
 
@@ -5717,6 +5718,66 @@ contains
         call db_set_readonly(a, rs)
         call check(rs == SQR_INVALID, 'setro: rejected on a closed handle')
 
+        ios = c_rmtree(SDIR)
+    end subroutine
+
+    ! Review finding E2: a read-only handle writes nothing at close, so the
+    ! demotion itself must save the row counters a writer keeps in memory.
+    subroutine test_set_readonly_counters()
+        character(len=*), parameter :: SDIR = 'utest_sqr_setroc_db'
+        type(db_t) :: a
+        type(column_t) :: cols(1)
+        character(len=:), allocatable :: buf
+        character(len=128) :: emsg
+        integer(int32) :: rid
+        integer :: rs, ios, i
+        ios = c_rmtree(SDIR)
+        cols(1)%name = 'v'; cols(1)%dtype = DT_INT; cols(1)%csize = 4
+        call db_open(a, SDIR, stat=rs)
+        call db_create_table(a, 't', cols, rs)
+        call row_alloc(buf, db_record_size(a, 't'))
+        do i = 1, 3
+            call row_set_int(buf, a%tables(1)%cols(1), int(i, int32))
+            call db_insert(a, 't', buf, rid, rs)
+        end do
+        call db_close(a, rs)
+
+        ! Delete, demote, close: the delete must still be counted afterwards.
+        call db_open(a, SDIR, stat=rs)
+        call db_delete(a, 't', 2_int32, rs)
+        call db_begin(a, rs)
+        emsg = ''
+        call db_set_readonly(a, rs, emsg)
+        call check(rs == SQR_INVALID .and. index(emsg, 'transaction is open') > 0, &
+                   'setro counters: refused in a transaction, and says why')
+        call db_rollback(a, rs)
+        call check(c_path_exists(SDIR // '/_journal.dat'), 'setro counters: a voided journal is on disk')
+        call db_set_readonly(a, rs)
+        call check(rs == SQR_OK .and. a%readonly, 'setro counters: demoted')
+        call check(.not. c_path_exists(SDIR // '/_journal.dat'), 'setro counters: demotion removed the journal')
+        call db_close(a, rs)
+        call check(rs == SQR_OK, 'setro counters: close after demotion ok')
+        call db_open(a, SDIR, stat=rs)
+        call check(db_row_count(a, 't') == 2, 'setro counters: the delete is counted after reopen')
+        call db_verify(a, 't', rs, emsg)
+        call check(rs == SQR_OK, 'setro counters: verify clean after delete + demote')
+
+        ! The same for an insert: next_id and the count both survive.
+        call row_set_int(buf, a%tables(1)%cols(1), 9_int32)
+        call db_insert(a, 't', buf, rid, rs)
+        call db_set_readonly(a, rs)
+        call db_close(a, rs)
+        call db_open(a, SDIR, stat=rs, readonly=.true.)
+        call check(rs == SQR_OK .and. db_row_count(a, 't') == 3, &
+                   'setro counters: the insert is counted by a read-only reopen')
+        call db_verify(a, 't', rs, emsg)
+        call check(rs == SQR_OK, 'setro counters: verify clean after insert + demote')
+        call db_close(a, rs)
+
+        emsg = ''
+        call db_set_readonly(a, rs, emsg)
+        call check(rs == SQR_INVALID .and. index(emsg, 'not open') > 0, &
+                   'setro counters: a closed handle is refused, and says why')
         ios = c_rmtree(SDIR)
     end subroutine
 

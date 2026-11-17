@@ -1356,6 +1356,42 @@ contains
         stat = SQR_OK
     end subroutine
 
+    ! Bring the on-disk metadata level with memory: every table's schema
+    ! whose row counters have moved, and the catalog if its last write failed.
+    ! For a writable handle that is about to stop writing (db_close,
+    ! db_quiesce, db_set_readonly).  Runs to the end; `stat` is the first
+    ! failure.
+    subroutine settle_meta(db, stat)
+        type(db_t), intent(inout) :: db
+        integer,    intent(out)   :: stat
+        integer :: i, rs
+        stat = SQR_OK
+        settle_tables: do i = 1, db%ntables
+            if (.not. schema_stale(db%tables(i))) cycle settle_tables
+            call write_schema(db, db%tables(i), rs)
+            if (rs /= SQR_OK .and. stat == SQR_OK) stat = rs
+        end do settle_tables
+        if (db%catalog_dirty) then
+            call write_catalog(db, rs)
+            if (rs /= SQR_OK .and. stat == SQR_OK) stat = rs
+        end if
+    end subroutine
+
+    ! Delete the journal file of a handle with no transaction open: what is
+    ! on disk is then a voided leftover, and removing it leaves the next open
+    ! no recovery work.
+    subroutine remove_idle_journal(db, stat)
+        type(db_t), intent(inout) :: db
+        integer,    intent(out)   :: stat
+        character(len=:), allocatable :: jpath
+        stat = SQR_OK
+        call jrnl_close_unit(db)
+        jpath = pathjoin(db%dir, '_journal.dat')
+        if (c_path_exists(jpath)) then
+            if (c_remove(jpath) /= 0) stat = SQR_ERR
+        end if
+    end subroutine
+
     subroutine abandon_open(db)
         type(db_t), intent(inout) :: db
         integer :: i, j

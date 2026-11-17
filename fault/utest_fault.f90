@@ -89,6 +89,9 @@ program utest_fault
     ! D4: a mutator that fails part-way inside an explicit transaction.
     call doomed_by_fault()
 
+    ! E2: a demotion that cannot save the counters stays writable.
+    call readonly_by_fault()
+
     ! H1: a faulted undo replay must leave the journal hot, never voided.
     call recover_fault()
     call check(no_stranded_units(), 'all: no unit left connected after faulted runs')
@@ -1081,6 +1084,40 @@ contains
     end subroutine doomed_by_fault
 
     ! True when the open store verifies and holds the three fixture rows only.
+    ! db_set_readonly saves the row counters before it gives up the right
+    ! to write.  Every I/O fault in that save must leave the handle writable
+    ! (so the ordinary close can still save them) and the database sound.
+    subroutine readonly_by_fault()
+        integer :: nops, n, rs, bad, st
+        character(len=128) :: emsg
+        call fault_disarm()
+        call prep_rows()
+        call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
+        call db_delete(gdb, 'people', 2_int32, rs)
+        call fault_arm(BIG)
+        call db_set_readonly(gdb, rs)
+        nops = fault_count()
+        call fault_disarm()
+        call close_g()
+        call check(rs == SQR_OK .and. nops > 0, 'readonly: clean demotion does I/O')
+        bad = 0
+        fault_loop: do n = 1, nops
+            call prep_rows()
+            call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
+            call db_delete(gdb, 'people', 2_int32, rs)
+            call fault_arm(n)
+            call db_set_readonly(gdb, rs)
+            call fault_disarm()
+            if (rs == SQR_OK .or. gdb%readonly) bad = bad + 1
+            call close_g()
+            call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
+            call db_verify(gdb, 'people', st, emsg)
+            if (rs /= SQR_OK .or. st /= SQR_OK .or. db_row_count(gdb, 'people') /= 2) bad = bad + 1
+            call close_g()
+        end do fault_loop
+        call check(bad == 0, 'readonly: a failed demotion stays writable and loses no count')
+    end subroutine readonly_by_fault
+
     logical function no_zoe_and_sound() result(ok)
         integer :: st
         integer(int32) :: r
