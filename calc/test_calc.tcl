@@ -175,6 +175,52 @@ set rc [catch {sqr::main push} err]
 check {$rc == 1 && [string match "*not a column*" $err]} "unknown header rejected: $err"
 setcell t 1 2 {S x}
 
+# ---- 6: non-ASCII text, a two-column key, a column name with a space ----
+# (review findings X1, X2, W4.)  \u escapes keep this file ASCII.
+set cafe   "caf\u00e9 \u20ac5"            ;# e-acute, euro sign
+set cjk    "\u65e5\u672c\u8a9e"           ;# three CJK characters
+set tname  "caf\u00e9"
+sqr::dial 127.0.0.1 $port
+sqr::run "CREATE TABLE \"$tname\" (grp INTEGER, seq INTEGER, \"Rate %\" INTEGER, name CHAR(24), note TEXT)"
+sqr::run "CREATE UNIQUE INDEX ON \"$tname\" (grp, seq)"
+sqr::run "INSERT INTO \"$tname\" VALUES (2, 1, 30, 'plain', 'c')"
+sqr::run "INSERT INTO \"$tname\" VALUES (1, 2, 20, '$cjk', '$cafe')"
+sqr::run "INSERT INTO \"$tname\" VALUES (1, 1, 10, '$cafe', '$cjk')"
+lassign [sqr::fetch "SELECT name FROM \"$tname\" WHERE name = '$cafe'"] - - nr - cells
+check {$nr == 1 && [lindex $cells 0] eq [list S $cafe]} \
+    "non-ASCII text sent in SQL matches what was stored"
+set rc [catch {sqr::run "SELECT * FROM \"nicht d\u00e4\""} err]
+check {$rc == 1 && [string match "*d\u00e4*" $err]} "an error message arrives decoded: $err"
+sqr::hangup
+
+sheet sqr
+putcells 1 1 3 2 [list {S host} {S 127.0.0.1} {S port} [list V $port] {S table} [list S $tname]]
+set rc [catch {sqr::main pull} err]
+check {$rc == 0} "pull of a table with a two-column key and a non-ASCII name"
+check {[dict exists $::mock::sheets $tname]} "data sheet named after the table"
+check {[cellat $tname 1 3] eq {S {Rate %}}} "a column name with a space is read whole"
+check {[cellat $tname 2 3] eq {V 10} && [cellat $tname 4 3] eq {V 30}} \
+    "and its INTEGER cells are decoded as numbers"
+check {[lindex [cellat $tname 2 2] 1] == 1 && [lindex [cellat $tname 3 2] 1] == 2 \
+       && [lindex [cellat $tname 4 1] 1] == 2} "rows arrive ordered by both key columns"
+check {[cellat $tname 2 4] eq [list S $cafe] && [cellat $tname 3 4] eq [list S $cjk]} \
+    "CHAR cells arrive as characters, not bytes"
+check {[cellat $tname 2 5] eq [list S $cjk] && [cellat $tname 3 5] eq [list S $cafe]} \
+    "TEXT cells likewise"
+
+setcell $tname 4 4 [list S "\u00fcber \u20ac"]
+sqr::main push
+check {[string match "*pushed 3*" [lindex $::mock::msgs end]]} "push of non-ASCII rows reported 3"
+sqr::dial 127.0.0.1 $port
+lassign [sqr::fetch "SELECT name, note, \"Rate %\" FROM \"$tname\" ORDER BY grp, seq"] names - nr nc cells
+check {$nr == 3 && [lindex $names 2] eq "Rate %"} "table holds 3 rows after the push"
+check {[lindex $cells 0] eq [list S $cafe] && [lindex $cells 1] eq [list S $cjk]} \
+    "pushed non-ASCII text is stored unchanged"
+check {[lindex $cells 6] eq [list S "\u00fcber \u20ac"]} "an edited non-ASCII cell lands"
+lassign [sqr::fetch "SELECT name FROM \"$tname\" WHERE name = '$cafe'"] - - nr - -
+check {$nr == 1} "and still matches a query for it"
+sqr::hangup
+
 # ---- shut down ----
 exec kill [pid $srv]
 catch {close $srv}

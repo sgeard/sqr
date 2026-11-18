@@ -46,7 +46,10 @@ macro invocation (restart LO if it had already cached the Python module).
 
    Set the table name and run `sqr_pull` again.
 3. The table appears on a sheet named after it: headers in row 1, one row
-   per record, NULLs as empty cells, sorted by the table's unique key.
+   per record, NULLs as empty cells, sorted by the table's unique key
+   (every column of it, when the key has several).  Text is UTF-8 in both
+   directions, and table and column names may hold spaces, punctuation and
+   non-ASCII characters.
 4. Edit values, add or delete rows, then run `sqr_push`.
 
 For one-click use, bind the two macros to toolbar buttons or shortcuts

@@ -44,9 +44,22 @@ proc sqr::main {verb} {
 
 # ---------------------------------------------------------------- wire client
 
+# The socket is binary and the protocol's text is UTF-8: everything sent is
+# encoded here, every length is a count of bytes, and every piece of text
+# received (lines, CHAR/TEXT cells, messages) is decoded here.
+
+# Stored text is not validated by the engine.  Bytes that are not UTF-8 are
+# shown as Latin-1 instead of failing the pull.
+proc sqr::text {bytes} {
+    if {[catch {encoding convertfrom utf-8 $bytes} s]} {
+        set s [encoding convertfrom iso8859-1 $bytes]
+    }
+    return $s
+}
+
 proc sqr::sendline {line} {
     variable sock
-    puts -nonewline $sock "$line\n"
+    puts -nonewline $sock [encoding convertto utf-8 "$line\n"]
     flush $sock
 }
 
@@ -55,13 +68,14 @@ proc sqr::getline {} {
     if {[gets $sock line] < 0} {
         error "sqrd closed the connection"
     }
-    return $line
+    text $line
 }
 
 proc sqr::sendsql {sql} {
     variable sock
-    sendline "SQL [string length $sql]"
-    puts -nonewline $sock $sql
+    set bytes [encoding convertto utf-8 $sql]
+    sendline "SQL [string length $bytes]"
+    puts -nonewline $sock $bytes
     flush $sock
 }
 
@@ -71,7 +85,7 @@ proc sqr::reply {} {
     set hdr [getline]
     set payload ""
     if {[lindex $hdr 0] in {MSG ERR}} {
-        set payload [::read $sock [lindex $hdr end]]
+        set payload [text [::read $sock [lindex $hdr end]]]
     }
     list $hdr $payload
 }
@@ -103,7 +117,7 @@ proc sqr::rows {} {
     variable sock
     set hdr [getline]
     if {[lindex $hdr 0] eq "ERR"} {
-        error [::read $sock [lindex $hdr end]]
+        error [text [::read $sock [lindex $hdr end]]]
     }
     if {[lindex $hdr 0] ne "ROWS"} {
         error "protocol: expected ROWS, got \"$hdr\""
@@ -112,9 +126,14 @@ proc sqr::rows {} {
     set names {}
     set types {}
     for {set j 0} {$j < $nc} {incr j} {
-        set col [getline]                     ;# COL name type csize null key
-        lappend names [lindex $col 1]
-        lappend types [lindex $col 2]
+        # COL name type csize null key.  The name may hold spaces and any
+        # punctuation: it is everything before the last four tokens.
+        set col [getline]
+        if {![regexp {^COL (.*) (\S+) \S+ \S+ \S+$} $col - name type]} {
+            error "protocol: bad column line \"$col\""
+        }
+        lappend names $name
+        lappend types $type
     }
     set cells {}
     for {set k 0} {$k < $nr * $nc} {incr k} {
@@ -127,7 +146,7 @@ proc sqr::rows {} {
         switch [lindex $types [expr {$k % $nc}]] {
             INT     { lappend cells [list V [cint $bytes]] }
             REAL    { lappend cells [list V [creal $bytes]] }
-            default { lappend cells [list S $bytes] }
+            default { lappend cells [list S [text $bytes]] }
         }
     }
     if {[getline] ne "END"} {

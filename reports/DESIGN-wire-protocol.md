@@ -114,6 +114,17 @@ COL <name> <type> <csize> <null|notnull> <key-ordinal>    x ncols
 END
 ```
 
+A column name is sent as it is, without quoting, and may contain spaces
+and any punctuation (`COL Rate % INT 4 null 0`). The four fields after it
+never contain a space, so a client reads a `COL` line from the right: the
+name is everything between `COL ` and the last four tokens. A name cannot
+contain a line break or any other control character - the SQL lexer
+refuses one in a quoted identifier, which is the only way to write it.
+
+All text on the wire is UTF-8 and every `<nbytes>` counts bytes, not
+characters. A client whose strings are not UTF-8 internally converts on
+the way out, before it measures a length, and on the way in.
+
 Each cell is `C <nbytes>\n<bytes>`, or bare `N` for SQL NULL. NULL travels
 as its own token — the engine's `is_null` flag is the source of truth, so a
 CHAR value containing the string `NULL` stays unambiguous. `END` is

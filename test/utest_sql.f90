@@ -270,6 +270,7 @@ contains
     subroutine test_lexer()
         type(sql_token_t), allocatable :: toks(:)
         integer :: ntok, rs
+        character(len=128) :: emsg
 
         call sql_lex("SELECT * FROM t WHERE x >= 10", toks, ntok, rs)
         call check(rs == SQR_OK, 'lex: simple select succeeds')
@@ -306,6 +307,16 @@ contains
 
         call sql_lex('SELECT "oops FROM t', toks, ntok, rs)
         call check(rs == SQR_INVALID, 'lex: unterminated quoted identifier flagged')
+        emsg = ''
+        call sql_lex('SELECT a AS "x' // achar(10) // 'y" FROM t', toks, ntok, rs, emsg)
+        call check(rs == SQR_INVALID .and. index(emsg, 'control character') > 0, &
+                   'lex: a control character in a quoted identifier is refused')
+        call sql_lex('"x' // achar(127) // '"', toks, ntok, rs)
+        call check(rs == SQR_INVALID, 'lex: DEL in a quoted identifier is refused')
+        call sql_lex("x = 'two" // achar(10) // "lines'", toks, ntok, rs)
+        call check(rs == SQR_OK, 'lex: a string literal may still hold a newline')
+        call sql_lex('"Rate %  ' // char(195) // char(169) // '"', toks, ntok, rs)
+        call check(rs == SQR_OK, 'lex: spaces, punctuation and UTF-8 stay legal in a quoted identifier')
     end subroutine
 
     ! ===================== parser =====================

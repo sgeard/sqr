@@ -247,8 +247,9 @@ Meta-commands: `.open <dir>`, `.close`, `.tables`, `.schema [table]`,
 **Input encoding.** `sqlsh` and `sqrsh` read UTF-8 (plain ASCII included).
 Text is stored and compared as bytes, so UTF-8 values round-trip and sort in
 code-point order; `CHAR(n)` counts bytes, not characters, and a non-ASCII
-table or column name must be double-quoted. A UTF-8 byte-order mark at the
-start of the input is ignored.
+table or column name must be double-quoted. A double-quoted name may hold
+spaces and any punctuation but no control character (a tab or a line break,
+for instance). A UTF-8 byte-order mark at the start of the input is ignored.
 
 Nothing else is supported, and input that can be recognised as something
 else is refused by name, with exit status 1:

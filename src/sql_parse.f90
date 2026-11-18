@@ -205,6 +205,16 @@ contains
                     i = i + 1   ! closing quote
                     exit
                 end if
+                ! A name reaches a client on one line of the wire protocol
+                ! (COL) and a terminal in a heading: no control characters.
+                if (kind == TK_QIDENT) then
+                    if (iachar(s(i:i)) < 32 .or. iachar(s(i:i)) == 127) then
+                        call set_err(stat, errmsg, SQR_INVALID, &
+                            'col ' // itoa(i) // ': control character in a quoted identifier')
+                        i = -1
+                        return
+                    end if
+                end if
                 n = n + 1
                 body(n:n) = s(i:i)
                 i = i + 1
