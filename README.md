@@ -305,7 +305,7 @@ SELECT name FROM employee WHERE name LIKE 'A%' AND dept NOT IN ('sales');
 
 The supported subset: DDL (`CREATE`/`DROP TABLE`, `CREATE [UNIQUE] INDEX`,
 `DROP INDEX`, `ALTER TABLE … ADD/DROP COLUMN`), DML (`INSERT`, `DELETE`,
-`UPDATE`), `SELECT item,…|* … [WHERE][ORDER BY col [ASC|DESC]][LIMIT n]`, and
+`UPDATE`), `SELECT item,…|* … [WHERE][ORDER BY col [ASC|DESC],…][LIMIT n]`, and
 `BEGIN`/`COMMIT`/`ROLLBACK`. Types are `INTEGER`/`INT`, `REAL`, `CHAR(n)`,
 `TEXT`.
 
@@ -345,7 +345,9 @@ operator.
 
 `ORDER BY` puts NULLs first when ascending and last with `DESC`, as SQLite
 does; it is also the order an index keeps its keys in. Rows that compare
-equal keep the order they were found in.
+equal keep the order they were found in. Several keys may be given, each
+with its own direction (`ORDER BY dept, salary DESC`): a later key only
+separates rows that are equal on all the keys before it.
 
 A single comparison or `BETWEEN` on an indexed column is driven through the
 B+-tree; everything else is a scan, with the full predicate re-applied
@@ -466,7 +468,8 @@ A table's files are named after it, so `db_create_table` and
 - no space at either end, no dot at the end, no `..`;
 - no leading `_`: that prefix belongs to the engine's own files;
 - not the name of an existing table in a different case (`SQR_DUP`). Lookup
-  itself stays case-sensitive.
+  itself stays case-sensitive;
+- not a name whose files are already in the directory (`SQR_DUP`).
 
 The first four return `SQR_INVALID`. In SQL, a name with anything beyond
 ASCII letters, digits and `_` must be quoted: `CREATE TABLE "café" (...)`.
@@ -478,6 +481,25 @@ a combining accent - are two names. A name is at most 32 bytes, which is
 fewer than 32 characters once any of them is non-ASCII. The rules apply to creation only: a
 table already in a database opens under whatever name it has. Column names
 are not restricted in this way.
+
+The file system has the last word. Windows and macOS ignore case in every
+script, so there `CAFÉ` is refused once `café` exists: its files are
+already present. The same check refuses a table whose files were left in
+the directory by something else; remove them to create it.
+
+**Windows and non-ASCII names.** Windows reads a file name in the process's
+code page, which is UTF-8 only if the executable asks for it. An executable
+that uses sqr should therefore carry `src/sqr_utf8.manifest` (Windows 10
+version 1903 or later):
+
+```sh
+windres -I src src/sqr_utf8.rc -o sqr_utf8.o     # then link sqr_utf8.o
+```
+
+Without it a name with a non-ASCII character is refused (`SQR_INVALID`,
+"non-ASCII characters need the UTF-8 code page on Windows") and ASCII names
+work as usual. `make windows` links the manifest into the test executables,
+and builds `utest_sqr_acp.exe` without it to check the refusal.
 
 Each record is: 1 status byte (`ROW_ALIVE` / `ROW_TOMBSTONE`), then a
 `(ncols+7)/8`-byte NULL bitmap, then column data at fixed offsets.

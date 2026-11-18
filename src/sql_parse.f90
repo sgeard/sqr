@@ -696,8 +696,9 @@ contains
         ! three) and DELETE/UPDATE (WHERE only — they pass want_order=.false.).
         subroutine parse_tail(want_order)
             logical, intent(in) :: want_order
-            integer :: n
-            logical :: ok
+            integer :: n, nkeys
+            logical :: ok, desc
+            character(len=SQR_NAME_LEN) :: key
             if (is_kw(tk(), 'where')) then
                 call adv()
                 call parse_where()
@@ -708,14 +709,22 @@ contains
                 call adv()
                 call eat_kw('by')
                 if (had_err) return
-                call take_name(stmt%order_col, 'column name')
-                if (had_err) return
-                stmt%has_order = .true.
-                if (is_kw(tk(), 'asc')) then
+                ! One or more keys, most significant first, each with its
+                ! own optional direction.
+                nkeys = 0
+                allocate(stmt%order_desc(0))
+                order_keys: do
+                    call take_name(key, 'column name')
+                    if (had_err) return
+                    call grow_names(stmt%order_cols, nkeys, key)
+                    desc = is_kw(tk(), 'desc')
+                    if (desc .or. is_kw(tk(), 'asc')) call adv()
+                    stmt%order_desc = [stmt%order_desc, desc]
+                    if (.not. is_punct(tk(), ',')) exit order_keys
                     call adv()
-                else if (is_kw(tk(), 'desc')) then
-                    call adv(); stmt%order_desc = .true.
-                end if
+                end do order_keys
+                stmt%order_cols = stmt%order_cols(1:nkeys)
+                stmt%has_order = .true.
             end if
             if (is_kw(tk(), 'limit')) then
                 call adv()

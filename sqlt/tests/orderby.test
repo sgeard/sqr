@@ -1,0 +1,87 @@
+# orderby.test — ORDER BY with several keys.
+# Hand-authored in the sqllogictest record format; expected values verified
+# against sqlsh.  A later key only separates rows equal on the earlier keys;
+# each key has its own direction; NULL is first ascending, last descending.
+
+statement ok
+CREATE TABLE emp(id INTEGER, dept CHAR(8), grade INTEGER, pay REAL)
+
+statement ok
+INSERT INTO emp VALUES(1, 'ops', 2, 30.5)
+
+statement ok
+INSERT INTO emp VALUES(2, 'eng', 2, 50.0)
+
+statement ok
+INSERT INTO emp VALUES(3, 'ops', 1, 28.0)
+
+statement ok
+INSERT INTO emp VALUES(4, 'eng', 1, 41.0)
+
+statement ok
+INSERT INTO emp VALUES(5, 'eng', 2, 47.5)
+
+statement ok
+INSERT INTO emp VALUES(6, NULL, 3, 10.0)
+
+# Two keys, both ascending.
+query I nosort
+SELECT id FROM emp ORDER BY dept, grade
+----
+6
+4
+2
+5
+3
+1
+
+# The second key descending.
+query I nosort
+SELECT id FROM emp ORDER BY dept, grade DESC
+----
+6
+2
+5
+4
+1
+3
+
+# Three keys of three types.
+query I nosort
+SELECT id FROM emp ORDER BY dept DESC, grade DESC, pay
+----
+1
+3
+5
+2
+4
+6
+
+# LIMIT after the whole ordering.
+query I nosort
+SELECT id FROM emp ORDER BY grade DESC, pay DESC LIMIT 3
+----
+6
+2
+5
+
+# With a WHERE.
+query IT nosort
+SELECT id, dept FROM emp WHERE grade < 3 ORDER BY grade, dept DESC
+----
+3
+ops
+4
+eng
+1
+ops
+2
+eng
+5
+eng
+
+statement error
+SELECT id FROM emp ORDER BY dept, nope
+
+statement error
+SELECT id FROM emp ORDER BY dept,

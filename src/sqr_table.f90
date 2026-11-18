@@ -7,7 +7,7 @@
 ! lookup helpers.
 
 submodule (sqr:sqr_base) sqr_table
-    use :: clib_wrap, only: c_remove, c_lock_try, c_lock_share   ! c_rename/c_fsync_dir/c_file_size host-associated from sqr_base
+    use :: clib_wrap, only: c_remove, c_lock_try, c_lock_share, c_utf8_paths   ! c_rename/c_fsync_dir/c_file_size host-associated from sqr_base
     implicit none
 contains
 
@@ -568,6 +568,19 @@ contains
                        'invalid table name: "' // trim(name) // '" (' // fault // ')')
             return
         end if
+        ! The name becomes file names.  Where the operating system would not
+        ! take those bytes as UTF-8 (Windows, unless the process runs in the
+        ! UTF-8 code page) the files would be created under other names, or
+        ! not at all: refuse instead.  (Past new_name_fault, a character
+        ! outside NAME_CHARS is a non-ASCII one.)
+        if (verify(trim(name), NAME_CHARS) > 0) then
+            if (.not. c_utf8_paths()) then
+                call raise_db(db, SQR_INVALID, stat, errmsg, &
+                           'invalid table name: "' // trim(name) // &
+                           '" (non-ASCII characters need the UTF-8 code page on Windows)')
+                return
+            end if
+        end if
         if (reserved_name(name)) then
             call raise_db(db, SQR_INVALID, stat, errmsg, &
                        'reserved table name: "' // trim(name) // &
@@ -597,6 +610,17 @@ contains
             call raise_db(db, SQR_DUP, stat, errmsg, &
                        'table name "' // trim(name) // '" differs only in case from "' // &
                        trim(db%tables(other)%name) // '"')
+            return
+        end if
+        ! The file system has the last word on whether two names are one
+        ! file: Windows and macOS ignore case in every script, not only ASCII,
+        ! and macOS also treats the two spellings of an accented letter as
+        ! one.  Creating over another table's files would overwrite its
+        ! schema, and the failure tail would then delete it.
+        if (table_files_exist(db, name)) then
+            call raise_db(db, SQR_DUP, stat, errmsg, &
+                       'cannot create table "' // trim(name) // '": its files already exist ' // &
+                       '(the name may differ only in case from another table''s)')
             return
         end if
 
@@ -652,6 +676,17 @@ contains
 
         call report(db, SQR_OK, stat, errmsg)
     end subroutine
+
+    !! Is any file a table called `name` would own already in the database
+    !! directory - under that name as the file system compares names?
+    function table_files_exist(db, name) result(yes)
+        type(db_t),       intent(in) :: db
+        character(len=*), intent(in) :: name
+        logical :: yes
+        yes = c_path_exists(schema_path(db, name))
+        if (.not. yes) yes = c_path_exists(data_path(db, name))
+        if (.not. yes) yes = c_path_exists(blob_path(db, name))
+    end function
 
     !! Undo a half-created table: close its open units (deleting the files
     !! they are connected to) and remove the schema file.  Used only by the

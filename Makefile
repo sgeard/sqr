@@ -403,17 +403,23 @@ distclean: veryclean docs-clean
 #   * -static yields a self-contained .exe; -Wl,-u,__strcpy_chk -lssp resolves
 #     a fortify symbol libgfortran's runtime pulls in (via its directory code)
 #     under -static on this toolchain.
-# Under wine in podman expect utest_sqr.exe to report four checks SKIPPED:
-# the read-only-media tests rely on chmod, which Windows does not enforce on
-# directories and root (the container's user) is not subject to.  The reason
-# is written up beside the probes in test/utest_sqr.f90 ("Permission-based
-# tests").
+# Under wine in podman give the container LC_ALL=C.UTF-8, or wine cannot
+# create a non-ASCII file name, and expect utest_sqr.exe to report four
+# checks SKIPPED: the read-only-media tests rely on chmod, which Windows
+# does not enforce on directories and root (the container's user) is not
+# subject to.  The reason is written up beside the probes in
+# test/utest_sqr.f90 ("Permission-based tests").
+# The test executables carry src/sqr_utf8.manifest, which puts the process in
+# the UTF-8 code page so that non-ASCII table names become correctly named
+# files.  utest_sqr_acp.exe is utest_sqr built WITHOUT it: there the same
+# names must be refused (one further check is skipped).
 # 32-bit is intentionally not offered: the Win32 APIs are stdcall with
 # @N-decorated names on i686, which a plain bind(c) (cdecl) interface does not
 # match — that needs separate handling. 64-bit has one calling convention.
 WIN_FC     := x86_64-w64-mingw32-gfortran
 WIN_CC     := x86_64-w64-mingw32-gcc
 WIN_AR     := x86_64-w64-mingw32-ar
+WIN_RC     := x86_64-w64-mingw32-windres
 WIN_ODIR   := obj_mingw64
 WIN_FLAGS  := -O3
 WIN_CFLAGS := -O2 -Wall -Wextra
@@ -433,13 +439,18 @@ windows:
 	        -c $(SRC_DIR)/$$f.f90 -o $(WIN_ODIR)/$$f.o || exit 1; \
 	done
 	$(WIN_AR) rcs $(WIN_ODIR)/libsqr.a $(WIN_ODIR)/*.o
+	@echo "  RC  sqr_utf8"
+	$(WIN_RC) -I $(SRC_DIR) $(SRC_DIR)/sqr_utf8.rc -o $(WIN_ODIR)/sqr_utf8.res.o
 	@for t in $(WIN_TESTS); do \
 	    echo "  LD  $$t.exe"; \
 	    $(WIN_FC) $(WIN_FLAGS) -J$(WIN_ODIR) -I$(WIN_ODIR) -o $(WIN_ODIR)/$$t.exe \
-	        $(TEST_DIR)/$$t.f90 $(WIN_ODIR)/libsqr.a $(WIN_LINK) || exit 1; \
+	        $(TEST_DIR)/$$t.f90 $(WIN_ODIR)/sqr_utf8.res.o $(WIN_ODIR)/libsqr.a $(WIN_LINK) || exit 1; \
 	done
+	@echo "  LD  utest_sqr_acp.exe"
+	@$(WIN_FC) $(WIN_FLAGS) -J$(WIN_ODIR) -I$(WIN_ODIR) -o $(WIN_ODIR)/utest_sqr_acp.exe \
+	    $(TEST_DIR)/utest_sqr.f90 $(WIN_ODIR)/libsqr.a $(WIN_LINK)
 	@echo "Built standalone Windows 64-bit exes in $(WIN_ODIR)/ (run on Windows or via wine):"
-	@for t in $(WIN_TESTS); do echo "    $(WIN_ODIR)/$$t.exe"; done
+	@for t in $(WIN_TESTS) utest_sqr_acp; do echo "    $(WIN_ODIR)/$$t.exe"; done
 
 help:
 	@echo "Targets : all, check (depcheck utest sqlttest shelltest), depcheck"

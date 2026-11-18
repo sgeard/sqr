@@ -16,7 +16,7 @@
 !!   * **DML** — `INSERT INTO t [(cols)] VALUES (…)[, (…)]`,
 !!     `DELETE FROM t [WHERE …]`, `UPDATE t SET col=val[,…] [WHERE …]`.
 !!   * **Query** — `SELECT item[,…]|* FROM t [WHERE pred]
-!!     [ORDER BY col [ASC|DESC]] [LIMIT n]`, where an `item` is a column, a
+!!     [ORDER BY col [ASC|DESC][,…]] [LIMIT n]`, where an `item` is a column, a
 !!     literal or an aggregate, optionally followed by `AS name`.  The
 !!     aggregates are `COUNT(*)`, `COUNT(col)`, `MIN(col)`, `MAX(col)`,
 !!     `SUM(col)` and `AVG(col)`; a projection that holds one returns a
@@ -198,9 +198,10 @@ module sql
         type(sql_cond_group_t), allocatable :: where_groups(:)
 
         ! ORDER BY / LIMIT.
+        ! ORDER BY keys, most significant first; each has its own direction.
         logical :: has_order = .false.
-        character(len=SQR_NAME_LEN) :: order_col = ''
-        logical :: order_desc = .false.
+        character(len=SQR_NAME_LEN), allocatable :: order_cols(:)
+        logical,                     allocatable :: order_desc(:)
         logical :: has_limit = .false.
         integer :: limit_n = 0
     end type

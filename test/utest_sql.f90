@@ -340,8 +340,12 @@ contains
         call check(st%has_where, 'parse: has where')
         call check(size(st%where_groups) == 2, 'parse: two OR-groups (DNF)')
         call check(size(st%where_groups(1)%conds) == 2, 'parse: first group has two ANDed conds')
-        call check(st%has_order .and. st%order_desc, 'parse: order by desc')
+        call check(st%has_order .and. size(st%order_cols) == 1 .and. all(st%order_desc), 'parse: order by desc')
         call check(st%has_limit .and. st%limit_n == 5, 'parse: limit 5')
+        call sql_parse('SELECT * FROM t ORDER BY a, "b c" DESC, d ASC LIMIT 2', st, rs)
+        call check(rs == SQR_OK .and. size(st%order_cols) == 3, 'parse: three ORDER BY keys')
+        call check(trim(st%order_cols(2)) == 'b c' .and. all(st%order_desc .eqv. [.false., .true., .false.]) &
+                   .and. st%limit_n == 2, 'parse: each key keeps its own direction')
 
         call sql_parse("DELETE FROM t WHERE id BETWEEN 1 AND 10", st, rs)
         call check(st%where_groups(1)%conds(1)%op == OP_BETWEEN, 'parse: between op')
@@ -557,6 +561,17 @@ contains
 
     ! ===================== ORDER BY / LIMIT =====================
 
+    ! The first column of every row, run together.
+    function ids(r) result(s)
+        type(sql_result_t), intent(in) :: r
+        character(len=:), allocatable :: s
+        integer :: i
+        s = ''
+        do i = 1, r%nrows
+            s = s // cell(r, i, 1)
+        end do
+    end function
+
     subroutine test_order_and_limit()
         type(db_t) :: db
         type(sql_result_t) :: res
@@ -572,7 +587,34 @@ contains
         call check(cell(res,1,1) == '4' .and. cell(res,4,1) == '2', 'order: descending')
         call run(db, "SELECT id FROM t ORDER BY v DESC LIMIT 2", res, rs)
         call check(res%nrows == 2 .and. cell(res,1,1) == '4', 'order: limit caps rows')
+        call db_close(db)
 
+        ! Several keys: a later key only separates rows equal on the earlier
+        ! ones, and each key has its own direction.
+        call fresh_db(db)
+        call run(db, "CREATE TABLE m (id INTEGER, g CHAR(4), v INTEGER, r REAL, n TEXT)", res, rs)
+        call run(db, "INSERT INTO m (id,g,v,r) VALUES (1,'b',2,1.5),(2,'a',2,0.5),(3,'b',1,2.5)," // &
+                     "(4,'a',1,3.5),(5,'a',2,0.25),(6,NULL,9,0.0)", res, rs)
+        call run(db, "SELECT id FROM m ORDER BY g, v", res, rs)
+        call check(rs == SQR_OK .and. ids(res) == '642531', 'order: two keys ascending, NULL first, ties stable')
+        call run(db, "SELECT id FROM m ORDER BY g ASC, v DESC", res, rs)
+        call check(ids(res) == '625413', 'order: second key descending')
+        call run(db, "SELECT id FROM m ORDER BY g DESC, v", res, rs)
+        call check(ids(res) == '314256', 'order: first key descending puts NULL last')
+        call run(db, "SELECT id FROM m ORDER BY g, v DESC, r", res, rs)
+        call check(ids(res) == '652413', 'order: three keys, the third breaks the remaining tie')
+        call run(db, "SELECT id FROM m ORDER BY v, v DESC, id DESC", res, rs)
+        call check(ids(res) == '435216', 'order: a repeated key is harmless')
+        call run(db, "SELECT id FROM m ORDER BY g, v DESC LIMIT 3", res, rs)
+        call check(ids(res) == '625', 'order: LIMIT applies after all keys')
+        call run(db, "SELECT id FROM m ORDER BY g, nope", res, rs)
+        call check(rs == SQR_INVALID, 'order: an unknown second key is refused')
+        call run(db, "SELECT id FROM m ORDER BY g, n", res, rs)
+        call check(rs == SQR_INVALID, 'order: a TEXT second key is refused')
+        call run(db, "SELECT id FROM m ORDER BY g,", res, rs)
+        call check(rs /= SQR_OK, 'order: a trailing comma is a syntax error')
+        call run(db, "SELECT id FROM m ORDER BY g v", res, rs)
+        call check(rs /= SQR_OK, 'order: two keys need a comma')
         call db_close(db)
     end subroutine
 

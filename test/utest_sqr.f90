@@ -1,7 +1,7 @@
 program utest_sqr
     use, intrinsic :: iso_fortran_env, only: int8, int32, int64, real64
     use sqr
-    use clib_wrap, only: c_rename, c_remove, c_mkdir, c_chmod, c_rmtree, c_path_exists, &
+    use clib_wrap, only: c_rename, c_remove, c_mkdir, c_chmod, c_rmtree, c_path_exists, c_utf8_paths, &
                          c_fsync_path, c_fsync_dir, c_truncate, c_file_size, c_lock_release
     implicit none
 
@@ -797,9 +797,13 @@ contains
         character(len=*), parameter :: E_ACUTE_UC = char(195) // char(137)
         character(len=*), parameter :: CJK = char(230) // char(151) // char(165)
         character(len=*), parameter :: EMOJI = char(240) // char(159) // char(152) // char(128)
-        character(len=*), parameter :: GOOD(12) = [character(len=12) :: &
-            'Plain9', 'two words', 'a-b', 'a!b', 'a+b', 'a.b', 'a,b', '.hidden', &
-            'caf' // E_ACUTE, 'CAF' // E_ACUTE_UC, CJK // CJK, 'x' // EMOJI]
+        character(len=*), parameter :: GOOD(8) = [character(len=12) :: &
+            'Plain9', 'two words', 'a-b', 'a!b', 'a+b', 'a.b', 'a,b', '.hidden']
+        ! Good too, wherever a UTF-8 file name reaches the OS as UTF-8; the
+        ! last begins with the first character after the C1 controls.
+        character(len=*), parameter :: GOOD_UTF8(5) = [character(len=12) :: &
+            'caf' // E_ACUTE, 'CAF' // E_ACUTE_UC, CJK // CJK, 'x' // EMOJI, &
+            'a' // char(194) // char(160)]
         character(len=*), parameter :: BAD(11) = [character(len=12) :: &
             'a:b', 'a*b', 'a?b', 'a"b', 'a<b', 'a>b', 'a|b', 'a#b', &
             ' lead', 'trail.', 'a..b']
@@ -816,13 +820,42 @@ contains
         integer        :: rs, i, ios, u, p
         integer(int32) :: rid
         integer(int64) :: sz
+        logical        :: folds
         character(len=128) :: emsg
         ios = c_rmtree(XDIR)
+        folds = .false.
         c(1)%name = 'a:b'; c(1)%dtype = DT_INT; c(1)%csize = 4
         call db_open(db, XDIR, rs, emsg)
         do i = 1, size(GOOD)
             call db_create_table(db, trim(GOOD(i)), c, rs, emsg)
             call check(rs == SQR_OK, 'names: "' // trim(GOOD(i)) // '" accepted')
+        end do
+        ! Windows takes a file name in the process's code page: without the
+        ! UTF-8 one (src/sqr_utf8.manifest) a non-ASCII name is refused.
+        do i = 1, size(GOOD_UTF8)
+            emsg = ''
+            call db_create_table(db, trim(GOOD_UTF8(i)), c, rs, emsg)
+            if (c_utf8_paths() .and. i == 2) then
+                ! Windows and macOS hold "CAFÉ" to be the file "café": there
+                ! the name is refused and the first table is left whole.
+                if (folds) then
+                    call check(rs == SQR_DUP .and. index(emsg, 'files already exist') > 0, &
+                               'names: a name the file system folds onto another is refused')
+                    call check(c_path_exists(XDIR // '/caf' // E_ACUTE // '.schema') .and. &
+                               db_record_size(db, 'caf' // E_ACUTE) > 0, &
+                               'names: and the table that owns the files is untouched')
+                else
+                    call check(rs == SQR_OK, 'names: "' // trim(GOOD_UTF8(i)) // '" accepted')
+                end if
+            else if (c_utf8_paths()) then
+                call check(rs == SQR_OK, 'names: "' // trim(GOOD_UTF8(i)) // '" accepted')
+                if (i == 1) folds = c_path_exists(XDIR // '/CAF' // E_ACUTE_UC // '.dat')
+            else
+                call check(rs == SQR_INVALID .and. index(emsg, 'UTF-8 code page') > 0 &
+                           .and. db_table_index(db, trim(GOOD_UTF8(i))) == 0, &
+                           'names: non-ASCII name refused outside the UTF-8 code page (case ' &
+                           // achar(48 + i) // ')')
+            end if
         end do
         do i = 1, size(BAD)
             emsg = ''
@@ -843,12 +876,32 @@ contains
         call db_create_table(db, 'a' // char(194) // char(133), c, rs, emsg)
         call check(rs == SQR_INVALID .and. index(emsg, 'control characters') > 0, &
                    'names: a C1 control character is refused')
-        call db_create_table(db, 'a' // char(194) // char(160), c, rs, emsg)
-        call check(rs == SQR_OK, 'names: the first character after the C1 controls is accepted')
         call db_create_table(db, repeat(CJK, 11), c, rs, emsg)
         call check(rs == SQR_INVALID, 'names: the length limit counts bytes, not characters')
-        call check(db_table_index(db, 'caf' // E_ACUTE) > 0 .and. db_table_index(db, 'CAF' // E_ACUTE_UC) > 0, &
-                   'names: the case rule folds ASCII letters only')
+        if (.not. c_utf8_paths()) then
+            call skip('names: the case rule folds ASCII letters only', 'not in the UTF-8 code page')
+        else if (folds) then
+            call skip('names: the case rule folds ASCII letters only', 'the file system folds more')
+        else
+            call check(db_table_index(db, 'caf' // E_ACUTE) > 0 .and. db_table_index(db, 'CAF' // E_ACUTE_UC) > 0, &
+                       'names: the case rule folds ASCII letters only')
+        end if
+
+        ! Files already in the directory under the new table's name are not
+        ! created over, whoever left them.
+        open(newunit=u, file=XDIR // '/stray.schema', status='replace', action='write')
+        write(u, '(a)') 'not a schema'
+        close(u)
+        emsg = ''
+        call db_create_table(db, 'stray', c, rs, emsg)
+        inquire(file=XDIR // '/stray.schema', size=sz)
+        call check(rs == SQR_DUP .and. index(emsg, 'files already exist') > 0, &
+                   'names: a table whose files already exist is refused')
+        call check(sz > 0 .and. db_table_index(db, 'stray') == 0, &
+                   'names: and the files are left as they were')
+        ios = c_remove(XDIR // '/stray.schema')
+        call db_create_table(db, 'stray', c, rs, emsg)
+        call check(rs == SQR_OK, 'names: free once the files are gone')
 
         ! Case: the same name is a duplicate as before; another case is too.
         call db_create_table(db, 'Plain9', c, rs, emsg)
@@ -5105,7 +5158,9 @@ contains
         ct(2)%name = 'note'; ct(2)%dtype = DT_TEXT; ct(2)%csize = SQR_TEXT_DESC
         call db_open(db, CDIR, rs, emsg)
 
-        ! (a) open_data fails: a blocking file where the fresh '.dat' must go.
+        ! (a) a blocking file where the fresh '.dat' must go.  (Since the
+        ! files-already-exist check this is refused before anything is
+        ! written; the failure tails themselves now need an I/O fault.)
         open(newunit=u, file=CDIR // '/t.dat', status='new', iostat=ios)
         close(u)
         call db_create_table(db, 't', c, rs, emsg)
@@ -5117,7 +5172,7 @@ contains
         call db_create_table(db, 't', c, rs, emsg)
         call check(rs == SQR_OK, 'create cleanup: succeeds once unblocked')
 
-        ! (b) open_blob fails: a directory squatting on the '.blob' path.
+        ! (b) a directory squatting on the '.blob' path: refused likewise.
         ios = c_mkdir(CDIR // '/u.blob')
         call db_create_table(db, 'u', ct, rs, emsg)
         call check(rs /= SQR_OK, 'create cleanup: blocked .blob fails')

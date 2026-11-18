@@ -38,6 +38,7 @@ module clib_wrap
     public :: c_lock_release!! release an advisory lock and close its handle
     public :: c_lock_share  !! downgrade an exclusive advisory lock to shared
     public :: c_isatty_stdin!! is standard input a terminal?
+    public :: c_utf8_paths  !! do UTF-8 file names reach the OS as UTF-8?
     public :: c_sock_listen !! open a loopback TCP listening socket
     public :: c_sock_port   !! actual bound port of a listening socket
     public :: c_sock_accept !! accept one pending connection
@@ -131,6 +132,12 @@ module clib_wrap
         end function
 
         function sqr_os_getpid() bind(c, name='sqr_os_getpid') result(r)
+            import :: c_int
+            integer(c_int) :: r
+        end function
+
+        ! Returns 1 if a file path given as UTF-8 reaches the OS as UTF-8.
+        function sqr_os_utf8_paths() bind(c, name='sqr_os_utf8_paths') result(r)
             import :: c_int
             integer(c_int) :: r
         end function
@@ -416,6 +423,14 @@ module clib_wrap
         !! `_isatty`.
         module function c_isatty_stdin() result(yes)
             logical :: yes  !! `.true.` if stdin is a TTY
+        end function
+
+        !! `.true.` when a file path holding UTF-8 reaches the operating
+        !! system as UTF-8.  Always so on POSIX, where a path is bytes; on
+        !! Windows only when the process's ANSI code page is UTF-8, which an
+        !! executable asks for in its manifest (`src/sqr_utf8.manifest`).
+        module function c_utf8_paths() result(yes)
+            logical :: yes  !! `.true.` if non-ASCII file names are safe
         end function
 
         !! Open a TCP listening socket bound to loopback (127.0.0.1) on

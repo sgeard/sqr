@@ -164,6 +164,15 @@ int sqr_os_getpid(void) {
     return (int)_getpid();
 }
 
+int sqr_os_utf8_paths(void) {
+    /* The narrow file calls used here and by the Fortran runtime (CreateFileA,
+       MoveFileExA, the CRT's open) read a path in the process's ANSI code
+       page.  It is UTF-8 only when the executable's manifest asks for it
+       (activeCodePage, Windows 10 1903 on - see src/sqr_utf8.manifest) or the
+       system code page is set so. */
+    return GetACP() == CP_UTF8 ? 1 : 0;
+}
+
 int sqr_os_realpath(const char *p, char *buf, int cap) {
     /* _fullpath resolves against the cwd and normalises .././, but unlike
        POSIX realpath it does not require the path to exist — the caller's
@@ -447,6 +456,10 @@ int sqr_os_getcwd(char *buf, int cap) {
 
 int sqr_os_getpid(void) {
     return (int)getpid();
+}
+
+int sqr_os_utf8_paths(void) {
+    return 1;                   /* a path is bytes: UTF-8 passes untouched */
 }
 
 int sqr_os_realpath(const char *p, char *buf, int cap) {

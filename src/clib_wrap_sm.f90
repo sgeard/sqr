@@ -247,6 +247,11 @@ contains
         yes = sqr_os_isatty_stdin() /= 0_c_int
     end function
 
+    module function c_utf8_paths() result(yes)
+        logical :: yes
+        yes = sqr_os_utf8_paths() /= 0_c_int
+    end function
+
     module function c_sock_listen(port) result(sock)
         integer, intent(in) :: port
         integer(c_int64_t)  :: sock

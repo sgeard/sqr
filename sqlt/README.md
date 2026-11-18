@@ -81,6 +81,7 @@ query <types> [nosort|rowsort|valuesort] [label]
 
 - `run_sqlt.tcl` — the harness.
 - `tests/select1.test` — projection, WHERE, ORDER BY, LIMIT, rowsort.
+- `tests/orderby.test` — ORDER BY with several keys and mixed directions.
 - `tests/where_null.test` — NULL, `IS [NOT] NULL`, `BETWEEN`, `(empty)`.
 - `tests/like.test` — `LIKE`, `NOT LIKE`, `ESCAPE`.
 - `tests/in.test` — `IN (list)`, `NOT IN`, `NOT BETWEEN`.

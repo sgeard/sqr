@@ -483,8 +483,8 @@ contains
         integer,            intent(out),  optional :: stat
         character(len=*),   intent(inout), optional :: errmsg
         type(row_match_ctx_t) :: g
-        integer :: ti, rs, oc
-        integer, allocatable :: ords(:)
+        integer :: ti, rs, k
+        integer, allocatable :: ords(:), ocs(:)
         type(sql_proj_t), allocatable :: items(:)
         type(column_t), allocatable :: cols(:)
         logical :: has_agg
@@ -495,22 +495,26 @@ contains
         if (.not. validate_where(cols, stmt, stat, errmsg)) return
         if (.not. resolve_projection(cols, stmt, items, ords, has_agg, stat, errmsg)) return
 
-        ! ORDER BY column (must exist and be sortable).
-        oc = 0
-        if (stmt%has_order) then
+        ! ORDER BY columns (each must exist and be sortable).
+        if (.not. stmt%has_order) then
+            allocate(ocs(0))
+        else
             if (has_agg) then
                 call set_err(stat, errmsg, SQR_INVALID, 'ORDER BY is not allowed with an aggregate')
                 return
             end if
-            oc = col_index(cols, trim(stmt%order_col))
-            if (oc == 0) then
-                call set_err(stat, errmsg, SQR_INVALID, 'no such column: ' // trim(stmt%order_col))
-                return
-            end if
-            if (cols(oc)%dtype == DT_TEXT) then
-                call set_err(stat, errmsg, SQR_INVALID, 'cannot ORDER BY a TEXT column')
-                return
-            end if
+            allocate(ocs(size(stmt%order_cols)))
+            order_keys: do k = 1, size(ocs)
+                ocs(k) = col_index(cols, trim(stmt%order_cols(k)))
+                if (ocs(k) == 0) then
+                    call set_err(stat, errmsg, SQR_INVALID, 'no such column: ' // trim(stmt%order_cols(k)))
+                    return
+                end if
+                if (cols(ocs(k))%dtype == DT_TEXT) then
+                    call set_err(stat, errmsg, SQR_INVALID, 'cannot ORDER BY a TEXT column')
+                    return
+                end if
+            end do order_keys
         end if
 
         call gather(db, stmt, g, rs, errmsg)
@@ -520,18 +524,18 @@ contains
         if (has_agg) then
             call select_aggregate(stmt, g, items, ords, binary, res, stat, errmsg)
         else
-            call select_rows(db, stmt, g, items, ords, oc, binary, res)
+            call select_rows(db, stmt, g, items, ords, ocs, binary, res)
         end if
     end subroutine
 
     ! One output row per gathered row, ordered and limited.
-    subroutine select_rows(db, stmt, g, items, ords, oc, binary, res)
+    subroutine select_rows(db, stmt, g, items, ords, ocs, binary, res)
         type(db_t),            intent(inout), target :: db
         type(sql_stmt_t),      intent(in)    :: stmt
         type(row_match_ctx_t), intent(in)    :: g
         type(sql_proj_t),      intent(in)    :: items(:)
         integer,               intent(in)    :: ords(:)
-        integer,               intent(in)    :: oc
+        integer,               intent(in)    :: ocs(:)      ! ORDER BY columns, in key order
         logical,               intent(in)    :: binary
         type(sql_result_t),    intent(inout) :: res
         integer, allocatable :: perm(:)
@@ -539,7 +543,7 @@ contains
 
         allocate(perm(g%n))
         perm = [(i, i = 1, g%n)]
-        if (stmt%has_order .and. g%n > 1) call order_rows(g, oc, stmt%order_desc, perm)
+        if (stmt%has_order .and. g%n > 1) call order_rows(g, ocs, stmt%order_desc, perm)
 
         nout = g%n
         if (stmt%has_limit) nout = min(nout, stmt%limit_n)
@@ -1446,10 +1450,10 @@ contains
     ! the previous insertion sort was O(n^2).  Stability (ties keep gather
     ! order) comes from the merge taking the LEFT run's element unless the
     ! right's strictly precedes it.
-    subroutine order_rows(g, oc, desc, perm)
+    subroutine order_rows(g, ocs, desc, perm)
         type(row_match_ctx_t), intent(in)    :: g
-        integer,               intent(in)    :: oc
-        logical,               intent(in)    :: desc
+        integer,               intent(in)    :: ocs(:)      ! key columns, most significant first
+        logical,               intent(in)    :: desc(:)     ! direction of each
         integer,               intent(inout) :: perm(:)
         integer, allocatable :: work(:)
         integer :: n, width, lo, mid, hi
@@ -1461,7 +1465,7 @@ contains
             runs: do while (lo + width <= n)
                 mid = lo + width - 1
                 hi  = min(lo + 2*width - 1, n)
-                call merge_runs(g, oc, desc, perm, work, lo, mid, hi)
+                call merge_runs(g, ocs, desc, perm, work, lo, mid, hi)
                 lo = hi + 1
             end do runs
             width = 2 * width
@@ -1470,17 +1474,17 @@ contains
 
     ! Merge perm(lo:mid) and perm(mid+1:hi) (each already ordered) through
     ! the scratch array.
-    subroutine merge_runs(g, oc, desc, perm, work, lo, mid, hi)
+    subroutine merge_runs(g, ocs, desc, perm, work, lo, mid, hi)
         type(row_match_ctx_t), intent(in)    :: g
-        integer,               intent(in)    :: oc, lo, mid, hi
-        logical,               intent(in)    :: desc
+        integer,               intent(in)    :: ocs(:), lo, mid, hi
+        logical,               intent(in)    :: desc(:)
         integer,               intent(inout) :: perm(:), work(:)
         integer :: i, j, k
         i = lo
         j = mid + 1
         k = lo
         both: do while (i <= mid .and. j <= hi)
-            if (row_gt(g, oc, perm(i), perm(j), desc)) then   ! right strictly first
+            if (row_gt(g, ocs, perm(i), perm(j), desc)) then   ! right strictly first
                 work(k) = perm(j);  j = j + 1
             else                                              ! ties take LEFT: stable
                 work(k) = perm(i);  i = i + 1
@@ -1493,15 +1497,21 @@ contains
     end subroutine
 
     ! Should row a sort after row b (i.e. a > b in the requested order)?
-    function row_gt(g, oc, a, b, desc) result(gt)
+    ! The first key on which the rows differ decides; a later key only
+    ! separates rows that are equal on every key before it.
+    function row_gt(g, ocs, a, b, desc) result(gt)
         type(row_match_ctx_t), intent(in) :: g
-        integer,               intent(in) :: oc, a, b
-        logical,               intent(in) :: desc
+        integer,               intent(in) :: ocs(:), a, b
+        logical,               intent(in) :: desc(:)
         logical :: gt
-        integer :: cmp
-        cmp = cmp_rows(g, oc, a, b)        ! ascending, NULL first
-        if (desc) cmp = -cmp
-        gt = cmp > 0
+        integer :: cmp, k
+        gt = .false.
+        keys: do k = 1, size(ocs)
+            cmp = cmp_rows(g, ocs(k), a, b)    ! ascending, NULL first
+            if (cmp == 0) cycle keys
+            gt = (cmp > 0) .neqv. desc(k)
+            return
+        end do keys
     end function
 
     ! Compare rows a and b on column oc for ascending order, NULLs first -

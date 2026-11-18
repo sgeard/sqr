@@ -1,0 +1,5 @@
+// Windows resource script: embeds sqr_utf8.manifest as the application
+// manifest (resource 1 of type 24, RT_MANIFEST).  Compile it with windres
+// and link the object into the executable:
+//     windres -I src src/sqr_utf8.rc -o sqr_utf8.o
+1 24 "sqr_utf8.manifest"
