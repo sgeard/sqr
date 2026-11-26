@@ -109,7 +109,7 @@ contains
         use iso_fortran_env, only: output_unit
         use fb_monitor
         
-        type(db_t) :: db
+        type(db_t), target :: db
         character(len=:), allocatable :: buf
         integer :: rs, i, ti
         integer(int32) :: rid
@@ -168,7 +168,7 @@ contains
     subroutine one_scale(n, prev_us)
         integer,      intent(in)    :: n
         real(real64), intent(inout) :: prev_us
-        type(db_t) :: db
+        type(db_t), target :: db
         character(len=:), allocatable :: buf
         integer :: rs, i, ti
         integer(int32) :: rid
@@ -266,7 +266,7 @@ contains
     subroutine one_txn_scale(n, prev_us)
         integer,      intent(in)    :: n
         real(real64), intent(inout) :: prev_us
-        type(db_t) :: db
+        type(db_t), target :: db
         character(len=:), allocatable :: buf
         integer :: rs, i, ti
         integer(int32) :: rid
@@ -326,7 +326,7 @@ contains
         integer,      intent(in)  :: n
         logical,      intent(in)  :: null_key, in_txn
         real(real64), intent(out) :: us
-        type(db_t) :: db
+        type(db_t), target :: db
         character(len=:), allocatable :: buf
         integer :: rs, i, ti
         integer(int32) :: rid
@@ -362,7 +362,7 @@ contains
 
     ! --- 3. Point lookup: index vs full scan --------------------------
     subroutine bench_lookup()
-        type(db_t) :: db
+        type(db_t), target :: db
         character(len=:), allocatable :: buf
         integer :: rs, i, ti
         integer(int32) :: rid
@@ -416,7 +416,7 @@ contains
 
     ! --- 4. Delete half, then compact ---------------------------------
     subroutine bench_delete_compact()
-        type(db_t) :: db
+        type(db_t), target :: db
         character(len=:), allocatable :: buf
         integer :: rs, i, ti
         integer(int32) :: rid
@@ -456,7 +456,7 @@ contains
 
     ! --- 5. TEXT set / get --------------------------------------------
     subroutine bench_text()
-        type(db_t) :: db
+        type(db_t), target :: db
         character(len=:), allocatable :: buf, got
         character(len=TEXT_BYTES) :: payload
         integer :: rs, i, ti
@@ -517,7 +517,7 @@ contains
     ! one txn of rows each), copy it row by row into a second non-durable
     ! store (the 2d_cad Open path, one txn), and a plain open+close cycle.
     subroutine bench_document()
-        type(db_t) :: db, dst
+        type(db_t), target :: db, dst
         character(len=:), allocatable :: buf
         character(len=SQR_NAME_LEN), allocatable :: names(:)
         character(len=16) :: tn
@@ -610,7 +610,7 @@ contains
     ! re-resolution (multi-condition scan), the O(n^2) ORDER BY insertion
     ! sort, and lex_string's O(len^2) one-char-at-a-time buffer growth.
     subroutine bench_sql()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         type(sql_stmt_t)   :: stmt
         character(len=:), allocatable :: buf, longlit

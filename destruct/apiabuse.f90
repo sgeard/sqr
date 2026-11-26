@@ -31,7 +31,7 @@ program apiabuse
     use :: abuse_mod
     implicit none
 
-    type(db_t)                    :: db
+    type(db_t), target                    :: db
     type(db_cursor_t)             :: cur
     type(column_t)                :: c1, cols1(1)
     type(column_t), allocatable   :: bigcols(:)

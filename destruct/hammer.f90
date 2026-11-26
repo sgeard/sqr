@@ -57,7 +57,7 @@ program hammer
     use :: hammer_mod
     implicit none
 
-    type(db_t)                    :: db, db2
+    type(db_t), target                    :: db, db2
     type(db_cursor_t)             :: cur
     type(cnt_t)                   :: counter
     class(*), pointer             :: ctxp

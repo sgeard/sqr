@@ -20,7 +20,7 @@ program sqlsh
     use :: clib_wrap, only: c_isatty_stdin, c_exit
     implicit none
 
-    type(db_t), save :: db
+    type(db_t), save, target :: db
     character(len=:), allocatable :: line
     logical :: interactive, first_line
     character(len=*), parameter :: USAGE = 'usage: sqlsh [<db-dir>]   (or --help, --version)'

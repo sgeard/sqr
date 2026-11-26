@@ -39,6 +39,7 @@ program utest_sqr
     call test_nested_dir()
     call test_readonly()
     call test_drop_table()
+    call test_drop_marker()
     call test_open_corruption_paths()
     call test_catalog_traversal_name()
     call test_crash_recovery()
@@ -57,6 +58,9 @@ program utest_sqr
     call test_pack()
     call test_pack_too_large()
     call test_quiesce()
+    call test_resume_retry()
+    call test_handle_misuse()
+    call test_history_kept_on_refusal()
     call test_natural_keys()
     call test_null_columns()
     call test_null_in_keys()
@@ -136,6 +140,7 @@ contains
             end associate
         end do
         call jrnl_close_unit(db)
+        db%opened = .false.      ! the process is gone, and its handle with it
     end subroutine crash_units
 
     subroutine check(cond, label)
@@ -230,7 +235,7 @@ contains
     ! transaction leaves its new bytes; an interrupted one is rolled back by
     ! recovery; an append is truncated away; duplicate regions log once.
     subroutine test_journal()
-        type(db_t) :: db
+        type(db_t), target :: db
         character(len=*), parameter   :: REL = 'jtest.bin'
         character(len=:), allocatable :: full
         integer :: st
@@ -354,7 +359,7 @@ contains
     ! is rolled back by the next read-write open and refused by a read-only
     ! open; a clean close deletes the (voided) journal file.
     subroutine test_lifecycle()
-        type(db_t) :: db, db2
+        type(db_t), target :: db, db2
         character(len=*), parameter   :: REL  = 'lc.bin'
         character(len=*), parameter   :: JPATH = TEST_DIR // '/_journal.dat'
         character(len=:), allocatable :: full
@@ -1147,7 +1152,7 @@ contains
     end subroutine
 
     subroutine test_empty_open_close()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: rs
         character(len=128) :: emsg
         call db_open(db, TEST_DIR, rs, emsg)
@@ -1158,7 +1163,7 @@ contains
     end subroutine
 
     subroutine test_create_table_and_insert()
-        type(db_t)     :: db
+        type(db_t), target     :: db
         type(column_t) :: c(3)
         integer        :: rs
         integer(int32) :: rid
@@ -1203,7 +1208,7 @@ contains
     end subroutine
 
     subroutine test_real_table_and_scan_stop()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(2)
         integer :: rs
         integer(int32) :: rid
@@ -1275,7 +1280,7 @@ contains
     ! three entry points: insert, update, and create-index over existing data.
     subroutine test_index_real_nan()
         use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(2)
         integer :: rs
         integer(int32) :: rid
@@ -1344,7 +1349,7 @@ contains
     ! (a plain binding, the table_index function binding, and the create_index
     ! / find_range generic bindings) to prove they dispatch to the same code.
     subroutine test_oo_bindings()
-        type(db_t)        :: db
+        type(db_t), target        :: db
         type(column_t)    :: c(3)
         type(db_cursor_t) :: cur
         integer           :: rs, n
@@ -1396,7 +1401,7 @@ contains
     end subroutine
 
     subroutine test_get_and_scan()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer    :: rs
         character(len=:), allocatable :: buf
         character(len=128) :: emsg
@@ -1426,7 +1431,7 @@ contains
     end subroutine
 
     subroutine test_delete()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer    :: rs
         character(len=:), allocatable :: buf
         character(len=128) :: emsg
@@ -1462,7 +1467,7 @@ contains
     end subroutine
 
     subroutine test_persistence()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer    :: rs
         character(len=:), allocatable :: buf
         character(len=128) :: emsg
@@ -1478,7 +1483,7 @@ contains
     end subroutine
 
     subroutine test_index_int()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer    :: rs
         integer(int32) :: rid
         character(len=128) :: emsg
@@ -1501,7 +1506,7 @@ contains
     end subroutine
 
     subroutine test_index_char()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer    :: rs
         integer(int32) :: rid
         character(len=128) :: emsg
@@ -1550,7 +1555,7 @@ contains
 
     subroutine test_range_cursor()
         character(len=*), parameter :: RDIR = 'utest_sqr_range_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(3)
         integer :: rs, ios, ti, n
         integer(int32) :: rid, ids(8)
@@ -1654,7 +1659,7 @@ contains
     ! generation guard rather than reading a stale/out-of-range slot.
     subroutine test_cursor_invalidation()
         character(len=*), parameter :: CDIR = 'utest_sqr_curinv_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(1)
         integer :: rs, ios, k
         integer(int32) :: rid
@@ -1728,7 +1733,7 @@ contains
         ! Runs after the age + name indices exist. Live people at this point:
         !   row 1 (pid 1, age 33, Alice), row 3 (pid 3, age 21, Carol),
         !   row 4 (pid 2, age 45, Bob); row 2 is a tombstone; next_id = 5.
-        type(db_t) :: db
+        type(db_t), target :: db
         integer    :: rs
         integer(int32) :: rid
         character(len=:), allocatable :: buf
@@ -1800,7 +1805,7 @@ contains
     end subroutine
 
     subroutine test_api_error_paths()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(3)
         integer :: rs
         integer(int32) :: rid
@@ -1859,7 +1864,7 @@ contains
     end subroutine
 
     subroutine test_validation()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c1(1), c2(2)
         integer :: rs
         character(len=128) :: emsg
@@ -1952,7 +1957,7 @@ contains
     ! db_open must create the intermediate directories (mkdir -p semantics)
     ! and the store must round-trip through that path.
     subroutine test_nested_dir()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: rs, ios
         character(len=128) :: emsg
         type(column_t) :: c(1)
@@ -1984,7 +1989,7 @@ contains
 
     subroutine test_readonly()
         character(len=*), parameter :: RO_DIR = 'utest_sqr_ro_db'
-        type(db_t) :: db_rw, db_ro
+        type(db_t), target :: db_rw, db_ro
         type(column_t) :: c(3)
         integer :: rs, ios
         integer(int32) :: rid
@@ -2063,7 +2068,7 @@ contains
     end subroutine
 
     subroutine test_drop_table()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer    :: rs
         character(len=128) :: emsg
         call db_open(db, TEST_DIR, rs, emsg)
@@ -2079,7 +2084,7 @@ contains
     end subroutine
 
     subroutine test_open_corruption_paths()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: rs, u, ios
         character(len=128) :: emsg
         character(len=4) :: magic
@@ -2175,7 +2180,7 @@ contains
     ! path-traversal sequence must be rejected as corruption on open, never
     ! followed out of the database directory (read_catalog re-validates it).
     subroutine test_catalog_traversal_name()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: rs, u, ios
         character(len=128) :: emsg
         character(len=4) :: magic
@@ -2206,7 +2211,7 @@ contains
     ! crash-window rows stay visible and the next insert does not overwrite a
     ! live row (the pre-fix silent corruption).
     subroutine test_crash_recovery()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: rs, j
         character(len=128) :: emsg
         type(column_t) :: c(1)
@@ -2271,7 +2276,7 @@ contains
 
     subroutine test_version_check()
         ! Manually create a schema file with a bad version, then try to open.
-        type(db_t) :: db
+        type(db_t), target :: db
         integer    :: rs, u, ios
         character(len=128) :: emsg
         character(len=4) :: magic
@@ -2308,7 +2313,7 @@ contains
     ! inconsistent, and confirm read_schema rejects each with SQR_INVALID
     ! rather than allocating from a bad count or indexing tbl%cols(0).
     subroutine test_schema_corruption()
-        type(db_t)      :: db
+        type(db_t), target      :: db
         type(column_t)  :: c(1)
         integer         :: rs
         character(len=128) :: emsg
@@ -2369,6 +2374,32 @@ contains
         call db_open(db, TEST_DIR, rs, emsg)
         call check(rs == SQR_INVALID, 'reject schema index key geometry')
 
+        ! D3: fixed-width sizes follow the creation rules, the layout still
+        ! adding up.  An INT cut to 1 byte (record 6 -> 3), a REAL cut to 4,
+        ! a CHAR above SQR_MAX_CHAR.
+        emsg = ''
+        call put_schema(1, 1, 3, 1, 0, 0, DT_INT, 1, 3, .false., 'x', 4)
+        call db_open(db, TEST_DIR, rs, emsg)
+        call check(rs == SQR_INVALID .and. index(emsg, 'corrupt column layout') > 0, &
+                   'reject schema INT column of 1 byte')
+        call put_schema(1, 1, 6, 1, 0, 0, DT_REAL, 4, 3, .false., 'x', 4)
+        call db_open(db, TEST_DIR, rs, emsg)
+        call check(rs == SQR_INVALID, 'reject schema REAL column of 4 bytes')
+        call put_schema(1, 1, SQR_MAX_CHAR + 3, 1, 0, 0, DT_CHAR, SQR_MAX_CHAR + 1, 3, &
+                        .false., 'x', 4)
+        call db_open(db, TEST_DIR, rs, emsg)
+        call check(rs == SQR_INVALID, 'reject schema CHAR column above SQR_MAX_CHAR')
+
+        ! D5: counts below the ceiling that cannot fit in the file
+        emsg = ''
+        call put_schema(1, 1000000, 6, 1, 0, 0, DT_INT, 4, 3, .false., 'x', 4)
+        call db_open(db, TEST_DIR, rs, emsg)
+        call check(rs == SQR_INVALID .and. index(emsg, 'corrupt schema header') > 0, &
+                   'reject schema claiming 1,000,000 columns in a small file')
+        call put_schema(1, 1, 6, 1, 0, 1000000, DT_INT, 4, 3, .false., 'x', 4)
+        call db_open(db, TEST_DIR, rs, emsg)
+        call check(rs == SQR_INVALID, 'reject schema claiming 1,000,000 indexes in a small file')
+
         ! a faithfully written schema still opens (guards against the checks
         ! being too strict and rejecting valid files)
         call put_schema(1, 1, 6, 1, 0, 0, DT_INT, 4, 3, .false., 'x', 4)
@@ -2410,7 +2441,7 @@ contains
 
     subroutine test_compact()
         character(len=*), parameter :: CDIR = 'utest_sqr_compact_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(3)
         integer :: rs, ios, ti, bsz_before, bsz_after
         integer(int32) :: rid
@@ -2558,7 +2589,209 @@ contains
         ok = (ios == 0)
     end subroutine
 
-    ! Create a zero-content file (used to fabricate the compact marker).
+    ! Write `text` as the whole content of `path` (fabricated markers).
+    subroutine put_text_file(path, text)
+        character(len=*), intent(in) :: path, text
+        integer :: u, ios
+        open(newunit=u, file=path, access='stream', form='unformatted', &
+             status='replace', action='write', iostat=ios)
+        if (ios /= 0) return
+        write(u, iostat=ios) text
+        close(u)
+    end subroutine
+
+    ! E11: an interrupted db_drop_table (the `_dropping` marker) is finished
+    ! by the next read-write open, whatever it had got through.
+    subroutine test_drop_marker()
+        character(len=*), parameter :: DDIR = 'utest_sqr_dropmark_db'
+        character(len=*), parameter :: VICTIM = 'utest_sqr_dropx_victim'
+        type(db_t), target :: db
+        integer :: rs, ios
+        logical :: ok
+        character(len=128) :: emsg
+
+        ! ---- marker + catalog still naming the table + all its files
+        call build_pair(DDIR)
+        call put_text_file(DDIR // '/_dropping', drop_marker_text('gone'))
+        call reopen_and_expect_gone(DDIR, 'drop marker, table still catalogued')
+
+        ! ---- marker + catalog without the table + the data file alone
+        call build_pair(DDIR)
+        call save_gone(DDIR)
+        call db_open(db, DDIR, rs, emsg)
+        call db_drop_table(db, 'gone', rs, emsg)
+        call db_close(db)
+        call copy_file(DDIR // '/gone.dat.keep', DDIR // '/gone.dat', ok)
+        call put_text_file(DDIR // '/_dropping', drop_marker_text('gone'))
+        call reopen_and_expect_gone(DDIR, 'drop marker, only the data file left')
+
+        ! ---- marker + catalog without the table + schema and one index
+        call build_pair(DDIR)
+        call save_gone(DDIR)
+        call db_open(db, DDIR, rs, emsg)
+        call db_drop_table(db, 'gone', rs, emsg)
+        call db_close(db)
+        call copy_file(DDIR // '/gone.schema.keep', DDIR // '/gone.schema', ok)
+        call copy_file(DDIR // '/gone__i1.idx.keep', DDIR // '/gone__i1.idx', ok)
+        call put_text_file(DDIR // '/_dropping', drop_marker_text('gone'))
+        call reopen_and_expect_gone(DDIR, 'drop marker, schema and an index left')
+
+        ! ---- marker alone
+        call build_pair(DDIR)
+        call db_open(db, DDIR, rs, emsg)
+        call db_drop_table(db, 'gone', rs, emsg)
+        call db_close(db)
+        call put_text_file(DDIR // '/_dropping', drop_marker_text('gone'))
+        call reopen_and_expect_gone(DDIR, 'drop marker alone')
+
+        ! ---- a read-only open is refused
+        call build_pair(DDIR)
+        call put_text_file(DDIR // '/_dropping', drop_marker_text('gone'))
+        call db_open(db, DDIR, rs, emsg, readonly=.true.)
+        call check(rs == SQR_READONLY .and. .not. db%opened, 'drop marker: read-only open refused')
+        call db_close(db)
+
+        ! ---- an untrusted name is refused before anything is touched
+        call build_pair(DDIR)
+        call put_text_file(VICTIM // '.dat', 'x')
+        call put_text_file(VICTIM // '.schema', 'x')
+        call put_text_file(DDIR // '/_dropping', drop_marker_text('../' // VICTIM))
+        emsg = ''
+        call db_open(db, DDIR, rs, emsg)
+        call check(rs == SQR_INVALID .and. index(emsg, 'corrupt drop marker') > 0, &
+                   'drop marker: a name with ../ is SQR_INVALID')
+        call check(c_path_exists(VICTIM // '.dat') .and. c_path_exists(VICTIM // '.schema'), &
+                   'drop marker: no file outside the directory touched')
+        call db_close(db)
+        ios = c_remove(VICTIM // '.dat'); ios = c_remove(VICTIM // '.schema')
+
+        ! ---- an incomplete marker (power lost before its contents were
+        ! durable, or a torn write) means no drop began: it is discarded
+        call expect_marker_discarded(DDIR, '', 'empty drop marker')
+        call expect_marker_discarded(DDIR, 'DROPgone' // repeat(achar(0), 4), &
+                                     'drop marker with a wrong check value')
+        call expect_marker_discarded(DDIR, repeat(achar(0), 20), 'zero-filled drop marker')
+        ios = c_rmtree(DDIR)
+    end subroutine
+
+    ! The `_dropping` marker db_drop_table writes for `name`: `DROP`, the
+    ! name, then the 4-byte checksum of the two - the engine's polynomial fold
+    ! (multiplier 31, modulus 2^31-1), written out here independently.
+    function drop_marker_text(name) result(t)
+        character(len=*), intent(in) :: name
+        character(len=:), allocatable :: t
+        integer(int64) :: acc
+        integer :: i
+        t = 'DROP' // name
+        acc = 0
+        do i = 1, len(t)
+            acc = mod(acc * 31_int64 + iachar(t(i:i)), 2147483647_int64)
+        end do
+        t = t // transfer(int(acc, int32), 'abcd')
+    end function
+
+    ! An incomplete marker `text` beside the build_pair tables: a read-only
+    ! open succeeds and leaves it; a writable open succeeds, removes it and
+    ! touches nothing else.
+    subroutine expect_marker_discarded(dir, text, label)
+        character(len=*), intent(in) :: dir, text, label
+        type(db_t), target :: db
+        integer :: rs, st1, st2
+        logical :: intact
+        character(len=128) :: emsg
+        call build_pair(dir)
+        call put_text_file(dir // '/_dropping', text)
+        emsg = ''
+        call db_open(db, dir, rs, emsg, readonly=.true.)
+        call check(rs == SQR_OK .and. db_table_index(db, 'gone') > 0, &
+                   label // ': a read-only open succeeds')
+        call db_close(db)
+        call check(c_path_exists(dir // '/_dropping'), label // ': the read-only open leaves it')
+        emsg = ''
+        call db_open(db, dir, rs, emsg)
+        call check(rs == SQR_OK, label // ': a writable open succeeds')
+        call check(.not. c_path_exists(dir // '/_dropping'), label // ': the marker is gone')
+        intact = .false.
+        if (rs == SQR_OK) then
+            call db_verify(db, 'keep', st1, emsg)
+            call db_verify(db, 'gone', st2, emsg)
+            intact = st1 == SQR_OK .and. st2 == SQR_OK .and. db_row_count(db, 'keep') == 1 &
+                     .and. db_row_count(db, 'gone') == 1
+        end if
+        call check(intact, label // ': every table intact')
+        call db_close(db)
+    end subroutine
+
+    ! test_drop_marker fixture: tables `keep` (one row) and `gone` (a row, a
+    ! TEXT value and an index on id, so it has all four kinds of file).
+    subroutine build_pair(dir)
+        character(len=*), intent(in) :: dir
+        type(db_t), target :: db
+        type(column_t) :: c(2)
+        integer :: rs, ios, ti
+        integer(int32) :: rid
+        character(len=:), allocatable :: buf
+        ios = c_rmtree(dir)
+        call db_open(db, dir, rs)
+        c(1)%name = 'id'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        call db_create_table(db, 'keep', c(1:1), rs)
+        c(2)%name = 'body'; c(2)%dtype = DT_TEXT; c(2)%csize = SQR_TEXT_DESC
+        call db_create_table(db, 'gone', c, rs)
+        ti = db_table_index(db, 'keep')
+        call row_alloc(buf, db%tables(ti)%record_size)
+        call row_set_int(buf, db%tables(ti)%cols(1), 1_int32)
+        call db_insert(db, 'keep', buf, rid, rs)
+        ti = db_table_index(db, 'gone')
+        call row_alloc(buf, db%tables(ti)%record_size)
+        call row_set_int(buf, db%tables(ti)%cols(1), 7_int32)
+        call db_insert(db, 'gone', buf, rid, rs)
+        call db_set_text(db, 'gone', rid, 'body', 'some text', rs)
+        call db_create_index(db, 'gone', 'id', rs)
+        call db_close(db)
+    end subroutine
+
+    ! Copies of `gone`'s files, to be put back after a real drop.
+    subroutine save_gone(dir)
+        character(len=*), intent(in) :: dir
+        character(len=*), parameter :: F(4) = [character(len=16) :: &
+            'gone.dat', 'gone.schema', 'gone.blob', 'gone__i1.idx']
+        integer :: k
+        logical :: ok
+        do k = 1, size(F)
+            call copy_file(dir // '/' // trim(F(k)), dir // '/' // trim(F(k)) // '.keep', ok)
+        end do
+    end subroutine
+
+    ! Open read-write and expect the interrupted drop of `gone` finished.
+    subroutine reopen_and_expect_gone(dir, label)
+        character(len=*), intent(in) :: dir, label
+        character(len=*), parameter :: F(4) = [character(len=16) :: &
+            'gone.dat', 'gone.schema', 'gone.blob', 'gone__i1.idx']
+        type(db_t), target :: db
+        type(column_t) :: c(1)
+        integer :: rs, k, st
+        logical :: left
+        character(len=128) :: emsg
+        emsg = ''
+        call db_open(db, dir, rs, emsg)
+        call check(rs == SQR_OK, label // ': opens')
+        if (rs /= SQR_OK) return
+        call check(db_table_index(db, 'gone') == 0 .and. db_table_index(db, 'keep') > 0, &
+                   label // ': the table is gone, the other kept')
+        left = .false.
+        do k = 1, size(F)
+            if (c_path_exists(dir // '/' // trim(F(k)))) left = .true.
+        end do
+        call check(.not. left, label // ': none of its files remain')
+        call check(.not. c_path_exists(dir // '/_dropping'), label // ': the marker is gone')
+        c(1)%name = 'id'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        call db_create_table(db, 'gone', c, rs, emsg)
+        call check(rs == SQR_OK, label // ': the name can be created again')
+        call db_verify(db, 'keep', st, emsg)
+        call check(st == SQR_OK .and. db_row_count(db, 'keep') == 1, label // ': the database verifies')
+        call db_close(db)
+    end subroutine
+
     subroutine touch_file(path)
         character(len=*), intent(in) :: path
         integer :: u, ios
@@ -2575,7 +2808,7 @@ contains
     subroutine test_compact_recovery()
         character(len=*), parameter :: RDIR = 'utest_sqr_reco_db'
         character(len=*), parameter :: REF  = 'utest_sqr_reco_ref'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(2)
         integer :: rs, ios, ti
         integer(int32) :: rid
@@ -2694,7 +2927,7 @@ contains
     subroutine test_deep_tree()
         character(len=*), parameter :: DDIR = 'utest_sqr_deep_db'
         integer, parameter :: NROW = 5000, BATCH = 500
-        type(db_t) :: db
+        type(db_t), target :: db
         type(db_cursor_t) :: cur
         type(column_t) :: c(2)
         integer :: rs, ios, ti, k, b, base, cnt
@@ -2808,7 +3041,7 @@ contains
     ! H1/H6 live had zero coverage.
     subroutine test_torn_journal()
         character(len=*), parameter :: JDIR = 'utest_sqr_torn_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(1)
         integer :: rs, ios, u
         integer(int32) :: rid
@@ -2944,7 +3177,7 @@ contains
     ! take the way out and check the one committed row (v = 7) is as it was.
     subroutine torn_refused(jdir, jpath, what)
         character(len=*), intent(in) :: jdir, jpath, what
-        type(db_t) :: db
+        type(db_t), target :: db
         character(len=:), allocatable :: buf
         character(len=256) :: why
         integer :: rs, r
@@ -3013,7 +3246,7 @@ contains
     ! from the gap — a wild allocate reached from nothing but a reopen.
     subroutine test_schema_next_id()
         character(len=*), parameter :: NDIR = 'utest_sqr_nextid_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(1)
         integer :: rs, ios, u, k
         integer(int32) :: rid
@@ -3079,7 +3312,7 @@ contains
     ! at all on a leaf chain that cycles.
     subroutine test_corrupt_index()
         character(len=*), parameter :: CDIR = 'utest_sqr_badidx_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(db_cursor_t) :: cur
         type(column_t) :: c(1)
         integer :: rs, ios, k, ti
@@ -3162,7 +3395,7 @@ contains
         character(len=*), parameter :: PDIR  = 'utest_sqr_packbig_db'
         character(len=*), parameter :: PFILE = 'utest_sqr_packbig.sqr'
         integer(int64),   parameter :: GIB = 1073741824_int64
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(1)
         character(len=128) :: emsg
         integer :: rs, ios
@@ -3223,7 +3456,7 @@ contains
         character(len=*), parameter :: PDIR2 = 'utest_sqr_pack_db2'
         character(len=*), parameter :: EVIL  = 'utest_sqr_pack_evil'
         character(len=*), parameter :: PFILE = 'utest_sqr_pack.sqr'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(3)
         integer :: rs, ios, ti, u, k
         integer(int32) :: rid
@@ -3449,11 +3682,162 @@ contains
     ! flushes and drops the file units while the handle and its exclusive lock
     ! stay held, so another reader — db_pack's stream units — can read the
     ! directory without breaking the one-file-one-unit rule.
+    ! E9: a db_resume that failed part-way can be retried; the retry opens
+    ! only what is still closed.
+    subroutine test_resume_retry()
+        character(len=*), parameter :: RDIR = 'utest_sqr_resume_db'
+        type(db_t), target :: db
+        type(column_t) :: c(2)
+        integer :: rs, ios, ti, dunit
+        integer(int32) :: rid
+        character(len=:), allocatable :: buf
+        character(len=128) :: emsg
+        ios = c_rmtree(RDIR)
+        c(1)%name = 'id' ; c(1)%dtype = DT_INT  ; c(1)%csize = 4
+        c(2)%name = 'tag'; c(2)%dtype = DT_CHAR ; c(2)%csize = 4
+        call db_open(db, RDIR, rs, emsg)
+        call db_create_table(db, 'items', c, rs, emsg)
+        ti = db_table_index(db, 'items')
+        call row_alloc(buf, db%tables(ti)%record_size)
+        call row_set_int (buf, db%tables(ti)%cols(1), 10_int32)
+        call row_set_char(buf, db%tables(ti)%cols(2), 't1')
+        call db_insert(db, 'items', buf, rid, rs)
+        call db_create_index(db, 'items', 'id', rs)
+        call db_quiesce(db, rs, emsg)
+        ios = c_rename(RDIR // '/items__i1.idx', RDIR // '/items__i1.idx.away')
+        call db_resume(db, rs, emsg)
+        call check(rs /= SQR_OK .and. db%quiesced, 'resume retry: a missing index fails, still quiesced')
+        dunit = db%tables(ti)%unit
+        call check(dunit /= -1, 'resume retry: the data file was reopened before the failure')
+        ios = c_rename(RDIR // '/items__i1.idx.away', RDIR // '/items__i1.idx')
+        call db_resume(db, rs, emsg)
+        call check(rs == SQR_OK .and. .not. db%quiesced, 'resume retry: the second resume succeeds')
+        call check(db%tables(ti)%unit == dunit, 'resume retry: the data unit is not reopened')
+        call db_verify(db, 'items', rs, emsg)
+        call check(rs == SQR_OK, 'resume retry: verify passes')
+        call row_set_int (buf, db%tables(ti)%cols(1), 20_int32)
+        call row_set_char(buf, db%tables(ti)%cols(2), 't2')
+        call db_insert(db, 'items', buf, rid, rs)
+        call check(rs == SQR_OK, 'resume retry: an insert works')
+        call db_find_by_int(db, 'items', 'id', 20_int32, rid, rs)
+        call check(rs == SQR_OK .and. rid == 2, 'resume retry: an indexed find works')
+        call db_close(db)
+        ios = c_rmtree(RDIR)
+    end subroutine
+
+    ! E10: undo/redo on a closed handle; db_open on an open one.
+    subroutine test_handle_misuse()
+        character(len=*), parameter :: MDIR = 'utest_sqr_misuse_db'
+        type(db_t), target :: db
+        type(column_t) :: c(1)
+        integer :: rs, ios, ti
+        integer(int32) :: rid
+        character(len=:), allocatable :: buf
+        character(len=128) :: emsg
+        ios = c_rmtree(MDIR)
+        c(1)%name = 'id'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        call db_open(db, MDIR, rs, emsg)
+        call db_create_table(db, 't', c, rs, emsg)
+        ti = db_table_index(db, 't')
+        call row_alloc(buf, db%tables(ti)%record_size)
+        call row_set_int(buf, db%tables(ti)%cols(1), 1_int32)
+        call db_begin(db, rs, label='first')
+        call db_insert(db, 't', buf, rid, rs)
+        call db_commit(db, rs)
+        call db_undo(db, rs)                   ! leaves one redo step
+        call db_redo(db, rs)                   ! and back: one undo step
+        call check(db_can_undo(db), 'misuse: a gesture can be undone')
+        call db_close(db)
+        call check(.not. db_can_undo(db) .and. .not. db_can_redo(db), &
+                   'misuse: a closed handle has no undo or redo')
+        call db_undo(db, rs)
+        call check(rs == SQR_INVALID, 'misuse: undo on a closed handle is SQR_INVALID')
+        call db_redo(db, rs)
+        call check(rs == SQR_INVALID, 'misuse: redo on a closed handle is SQR_INVALID')
+
+        call db_open(db, MDIR, rs, emsg)
+        ti = db_table_index(db, 't')
+        call row_set_int(buf, db%tables(ti)%cols(1), 2_int32)
+        call db_insert(db, 't', buf, rid, rs)
+        emsg = ''
+        call db_open(db, MDIR, rs, emsg)
+        call check(rs == SQR_INVALID .and. index(emsg, 'already open') > 0, &
+                   'misuse: db_open on an open handle is SQR_INVALID')
+        call check(db%opened .and. db_row_count(db, 't') == 2, 'misuse: the open handle is untouched')
+        call db_get(db, 't', rid, buf, rs)
+        call check(rs == SQR_OK .and. row_get_int(buf, db%tables(ti)%cols(1)) == 2_int32, &
+                   'misuse: its row is still readable')
+        call row_set_int(buf, db%tables(ti)%cols(1), 3_int32)
+        call db_insert(db, 't', buf, rid, rs)
+        call check(rs == SQR_OK, 'misuse: and it still takes an insert')
+        call db_close(db, rs)
+        call check(rs == SQR_OK, 'misuse: it closes')
+        call db_open(db, MDIR, rs, emsg)
+        call check(rs == SQR_OK .and. db_row_count(db, 't') == 3, 'misuse: and opens again')
+        call db_close(db)
+        ios = c_rmtree(MDIR)
+    end subroutine
+
+    ! E12: a structural operation refused for a bad argument keeps the history.
+    subroutine test_history_kept_on_refusal()
+        character(len=*), parameter :: HDIR = 'utest_sqr_histkeep_db'
+        type(db_t), target :: db
+        type(column_t) :: c(2), extra
+        integer :: rs, ios, ti, ep, bad
+        integer(int32) :: rid
+        character(len=:), allocatable :: buf
+        character(len=128) :: emsg
+        ios = c_rmtree(HDIR)
+        c(1)%name = 'id'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        c(2)%name = 'n' ; c(2)%dtype = DT_INT; c(2)%csize = 4
+        extra%name = 'x'; extra%dtype = DT_INT; extra%csize = 4
+        call db_open(db, HDIR, rs, emsg)
+        call db_create_table(db, 't', c, rs, emsg)
+        call db_create_index(db, 't', 'id', rs)
+        ti = db_table_index(db, 't')
+        call row_alloc(buf, db%tables(ti)%record_size)
+        call row_set_int(buf, db%tables(ti)%cols(1), 1_int32)
+        call db_begin(db, rs, label='g')
+        call db_insert(db, 't', buf, rid, rs)
+        call db_commit(db, rs)
+        call check(db_can_undo(db), 'history kept: the gesture is undoable')
+        ep = db%hist%epoch
+        bad = 0
+        call db_drop_table(db, 'nosuch', rs)
+        if (rs == SQR_OK) bad = bad + 1
+        call db_compact(db, 'nosuch', rs)
+        if (rs == SQR_OK) bad = bad + 1
+        call db_add_column(db, 'nosuch', extra, rs)
+        if (rs == SQR_OK) bad = bad + 1
+        call db_drop_column(db, 'nosuch', 'n', rs)
+        if (rs == SQR_OK) bad = bad + 1
+        call db_drop_column(db, 't', 'nosuch', rs)
+        if (rs == SQR_OK) bad = bad + 1
+        call db_create_index(db, 'nosuch', 'n', rs)
+        if (rs == SQR_OK) bad = bad + 1
+        call db_create_index(db, 't', 'nosuch', rs)
+        if (rs == SQR_OK) bad = bad + 1
+        call db_create_index(db, 't', 'id', rs)
+        if (rs == SQR_OK) bad = bad + 1   ! exists already
+        call db_drop_index(db, 'nosuch', 'id', rs)
+        if (rs == SQR_OK) bad = bad + 1
+        call db_drop_index(db, 't', 'n', rs)
+        if (rs == SQR_OK) bad = bad + 1   ! no such index
+        call check(bad == 0, 'history kept: each bad request is refused')
+        call check(db_can_undo(db) .and. db%hist%epoch == ep, &
+                   'history kept: refusals leave the undo step and the epoch')
+        call db_add_column(db, 't', extra, rs)
+        call check(rs == SQR_OK .and. .not. db_can_undo(db), &
+                   'history kept: a valid structural change empties it')
+        call db_close(db)
+        ios = c_rmtree(HDIR)
+    end subroutine
+
     subroutine test_quiesce()
         character(len=*), parameter :: QDIR  = 'utest_sqr_quiesce_db'
         character(len=*), parameter :: QDIR2 = 'utest_sqr_quiesce_db2'
         character(len=*), parameter :: QFILE = 'utest_sqr_quiesce.sqr'
-        type(db_t) :: db, restored
+        type(db_t), target :: db, restored
         type(column_t) :: c(3)
         integer :: rs, ios, ti, k
         integer(int32) :: rid
@@ -3543,7 +3927,7 @@ contains
     subroutine test_natural_keys()
         character(len=*), parameter :: NK = 'utest_sqr_nk_db'
         character(len=6), parameter :: KEYCOLS(2) = [character(len=6) :: 'sku', 'region']
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(3), d(1)
         integer :: rs, ios, ti, td
         integer(int32) :: rid
@@ -3677,7 +4061,7 @@ contains
     ! raise() no-stat branch (library-must-not-crash contract).
     subroutine test_coverage_paths()
         character(len=*), parameter :: CV = 'utest_sqr_cov_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t), allocatable :: zc(:), big(:)
         type(column_t) :: bad(1)
         integer :: rs, ios, i
@@ -3749,7 +4133,7 @@ contains
     subroutine test_large_blob()
         character(len=*), parameter :: LB_DIR = 'utest_sqr_blob_db'
         integer, parameter :: NBIG = 1048576          ! 1 MiB
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(2)
         integer :: rs, ios
         integer(int32) :: rid
@@ -3788,7 +4172,7 @@ contains
 
     subroutine test_text()
         character(len=*), parameter :: TXT_DIR = 'utest_sqr_text_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(2), cbad(1)
         integer :: rs, ios
         integer(int32) :: rid
@@ -3919,7 +4303,7 @@ contains
     subroutine test_high_findings()
         use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan
         character(len=*), parameter :: HF_DIR = 'utest_sqr_hf_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(4)
         type(db_cursor_t) :: cur
         integer :: rs, ios, ti
@@ -4121,7 +4505,7 @@ contains
 
     subroutine test_null_columns()
         character(len=*), parameter :: NDIR = 'utest_sqr_null_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(3)
         integer :: rs, ios, ti, n, rsz
         integer(int32) :: rid, ids(8)
@@ -4223,7 +4607,7 @@ contains
         character(len=8), parameter :: AB(2) = [character(len=8) :: 'a', 'b']
         character(len=8), parameter :: XY(2) = [character(len=8) :: 'x', 'y']
         logical, parameter :: NUL = .true., SET = .false.
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(3), cr(3)
         integer :: rs, ios, ti, tr, n
         integer(int32) :: rid, ids(16), rids(2)
@@ -4451,7 +4835,7 @@ contains
         character(len=*), parameter :: FIX   = 'test/fixtures/v1_null.sqr'
         character(len=*), parameter :: UDIR  = 'utest_sqr_upgrade_db'
         character(len=*), parameter :: UDIR2 = 'utest_sqr_upgrade2_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: rs, ios, ti, n, u
         integer(int32) :: rid, ids(16)
         integer(int64) :: isz
@@ -4562,7 +4946,7 @@ contains
 
     subroutine test_leading_column()
         character(len=*), parameter :: LDIR = 'utest_sqr_lead_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(3), c2(2)
         integer :: rs, ios, ti, n
         integer(int32) :: ids(16)
@@ -4647,7 +5031,7 @@ contains
     ! the leading value: the one returned is the first in key order.
     subroutine test_find_by_leading()
         character(len=*), parameter :: LDIR = 'utest_sqr_findlead_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(3), c2(2)
         integer :: rs, ios, ti
         integer(int32) :: rid, r_lo, r_hi, r_eu1, r_eu3
@@ -4734,7 +5118,7 @@ contains
 
     subroutine test_drop_index()
         character(len=*), parameter :: DDIR = 'utest_sqr_dropidx_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(3)
         integer :: rs, ios, ti
         integer(int32) :: rid
@@ -4825,7 +5209,7 @@ contains
     ! and add together, matched by name, row ids and survivors' values kept.
     subroutine test_reshape_table()
         character(len=*), parameter :: RDIR = 'utest_sqr_reshape_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(4), t2(4), bad(2)
         integer :: rs, ios, ti, gen0
         integer(int32) :: rid
@@ -4927,7 +5311,7 @@ contains
     ! swap and the table reads in the new layout.
     subroutine test_alter_recovery()
         character(len=*), parameter :: ODIR = 'utest_sqr_altrec_db', TDIR = 'utest_sqr_altrec_twin'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(3), t2(2)
         integer :: rs, ios, ti, k
         character(len=:), allocatable :: buf
@@ -4987,7 +5371,7 @@ contains
         character(len=*), parameter :: ODIR = 'utest_sqr_alttext_db', TDIR = 'utest_sqr_alttext_twin'
         character(len=*), parameter :: STAGES(3) = [character(len=24) :: 'nothing renamed', &
             'blob file renamed', 'orphan blob file present']
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: bio
         integer :: rs, ios, ti, k
         character(len=:), allocatable :: txt, tag
@@ -5084,7 +5468,7 @@ contains
     ! A two-row people(pid, age, name) table with a name index (altrec fixture).
     subroutine altrec_people(dir)
         character(len=*), intent(in) :: dir
-        type(db_t) :: d
+        type(db_t), target :: d
         type(column_t) :: c(3)
         integer :: r, tj
         character(len=:), allocatable :: b
@@ -5102,7 +5486,7 @@ contains
 
     subroutine test_alter_column()
         character(len=*), parameter :: ADIR = 'utest_sqr_alter_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(3), nc
         integer :: rs, ios, ti, rsz0, rsz1
         integer(int32) :: rid
@@ -5255,7 +5639,7 @@ contains
 
     subroutine test_db_verify()
         character(len=*), parameter :: VDIR = 'utest_sqr_verify_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(3)
         integer :: rs, ios, ti, rsz, u
         character(len=:), allocatable :: buf
@@ -5325,7 +5709,7 @@ contains
     ! adjacent-pair comparison missed a duplicate split by a dead entry.
     subroutine test_verify_dup_split_by_dead()
         character(len=*), parameter :: VDIR = 'utest_sqr_dupdead_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(3)
         integer :: rs, ios, ti, rsz, u
         character(len=:), allocatable :: buf
@@ -5372,7 +5756,7 @@ contains
     ! Review §3: db_list_tables on a handle that was never opened must
     ! return an empty list, not reference an unallocated array.
     subroutine test_list_tables_closed()
-        type(db_t) :: db
+        type(db_t), target :: db
         character(len=SQR_NAME_LEN), allocatable :: names(:)
         call db_list_tables(db, names)
         call check(size(names) == 0, 'list_tables: closed handle -> empty list')
@@ -5382,7 +5766,7 @@ contains
     ! no leaked unit, no orphan .dat/.schema files, no phantom table.
     subroutine test_create_table_cleanup()
         character(len=*), parameter :: CDIR = 'utest_sqr_ctfail_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(2), ct(2)
         integer :: rs, ios, u
         character(len=128) :: emsg
@@ -5428,7 +5812,7 @@ contains
     ! Slice B: the db_record_size enquiry apps size their buffers with.
     subroutine test_record_size()
         character(len=*), parameter :: RDIR = 'utest_sqr_rsz_db'
-        type(db_t) :: db, never_opened
+        type(db_t), target :: db, never_opened
         type(column_t) :: c(2)
         integer :: rs, ios, ti
         character(len=128) :: emsg
@@ -5444,6 +5828,21 @@ contains
         call check(db_record_size(db, 'nosuch') == 0, 'record_size: unknown table -> 0')
         call check(db_record_size(never_opened, 't') == 0, 'record_size: closed handle -> 0')
         call check(db%record_size('t') == db_record_size(db, 't'), 'record_size: type-bound form')
+        ! D5: 40,000 CHAR(65536) columns sum past huge(0); refused, not wrapped
+        wide: block
+            type(column_t), allocatable :: w(:)
+            integer :: k
+            allocate(w(40000))
+            do k = 1, size(w)
+                write(w(k)%name, '(a,i0)') 'c', k
+                w(k)%dtype = DT_CHAR; w(k)%csize = SQR_MAX_CHAR
+            end do
+            emsg = ''
+            call db_create_table(db, 'wide', w, rs, emsg)
+            call check(rs == SQR_INVALID .and. index(emsg, 'record size too large') > 0 .and. &
+                       db_table_index(db, 'wide') == 0, &
+                       'record_size: 40,000 CHAR(65536) columns refused')
+        end block wide
         call db_close(db)
         ios = c_rmtree(RDIR)
     end subroutine
@@ -5452,7 +5851,7 @@ contains
     ! reads stay tolerant of the caller's buffer length.
     subroutine test_strict_write_length()
         character(len=*), parameter :: WDIR = 'utest_sqr_strict_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(2)
         integer :: rs, ios, ti, rsz
         integer(int32) :: rid, rids(2)
@@ -5505,7 +5904,7 @@ contains
     ! Slice B: the int32 row-id space is guarded (SQR_FULL), not wrapped.
     subroutine test_row_id_exhaustion()
         character(len=*), parameter :: FDIR = 'utest_sqr_full_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(1)
         integer :: rs, ios, ti
         integer(int32) :: rid, rids(2)
@@ -5537,7 +5936,7 @@ contains
     ! the same database must still be refused.
     subroutine test_readonly_media_lock()
         character(len=*), parameter :: MDIR = 'utest_sqr_romedia_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(1)
         integer :: rs, ios, ti
         integer(int32) :: rid
@@ -5593,7 +5992,7 @@ contains
     ! for the session, and a clean close must still delete the file.
     subroutine test_clean_close()
         character(len=*), parameter :: CDIR = 'utest_sqr_cleanclose_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(1)
         integer :: rs, ios, ti
         logical :: enforced
@@ -5651,7 +6050,7 @@ contains
     ! wording can evolve).
     subroutine test_engine_errmsg()
         character(len=*), parameter :: EDIR = 'utest_sqr_errmsg_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(2), big(16)
         integer :: rs, ios, i
         character(len=256) :: emsg
@@ -5696,7 +6095,7 @@ contains
     ! Review §5.5: a record sized close to SQR_MAX_RECORD must round-trip.
     subroutine test_wide_table()
         character(len=*), parameter :: WDIR = 'utest_sqr_wide_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(16)
         integer :: rs, ios, ti, i, rsz
         integer(int32) :: rid
@@ -5737,7 +6136,7 @@ contains
     ! fires and the scan reports SQR_OK.
     subroutine test_scan_empty()
         character(len=*), parameter :: SDIR = 'utest_sqr_scan0_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(2)
         type(scan_ctx_t) :: ctx
         integer :: rs, ios, ti
@@ -5760,7 +6159,7 @@ contains
     subroutine test_name_boundary()
         character(len=*), parameter :: NDIR = 'utest_sqr_name_db'
         character(len=32), parameter :: N32 = repeat('abcd', 8)   ! exactly SQR_NAME_LEN
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(1)
         integer :: rs, ios
         character(len=128) :: emsg
@@ -5783,7 +6182,7 @@ contains
     ! miss the old ones, and verify clean.
     subroutine test_index_reopen_after_removes()
         character(len=*), parameter :: RDIR = 'utest_sqr_reopen_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(2)
         integer :: rs, ios, ti, i
         integer(int32) :: rid, r
@@ -5827,7 +6226,7 @@ contains
     ! Review §5.5: idx_live asserted directly around create/drop.
     subroutine test_idx_live_direct()
         character(len=*), parameter :: LDIR = 'utest_sqr_idxlive_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(2)
         integer :: rs, ios, ti
         character(len=128) :: emsg
@@ -5852,7 +6251,7 @@ contains
 
     subroutine test_insert_many()
         character(len=*), parameter :: BDIR = 'utest_sqr_batch_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(2)
         integer :: rs, ios, ti, rsz, k, nid0
         integer(int32) :: rid, rids(4)
@@ -5985,7 +6384,7 @@ contains
     ! without a subprocess.
     subroutine test_locking()
         character(len=*), parameter :: LDIR = 'utest_sqr_lock_db'
-        type(db_t) :: a, b, c
+        type(db_t), target :: a, b, c
         type(column_t) :: cols(1)
         integer :: rs, ios
         ios = c_rmtree(LDIR)
@@ -6037,7 +6436,7 @@ contains
     ! read-only connections may attach, and makes the handle refuse writes.
     subroutine test_set_readonly()
         character(len=*), parameter :: SDIR = 'utest_sqr_setro_db'
-        type(db_t) :: a, b
+        type(db_t), target :: a, b
         type(column_t) :: cols(1)
         integer :: rs, ios
         ios = c_rmtree(SDIR)
@@ -6080,7 +6479,7 @@ contains
     ! demotion itself must save the row counters a writer keeps in memory.
     subroutine test_set_readonly_counters()
         character(len=*), parameter :: SDIR = 'utest_sqr_setroc_db'
-        type(db_t) :: a
+        type(db_t), target :: a
         type(column_t) :: cols(1)
         character(len=:), allocatable :: buf
         character(len=128) :: emsg
@@ -6139,7 +6538,7 @@ contains
     ! The procedural metadata surface: db_describe / db_row_count / db_in_txn.
     subroutine test_accessors()
         character(len=*), parameter :: ADIR = 'utest_sqr_acc_db'
-        type(db_t) :: a
+        type(db_t), target :: a
         type(column_t) :: cols(2)
         type(column_t), allocatable :: got(:)
         character(len=:), allocatable :: buf
@@ -6187,7 +6586,7 @@ contains
     ! Sticky error state (db_last_error) and the uniform errmsg argument.
     subroutine test_last_error()
         character(len=*), parameter :: EDIR = 'utest_sqr_lerr_db'
-        type(db_t) :: a
+        type(db_t), target :: a
         type(column_t) :: cols(1)
         type(column_t), allocatable :: laid(:)
         character(len=:), allocatable :: buf, msg
@@ -6250,7 +6649,7 @@ contains
     ! flushes are kept, so txns, rollback and reopen behave identically; only
     ! crash-durability is traded away (for scratch stores a host can rebuild).
     subroutine test_durable_off()
-        type(db_t) :: a
+        type(db_t), target :: a
         character(len=*), parameter :: DDIR = 'utest_sqr_dur'
         character(len=:), allocatable :: buf
         integer :: rs, i, got, ios

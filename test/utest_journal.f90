@@ -92,7 +92,7 @@ contains
     ! base overwrite, then drop the advisory lock so the recovering open is not
     ! blocked by this same-process stand-in for the crashed writer.
     subroutine arm_hot()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: st, r
         r = c_rmtree(DIR)
         call db_open(db, DIR, stat=st)
@@ -116,7 +116,7 @@ contains
             end subroutine perturb
         end interface
         logical, intent(in) :: expect_rollback
-        type(db_t) :: db2
+        type(db_t), target :: db2
         integer :: st
 
         call arm_hot()
@@ -145,7 +145,7 @@ contains
             subroutine perturb()
             end subroutine perturb
         end interface
-        type(db_t) :: db2
+        type(db_t), target :: db2
         integer :: st, r
         character(len=256) :: emsg
 
@@ -173,7 +173,7 @@ contains
     ! rollback then undoes the two that were written, and the limit is per
     ! transaction: the next one starts from zero.
     subroutine payload_limit_raw()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: st, r
         character(len=:), allocatable :: msg
         r = c_rmtree(DIR)
@@ -213,7 +213,7 @@ contains
     ! commit rolls everything back, and the table is intact afterwards.  An
     ! auto-committed insert that hits it rolls itself back.
     subroutine payload_limit_api()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(1)
         character(len=:), allocatable :: buf
         character(len=128) :: emsg
@@ -283,7 +283,7 @@ contains
     ! whole, so every row comes back exactly as it was.
     subroutine partial_record_rollback()
         integer, parameter :: NROWS = 3
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(1)
         character(len=:), allocatable :: buf, want(:), got
         character(len=128) :: emsg
@@ -329,7 +329,7 @@ contains
         character(len=*), intent(in) :: label
         integer(int64),   intent(in) :: left
         logical,          intent(in) :: expect_whole
-        type(db_t) :: db, db2
+        type(db_t), target :: db, db2
         integer :: st, r
         r = c_rmtree(DIR)
         call db_open(db, DIR, stat=st)
@@ -353,7 +353,7 @@ contains
 
     ! The same record through an in-process rollback.
     subroutine tail_rollback()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: st, r
         r = c_rmtree(DIR)
         call db_open(db, DIR, stat=st)

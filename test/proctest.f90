@@ -94,7 +94,7 @@ contains
     ! db_close could rewrite the schema.
     subroutine run_child(scenario)
         character(len=*), intent(in) :: scenario
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: rs, ti, i, n
         integer(int32) :: rid
         character(len=:), allocatable :: buf
@@ -137,7 +137,7 @@ contains
     subroutine one_round(scenario, pass, fail)
         character(len=*), intent(in)    :: scenario
         integer,          intent(inout) :: pass, fail
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: rs, ti, code, want_live, i
         integer(int64) :: pid
         integer(int32) :: rid

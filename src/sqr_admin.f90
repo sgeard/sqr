@@ -38,8 +38,6 @@ contains
         call clear_last_err(db)
         if (readonly_block(db, stat, errmsg)) return
         if (txn_block(db, stat, errmsg)) return
-        db%generation = db%generation + 1   ! structural change: invalidate cursors
-        call db_reset_history(db)           ! index-set change ⇒ captured undo/redo steps can't replay
         ti = db_table_index(db, table_name)
         if (ti == 0) then
             call set_last_err(db, SQR_NOT_FOUND, 'no such table: ' // trim(table_name))
@@ -52,28 +50,43 @@ contains
                 call report(db, SQR_NOT_FOUND, stat, errmsg)
                 return
             end if
-            ! Tombstone the slot (ncols = 0) rather than removing it: the
-            ! __i<slot> file names of surviving indices stay valid and a later
-            ! db_create_index simply appends a fresh slot. Close the tree first.
+            ! Nothing irreversible before the schema write succeeds.  The slot
+            ! is tombstoned (ncols = 0) rather than removed, so the __i<slot>
+            ! file names of surviving indices stay valid; its fields are saved
+            ! first and its tree stays open, so a failed write puts the index
+            ! back exactly as it was - live in memory, in the schema and on disk,
+            ! with the history and generation untouched.
             associate (ix => t%indices(j))
-                call bt_discard(ix%bt)       ! file is deleted below
-                ix%ncols    = 0
-                ix%key_size = 0
-                ix%nentries = 0
-                ix%unique   = .false.
-                if (allocated(ix%columns)) deallocate(ix%columns)
-                if (allocated(ix%col_idx)) deallocate(ix%col_idx)
-                if (allocated(ix%key_off)) deallocate(ix%key_off)
+                saved: block
+                    integer :: ncols, key_size, nentries
+                    logical :: unique
+                    character(len=SQR_NAME_LEN), allocatable :: columns(:)
+                    integer, allocatable :: col_idx(:), key_off(:)
+                    ncols = ix%ncols; key_size = ix%key_size
+                    nentries = ix%nentries; unique = ix%unique
+                    call move_alloc(ix%columns, columns)
+                    call move_alloc(ix%col_idx, col_idx)
+                    if (allocated(ix%key_off)) call move_alloc(ix%key_off, key_off)
+                    call tombstone_slot(ix)
+                    ! Persist the tombstone BEFORE deleting the file
+                    ! (catalog-first discipline, as in db_drop_table): a crash
+                    ! after it leaves an orphaned file the dead slot ignores, not
+                    ! a live slot with no file.
+                    call write_schema(db, t, rs)
+                    if (rs /= SQR_OK) then
+                        ix%ncols = ncols; ix%key_size = key_size
+                        ix%nentries = nentries; ix%unique = unique
+                        call move_alloc(columns, ix%columns)
+                        call move_alloc(col_idx, ix%col_idx)
+                        if (allocated(key_off)) call move_alloc(key_off, ix%key_off)
+                        call report(db, rs, stat, errmsg)
+                        return
+                    end if
+                end block saved
+                db%generation = db%generation + 1   ! structural change: invalidate cursors
+                call db_reset_history(db)           ! index-set change ⇒ captured undo/redo steps can't replay
+                call bt_discard(ix%bt)              ! file is deleted next
             end associate
-            ! Persist the tombstone BEFORE deleting the file (catalog-first
-            ! discipline, as in db_drop_table): if write_schema fails the file
-            ! and its still-live slot are intact; a crash after it leaves an
-            ! orphaned file the dead slot ignores, not a live slot with no file.
-            call write_schema(db, t, rs)
-            if (rs /= SQR_OK) then
-                call report(db, rs, stat, errmsg)
-                return
-            end if
             call remove_file(index_path(db, t%name, j))
         end associate
         call report(db, SQR_OK, stat, errmsg)

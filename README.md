@@ -130,6 +130,12 @@ call db_find_by_int(db, 'people', 'id', 1_int32, rid, st)
 call db_close(db, st)
 ```
 
+The handle is declared `target`, and must be: while a transaction is open
+(every write opens one) the index trees hold a pointer to it.  A handle held
+inside another type needs that variable to be the target.  `db_open`
+refuses a handle that is already open (`SQR_INVALID`, the open database
+left as it was): `db_close` it first.
+
 Wrap a group of changes in an explicit transaction when you need them to
 commit (and fail) as a unit:
 
@@ -204,6 +210,8 @@ call db_redo(db, st, label)    ! ...and back
 
 Every `db_*` procedure also has a type-bound equivalent on `db_t`
 (`db%open`, `db%insert`, `db%create_index`, …).
+
+Declare every handle `type(db_t), target` (see the quick start).
 
 ---
 
@@ -466,6 +474,7 @@ A database is a directory containing:
 | `<table>__i<slot>.idx`| one paged B+-tree per secondary index               |
 | `_journal.dat`        | rollback (undo) journal; present only while a txn is open or pending recovery |
 | `_lock`               | zero-byte sentinel carrying the advisory open lock  |
+| `_dropping`           | names a table whose `db_drop_table` is under way; present only until the drop finishes |
 
 A table's files are named after it, so `db_create_table` and
 `CREATE TABLE` hold a new table's name to a plain set:
@@ -660,6 +669,20 @@ Three behaviours of that path are worth knowing:
   middle of a rollback the journal stays on disk and every write on that
   handle is refused with `SQR_ERR` until the database is closed and
   reopened, which completes the rollback. Reads still work.
+- **A compact or column change that fails past its commit point wedges the
+  table**, as does a compact, column change or drop table whose marker
+  could not be written or withdrawn cleanly. The files on disk are consistent and the next read-write open
+  finishes the job, but for the rest of the session reads of that table fail
+  and every write on the handle is refused with `SQR_ERR` ('table "<t>"
+  needs recovery: close and reopen the database'). `db_close` still
+  succeeds.
+- **A drop table interrupted by a crash is finished by the next open.**
+  `db_drop_table` writes `_dropping` first; the next read-write open (or the
+  same handle's `db_close`, after a failure) removes whatever is left of the
+  table, so its name can be used again. A read-only open that finds the
+  marker is refused with `SQR_READONLY`. A marker that was never completely
+  written (power lost while it was being made) means no drop began: the
+  next read-write open removes it and a read-only open ignores it.
 - **One transaction can journal at most 2 GiB of undo data**
   (`SQR_JRNL_MAX_PAYLOAD`). The write that would pass it fails with
   `SQR_FULL`; an explicit transaction is then doomed and rolls back whole.
@@ -674,7 +697,10 @@ barrier and the schema/catalog replace alike — while the writes, flushes,
 transactions, rollback and the atomic renames all stay, so the running
 process never sees a torn file. Only a crash can, and that is the trade the
 flag names: after a power loss such a store may have a torn journal, and
-the open is then refused as described above.
+the open is then refused as described above. Its `_dropping` marker is not
+synced either, so after a power loss during `db_drop_table` the marker may
+be found incomplete and discarded although the drop had begun; the table's
+leftover files then stay where they are.
 
 Two things the engine avoids on its own account, because their cost grows
 with the number of open tables: a name-based `inquire`/`open` (the ifx

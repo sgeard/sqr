@@ -251,6 +251,17 @@ contains
         p = pathjoin(db%dir, trim(name) // '.altering')
     end function
 
+    ! Marker written by db_drop_table before it touches the catalog; it holds
+    ! the table's name.  Its presence on a writable open (or close) means a
+    ! drop was interrupted and is finished by finish_drop.  One drop runs at a
+    ! time, so the name is fixed; table files all carry a suffix, so it cannot
+    ! collide with one.
+    pure function drop_marker_path(db) result(p)
+        type(db_t), intent(in)        :: db
+        character(len=:), allocatable :: p
+        p = pathjoin(db%dir, '_dropping')
+    end function
+
     ! Order-sensitive rolling checksum over a byte image, folded into a
     ! non-negative int32. Used by the journal (torn-payload detection) and the
     ! pack/unpack codec (truncated-container detection); one definition here so
@@ -588,13 +599,15 @@ contains
                         return
                     end if
                 end do dup_check
+                ! Checked inside the loop: each csize is at most SQR_MAX_CHAR
+                ! here, so the running total cannot wrap before it is refused.
                 total = total + c%csize
+                if (total + 1 + null_bytes(size(cols)) > SQR_MAX_RECORD) then
+                    if (present(errmsg)) errmsg = 'record size too large'
+                    return
+                end if
             end associate
         end do col_loop
-        if (total + 1 + null_bytes(size(cols)) > SQR_MAX_RECORD) then
-            if (present(errmsg)) errmsg = 'record size too large'
-            return
-        end if
         stat = SQR_OK
     end subroutine
 
@@ -675,6 +688,7 @@ contains
         integer,                        optional, intent(out) :: version  ! as stored; current when there is no catalog yet
         integer :: u, ios, i, ver
         integer(int32) :: bom
+        integer(int64) :: fsz
         character(len=len(CATALOG_MAGIC)) :: magic
         n = 0
         allocate(names(0))
@@ -689,6 +703,7 @@ contains
             stat = SQR_ERR
             return
         end if
+        inquire(unit=u, size=fsz)
         read(u, iostat=ios) magic
         call io_check(ios)
         if (ios /= 0 .or. magic /= CATALOG_MAGIC) then
@@ -719,8 +734,9 @@ contains
         if (present(version)) version = ver
         ! ntables is untrusted on-disk data: a corrupt count would drive a
         ! bad allocate before any per-table validation runs. Bound it with
-        ! the same corruption ceiling read_schema applies to header counts.
-        if (n < 0 .or. n > SQR_MAX_RECORD) then
+        ! the same corruption ceiling read_schema applies to header counts,
+        ! and by the file: each name record is SQR_NAME_LEN bytes.
+        if (n < 0 .or. n > SQR_MAX_RECORD .or. int(n, int64) * SQR_NAME_LEN > fsz) then
             close(u)
             stat = SQR_INVALID
             return
@@ -777,14 +793,20 @@ contains
             ios = c_fsync_path(tmp)
             call io_check(ios)
             if (ios /= 0) then
+                call remove_file(tmp)
                 stat = SQR_ERR
                 return
             end if
         end if
-        if (c_rename(tmp, final) /= 0) then
+        ios = 0
+        call io_check(ios)          ! the injected fault stands for a rename that failed
+        if (ios == 0) ios = c_rename(tmp, final)
+        if (ios /= 0) then
+            call remove_file(tmp)
             stat = SQR_ERR
             return
         end if
+        ! From here there is no temporary file, whatever the fsync returns.
         stat = SQR_OK
         if (db%durable) then
             ios = c_fsync_dir(db%dir)
@@ -828,6 +850,7 @@ contains
         end if
         close(u, iostat=ios)   ! flushes buffered writes; catch a late ENOSPC/EIO
         if (ios /= 0) then
+            call remove_file(tmp)
             stat = SQR_ERR
             return
         end if
@@ -876,7 +899,7 @@ contains
     end subroutine
 
     ! The schema file body: write `tbl`'s header, columns and index set to
-    ! `path` (replaced); a failed write deletes the partial file.
+    ! `path` (replaced); a failed write or close deletes the partial file.
     subroutine write_schema_file(tbl, path, stat)
         type(table_t),    intent(in)  :: tbl
         character(len=*), intent(in)  :: path
@@ -928,6 +951,7 @@ contains
         end if
         close(u, iostat=ios)   ! flushes buffered writes; catch a late ENOSPC/EIO
         if (ios /= 0) then
+            call remove_file(path)
             stat = SQR_ERR
             return
         end if
@@ -948,6 +972,7 @@ contains
         character(len=*),            intent(inout), optional :: errmsg
         integer :: u, ios, i
         integer(int32)              :: bom
+        integer(int64)              :: fsz
         character(len=len(SQR_MAGIC)) :: magic
         character(len=SQR_NAME_LEN) :: nm
         tbl%name = name
@@ -958,6 +983,7 @@ contains
             if (present(errmsg)) errmsg = 'cannot open schema for ' // trim(name)
             return
         end if
+        inquire(unit=u, size=fsz)
         read(u, iostat=ios) magic
         call io_check(ios)
         if (ios /= 0 .or. magic /= SQR_MAGIC) then
@@ -1015,7 +1041,23 @@ contains
             if (present(errmsg)) errmsg = 'corrupt schema header for ' // trim(name)
             return
         end if
-        allocate(tbl%cols(tbl%ncols))
+        ! The counts must also fit in the file: a column record is a name and
+        ! three integers, an index record at least three integers (a dead
+        ! slot: arity 0, key_size, unique flag).
+        if (int(tbl%ncols, int64) * (SQR_NAME_LEN + 12) + &
+            int(tbl%nindices, int64) * 12 > fsz) then
+            close(u)
+            stat = SQR_INVALID
+            if (present(errmsg)) errmsg = 'corrupt schema header for ' // trim(name)
+            return
+        end if
+        allocate(tbl%cols(tbl%ncols), tbl%indices(max(1, tbl%nindices)), stat=ios)
+        if (ios /= 0) then
+            close(u)
+            stat = SQR_ERR
+            if (present(errmsg)) errmsg = 'not enough memory for the schema of ' // trim(name)
+            return
+        end if
         cols_in: do i = 1, tbl%ncols
             associate (c => tbl%cols(i))
                 read(u, iostat=ios) nm
@@ -1041,8 +1083,15 @@ contains
             cols_chk: do i = 1, tbl%ncols
                 associate (c => tbl%cols(i))
                     if (c%csize < 1 .or. c%offset /= off) exit cols_chk
+                    ! The creation rules (validate_columns): the row accessors
+                    ! always move 4 or 8 bytes for INT and REAL.
                     select case (c%dtype)
-                    case (DT_INT, DT_REAL, DT_CHAR)
+                    case (DT_INT)
+                        if (c%csize /= SQR_INT_SIZE) exit cols_chk
+                    case (DT_REAL)
+                        if (c%csize /= SQR_REAL_SIZE) exit cols_chk
+                    case (DT_CHAR)
+                        if (c%csize > SQR_MAX_CHAR) exit cols_chk
                     case (DT_TEXT)
                         if (c%csize /= SQR_TEXT_DESC) exit cols_chk
                     case default
@@ -1058,7 +1107,6 @@ contains
                 return
             end if
         end block check_cols
-        allocate(tbl%indices(max(1, tbl%nindices)))
         idx_in: do i = 1, tbl%nindices
             associate (ix => tbl%indices(i))
                 ! Index record: ncols, member names, key_size, unique flag.
@@ -1180,6 +1228,8 @@ contains
                 tbl%next_id = recovered
                 call recount_live(u, tbl, ios)
                 if (ios /= 0) then
+                    close(u, iostat=ios)   ! a failed open leaves the unit at -1
+                    tbl%unit = -1
                     stat = SQR_ERR
                     return
                 end if
@@ -1192,6 +1242,8 @@ contains
                 ! from the gap. read_schema bounds the other header counts by
                 ! SQR_MAX_RECORD; this one can only be bounded here, where the
                 ! file is open.
+                close(u, iostat=ios)       ! a failed open leaves the unit at -1
+                tbl%unit = -1
                 stat = SQR_INVALID
                 return
             end if
@@ -1253,7 +1305,25 @@ contains
         call bt_open(ix%bt, index_path(db, tbl%name, slot), ix%key_size, &
                      .not. db%readonly, mode /= 'old', bs)
         stat = sqr_of_bt(bs)
-        if (stat == SQR_OK) ix%nentries = int(ix%bt%nentries)
+        if (stat == SQR_OK) then
+            ix%nentries = int(ix%bt%nentries)
+        else if (ix%bt%unit /= -1) then
+            call bt_discard(ix%bt)   ! a failed create: leave the unit at -1
+        end if
+    end subroutine
+
+    ! Mark an index slot dead (ncols = 0) in memory: the descriptive fields
+    ! are cleared, the tree is left as it is.  The slot is kept so the
+    ! __i<slot> file names of the other indices stay valid.
+    subroutine tombstone_slot(ix)
+        type(index_t), intent(inout) :: ix
+        ix%ncols    = 0
+        ix%key_size = 0
+        ix%nentries = 0
+        ix%unique   = .false.
+        if (allocated(ix%columns)) deallocate(ix%columns)
+        if (allocated(ix%col_idx)) deallocate(ix%col_idx)
+        if (allocated(ix%key_off)) deallocate(ix%key_off)
     end subroutine
 
     ! The B+-tree key order: the index's member-by-member, per-dtype
@@ -1375,6 +1445,9 @@ contains
         integer :: i, rs
         stat = SQR_OK
         settle_tables: do i = 1, db%ntables
+            ! A wedged table's schema is never written: the marker on disk,
+            ! not this session's memory, says what its layout is.
+            if (db%tables(i)%wedged) cycle settle_tables
             if (.not. schema_stale(db%tables(i))) cycle settle_tables
             call write_schema(db, db%tables(i), rs)
             if (rs /= SQR_OK .and. stat == SQR_OK) stat = rs
@@ -1487,13 +1560,52 @@ contains
         integer,          intent(out),   optional :: stat
         character(len=*), intent(inout), optional :: errmsg
         logical :: blocked
+        integer :: i
         blocked = db%jrnl%needs_recovery
         if (blocked) then
             call set_last_err(db, SQR_ERR, NEEDS_RECOVERY_MSG)
             if (present(stat))   stat   = SQR_ERR
             if (present(errmsg)) errmsg = NEEDS_RECOVERY_MSG
+            return
         end if
+        ! A table that failed past its compact or layout-change marker
+        ! (table_t%wedged): the next open finishes the job from the marker,
+        ! and nothing may write before it has.
+        if (.not. allocated(db%tables)) return
+        wedge_scan: do i = 1, db%ntables
+            if (.not. db%tables(i)%wedged) cycle wedge_scan
+            blocked = .true.
+            call set_last_err(db, SQR_ERR, wedged_msg(db%tables(i)%name))
+            if (present(stat))   stat   = SQR_ERR
+            if (present(errmsg)) errmsg = wedged_msg(db%tables(i)%name)
+            return
+        end do wedge_scan
     end function
+
+    pure function wedged_msg(name) result(m)
+        character(len=*), intent(in)  :: name
+        character(len=:), allocatable :: m
+        m = 'table "' // trim(name) // '" needs recovery: close and reopen the database'
+    end function
+
+    ! Latch table `t` after a failure that followed its compact or
+    ! layout-change commit marker: the marker on disk is the truth and the
+    ! next open finishes the job from it.  Its data and blob units are closed
+    ! (a failed close is ignored: the files are superseded or about to be)
+    ! and left at -1; no file is removed and nothing is reopened.
+    ! recovery_block then refuses every write and structural change,
+    ! settle_meta never writes its schema and db_resume leaves it closed.
+    subroutine wedge_table(db, t)
+        type(db_t),    intent(inout) :: db
+        type(table_t), intent(inout) :: t
+        integer :: ios
+        if (t%unit /= -1) close(t%unit, iostat=ios)
+        t%unit = -1
+        if (t%blob_unit /= -1) close(t%blob_unit, iostat=ios)
+        t%blob_unit = -1
+        t%wedged = .true.
+        call set_last_err(db, SQR_ERR, wedged_msg(t%name))
+    end subroutine
 
     ! ===== Auto-commit brackets =====
     ! A public mutator wraps its work in `ac_begin … <body> … ac_end` so the op
@@ -1505,9 +1617,12 @@ contains
     ! SQR_READONLY itself (via readonly_block) and ac_end stays a no-op.
     !
     ! The hook txn_begin installs holds a pointer to `db` that the bracket only
-    ! dereferences between these two calls (during the body's page writes), so
-    ! `db` need not be `target` here — that is required only for the cross-call
-    ! explicit-transaction path, which already declares it.
+    ! dereferences between these two calls (during the body's page writes).
+    ! That pointer is still defined only if the CALLER's variable is a target:
+    ! every handle must be declared `type(db_t), target` (module sqr header),
+    ! here as for an explicit transaction.  Between the two calls the journal
+    ! is also updated through the pointer while the body holds the same handle
+    ! as an ordinary argument - the same reliance on pass-by-reference.
     !
     ! Inside an explicit transaction a failed body cannot be undone on its own.
     ! If it had begun to write (jrnl%nwrites moved past the mark ac_begin took)

@@ -8,7 +8,7 @@ program mkdb
     use :: sqr
     implicit none
 
-    type(db_t)                    :: db
+    type(db_t), target                    :: db
     type(column_t)                :: cols(5), ecols(3)
     character(len=:), allocatable :: buf
     character(len=256)            :: dir

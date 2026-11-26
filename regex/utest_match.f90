@@ -97,7 +97,7 @@ contains
     end subroutine scan_match
 
     subroutine test_match()
-        type(db_t)     :: db
+        type(db_t), target     :: db
         type(column_t) :: c(2)
         integer        :: rs, n
         integer(int32) :: rid, ids(32)

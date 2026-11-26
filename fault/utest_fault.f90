@@ -24,7 +24,7 @@ program utest_fault
     ! Handle the measured operation acts on. Opened by the sweep (for
     ! act-ops) or by the op itself (for db_open under test); always
     ! closed disarmed after the op.
-    type(db_t) :: gdb
+    type(db_t), target :: gdb
     logical    :: gopen = .false.
     integer    :: fds0  = -1      ! open descriptors at program start (-1 = no /proc)
 
@@ -43,7 +43,9 @@ program utest_fault
     call sweep('delete',       prep_rows,        op_delete,  .false.)
     call sweep('get',          prep_rows,        op_get,     .false.)
     call sweep('create_index', prep_rows,        op_index,   .false.)
-    call sweep('find_by_int',  prep_indexed,     op_find,    .false.)
+    ! E13: a failed row read under an index walk is an I/O error, never
+    ! "not found".
+    call sweep('find_by_int',  prep_indexed,     op_find,    .false., expect=SQR_ERR)
     call sweep('compact',      prep_compactable, op_compact, .false.)
     call sweep('reshape',      prep_indexed,     op_reshape, .false.)
     call reshape_atomicity()
@@ -95,6 +97,16 @@ program utest_fault
 
     ! E2: a demotion that cannot save the counters stays writable.
     call readonly_by_fault()
+
+    ! E14: a failed db_drop_index leaves the index whole.
+    call drop_index_faults()
+
+    ! E7, E8, E11: failures past a commit marker, a non-durable compact, and
+    ! an interrupted drop table.
+    call alter_wedge()
+    call compact_wedge()
+    call compact_nondurable()
+    call drop_table_faults()
 
     ! H1: a faulted undo replay must leave the journal hot, never voided.
     call recover_fault()
@@ -235,7 +247,7 @@ contains
     ! ---- preconditions: build on-disk state via a local handle -------
 
     subroutine prep_table()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: rs, ios
         ios = c_rmtree(DBDIR)
         call db_open(db, DBDIR, rs)
@@ -259,7 +271,7 @@ contains
     end subroutine insert_row
 
     subroutine prep_rows()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: rs
         call prep_table()
         call db_open(db, DBDIR, rs)
@@ -270,7 +282,7 @@ contains
     end subroutine prep_rows
 
     subroutine prep_indexed()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: rs
         call prep_rows()
         call db_open(db, DBDIR, rs)
@@ -279,7 +291,7 @@ contains
     end subroutine prep_indexed
 
     subroutine prep_compactable()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: rs
         call prep_rows()
         call db_open(db, DBDIR, rs)
@@ -290,7 +302,7 @@ contains
     ! As prep_compactable, but with a live index on 'age' — so a compact must
     ! rebuild the index over the renumbered rows (the M4 path).
     subroutine prep_indexed_compactable()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: rs
         call prep_rows()
         call db_open(db, DBDIR, rs)
@@ -300,7 +312,7 @@ contains
     end subroutine prep_indexed_compactable
 
     subroutine prep_textrow()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: rs
         call prep_table()
         call db_open(db, DBDIR, rs)
@@ -309,7 +321,7 @@ contains
     end subroutine prep_textrow
 
     subroutine prep_textset()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: rs
         call prep_textrow()
         call db_open(db, DBDIR, rs)
@@ -318,7 +330,7 @@ contains
     end subroutine prep_textset
 
     subroutine prep_fulldb()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: rs
         call prep_indexed()
         call db_open(db, DBDIR, rs)
@@ -419,7 +431,7 @@ contains
     ! kept, score NULL) - never a mixture - and db_verify passes either way.
     ! (A failure past the commit point legitimately leaves the new layout.)
     subroutine reshape_atomicity()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: nops, n, rs, bad, ti
         integer(int32) :: rid
         character(len=:), allocatable :: buf
@@ -440,6 +452,9 @@ contains
             call fault_arm(n)
             call op_reshape(rs)
             call fault_disarm()
+            if (rs /= SQR_OK) then
+                if (.not. same_session_sound('reshape', n)) bad = bad + 1
+            end if
             call close_g()
             if (rs == SQR_OK) cycle sweep_loop
             call db_open(db, DBDIR, rs)
@@ -476,7 +491,7 @@ contains
 
     ! `people` without its TEXT column: (pid, age, name), two rows, no blob file.
     subroutine prep_plain()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(column_t) :: c(4)
         integer :: rs, ios
         ios = c_rmtree(DBDIR)
@@ -501,7 +516,7 @@ contains
     ! columns) OR the new one (four, and the TEXT column usable: its blob file
     ! is there) - never a schema naming a TEXT column with no blob file.
     subroutine addtext_atomicity()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: nops, n, rs, bad, ti
         character(len=:), allocatable :: txt
         character(len=128) :: em
@@ -522,6 +537,9 @@ contains
             call fault_arm(n)
             call op_addtext(rs)
             call fault_disarm()
+            if (rs /= SQR_OK) then
+                if (.not. same_session_sound('add_text', n)) bad = bad + 1
+            end if
             call close_g()
             if (rs == SQR_OK) cycle sweep_loop
             call db_open(db, DBDIR, rs)
@@ -559,7 +577,7 @@ contains
     ! power cut to observe; this covers the failure paths.)
     subroutine unpack_faults()
         character(len=*), parameter :: PK = 'utest_fault_unpack.sqr', OUT = 'utest_fault_unpack_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: nops, n, rs, bad, left, ios
         character(len=128) :: em
         call fault_disarm()
@@ -604,7 +622,7 @@ contains
     ! a container that unpacks to a database that verifies (old or new).
     subroutine pack_faults()
         character(len=*), parameter :: PK = 'utest_fault_pack.sqr', OUT = 'utest_fault_pack_db'
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: nops, n, rs, bad, left, broken, ios
         character(len=128) :: em
         call fault_disarm()
@@ -671,9 +689,10 @@ contains
     ! each failed compaction, reopen and assert the live row is still
     ! readable and correct.
     subroutine compact_atomicity()
-        type(db_t) :: db
+        type(db_t), target :: db
         character(len=:), allocatable :: buf
-        integer :: rs, n, nops, ti, bad
+        character(len=128) :: em
+        integer :: rs, n, nops, ti, bad, st
         integer(int32) :: age
 
         call fault_disarm()
@@ -694,6 +713,9 @@ contains
             call fault_arm(n)
             call op_compact(rs)
             call fault_disarm()
+            if (rs /= SQR_OK) then
+                if (.not. same_session_sound('compact', n)) bad = bad + 1
+            end if
             call close_g()
             if (rs == SQR_OK) cycle atom_loop  ! compaction completed: fine
             ! Failed compaction: the originals must be untouched.
@@ -701,6 +723,12 @@ contains
             if (rs /= SQR_OK) then
                 bad = bad + 1
                 cycle atom_loop
+            end if
+            em = ''
+            call db_verify(db, 'people', st, em)
+            if (st /= SQR_OK) then
+                print '(a,i0,a,1x,a)', '  compact fault ', n, ': verify after reopen', trim(em)
+                bad = bad + 1
             end if
             ti = db_table_index(db, 'people')
             call row_alloc(buf, db%tables(ti)%record_size)
@@ -724,7 +752,7 @@ contains
     ! which walks the index against a full scan — must pass. An empty index over
     ! populated rows would fail it.
     subroutine compact_index_recovery()
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: rs, n, nops, bad
         character(len=128) :: emsg
 
@@ -769,7 +797,7 @@ contains
     ! b) finds both rows.
     subroutine upgrade_recovery()
         character(len=*), parameter :: FIX = 'test/fixtures/v1_null.sqr'
-        type(db_t) :: db
+        type(db_t), target :: db
         type(db_cursor_t) :: cur
         integer :: rs, n, nops, bad, unhealed, ios, nrows
         integer(int32) :: rid
@@ -961,7 +989,7 @@ contains
     integer function scratch_io_points(dir, durable) result(n)
         character(len=*), intent(in) :: dir
         logical,          intent(in) :: durable
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: st
         integer(int32) :: rid
         character(len=:), allocatable :: buf
@@ -987,7 +1015,7 @@ contains
         procedure(prep_i)             :: prep
         procedure(op_i)               :: op
         integer,           intent(in) :: base_live
-        type(db_t) :: db
+        type(db_t), target :: db
         integer :: rs, n, nops, ti, bad
         character(len=128) :: emsg
 
@@ -1282,7 +1310,7 @@ contains
     ! to write.  Every I/O fault in that save must leave the handle writable
     ! (so the ordinary close can still save them) and the database sound.
     subroutine readonly_by_fault()
-        integer :: nops, n, rs, bad, st
+        integer :: nops, n, rs, bad, st, tmpleft
         character(len=128) :: emsg
         call fault_disarm()
         call prep_rows()
@@ -1295,6 +1323,7 @@ contains
         call close_g()
         call check(rs == SQR_OK .and. nops > 0, 'readonly: clean demotion does I/O')
         bad = 0
+        tmpleft = 0
         fault_loop: do n = 1, nops
             call prep_rows()
             call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
@@ -1303,6 +1332,9 @@ contains
             call db_set_readonly(gdb, rs)
             call fault_disarm()
             if (rs == SQR_OK .or. gdb%readonly) bad = bad + 1
+            ! D5: a failed catalog or schema replace leaves no temporary file
+            if (c_path_exists(DBDIR // '/_catalog.dat.tmp') .or. &
+                c_path_exists(DBDIR // '/people.schema.tmp')) tmpleft = tmpleft + 1
             call close_g()
             call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
             call db_verify(gdb, 'people', st, emsg)
@@ -1310,7 +1342,391 @@ contains
             call close_g()
         end do fault_loop
         call check(bad == 0, 'readonly: a failed demotion stays writable and loses no count')
+        call check(tmpleft == 0, 'readonly: a failed schema/catalog replace leaves no .tmp')
     end subroutine readonly_by_fault
+
+    ! E14: a failure at any I/O point of db_drop_index.  In the same session
+    ! the index is still whole: its slot live, a lookup through it finds an
+    ! existing row, the table verifies.  Then one more row, close, reopen: the
+    ! database verifies, and either the index is gone or it is there and
+    ! finds the row inserted after the failed drop.
+    subroutine drop_index_faults()
+        type(db_t), target :: db
+        integer :: nops, n, rs, bad, ti, j, st, insess
+        integer(int32) :: rid
+        logical :: there
+        character(len=128) :: emsg
+        call fault_disarm()
+        call prep_indexed()
+        call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
+        call fault_arm(BIG)
+        call db_drop_index(gdb, 'people', 'age', rs)
+        nops = fault_count()
+        call fault_disarm()
+        call close_g()
+        call check(rs == SQR_OK .and. nops > 0, 'drop_index: clean drop does I/O')
+        bad = 0; insess = 0
+        fault_loop: do n = 1, nops
+            call prep_indexed()
+            call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
+            call fault_arm(n)
+            call db_drop_index(gdb, 'people', 'age', rs)
+            call fault_disarm()
+            if (rs == SQR_OK) bad = bad + 1
+            ti = db_table_index(gdb, 'people')
+            there = .false.
+            do j = 1, gdb%tables(ti)%nindices
+                if (idx_live(gdb%tables(ti)%indices(j))) there = .true.
+            end do
+            rid = 0
+            call db_find_by_int(gdb, 'people', 'age', 45_int32, rid, rs)
+            emsg = ''
+            call db_verify(gdb, 'people', st, emsg)
+            if (.not. there .or. rs /= SQR_OK .or. rid /= 2_int32 .or. st /= SQR_OK) then
+                print '(a,i0,a,l1,1x,i0,1x,i0,1x,i0,1x,a)', '  drop_index fault ', n, &
+                    ': in session live/find/rid/verify ', there, rs, rid, st, trim(emsg)
+                insess = insess + 1
+            end if
+            call op_insert(rs)                    ! age 99
+            call close_g()
+            call db_open(db, DBDIR, rs)
+            if (rs /= SQR_OK) then
+                bad = bad + 1
+                cycle fault_loop
+            end if
+            emsg = ''
+            call db_verify(db, 'people', st, emsg)
+            ti = db_table_index(db, 'people')
+            there = .false.
+            do j = 1, db%tables(ti)%nindices
+                if (idx_live(db%tables(ti)%indices(j))) there = .true.
+            end do
+            if (there) then
+                call db_find_by_int(db, 'people', 'age', 99_int32, rid, rs)
+                if (rs /= SQR_OK .or. rid /= 4_int32) st = SQR_ERR
+            end if
+            if (st /= SQR_OK) then
+                print '(a,i0,a,i0,1x,a)', '  drop_index fault ', n, ': verify ', st, trim(emsg)
+                bad = bad + 1
+            end if
+            call db_close(db)
+        end do fault_loop
+        call check(insess == 0, 'drop_index: after a failed drop the index is live, finds and verifies in session')
+        call check(bad == 0, 'drop_index: a failed drop leaves the index whole or gone, never stale')
+    end subroutine drop_index_faults
+
+    ! E7: after a structural operation on gdb failed, an insert in the same
+    ! session either succeeds on a table that then verifies, or is refused.
+    logical function same_session_sound(label, n) result(ok)
+        character(len=*), intent(in) :: label
+        integer,          intent(in) :: n
+        integer :: rs, st
+        character(len=128) :: em
+        call op_insert(rs)
+        ok = .true.
+        if (rs /= SQR_OK) return
+        em = ''
+        call db_verify(gdb, 'people', st, em)
+        ok = st == SQR_OK
+        if (.not. ok) print '(a,a,a,i0,a,1x,a)', '  ', label, ' fault ', n, &
+            ': same-session insert left the table unverifiable', trim(em)
+    end function same_session_sound
+
+    ! E7 and 5.5: a layout change (add a column, on a table whose counters
+    ! are stale: a row deleted in the session) failing at each I/O point.
+    ! Either the failure was ordinary - no marker left, an insert in the
+    ! same session is accepted, and the reopened table has the OLD layout and
+    ! holds that row - or the table is wedged: the insert and a row read are
+    ! refused, db_close succeeds, and the reopened table verifies in either
+    ! layout.
+    subroutine alter_wedge()
+        type(db_t), target :: db
+        type(column_t) :: extra
+        character(len=:), allocatable :: buf
+        character(len=128) :: em
+        integer :: rs, nops, n, ti, st, bad, plain, wedged, nc
+        logical :: marker
+        extra%name = 'extra'; extra%dtype = DT_INT; extra%csize = 4
+        call fault_disarm()
+        call prep_rows()
+        call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
+        call db_delete(gdb, 'people', 2_int32, rs)
+        call fault_arm(BIG)
+        call db_add_column(gdb, 'people', extra, rs)
+        nops = fault_count()
+        call fault_disarm()
+        call close_g()
+        call check(rs == SQR_OK, 'alter_wedge: the clean change succeeds')
+        bad = 0; plain = 0; wedged = 0
+        sweep_loop: do n = 1, nops
+            call prep_rows()
+            call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
+            call db_delete(gdb, 'people', 2_int32, rs)
+            call fault_arm(n)
+            call db_add_column(gdb, 'people', extra, rs)
+            call fault_disarm()
+            if (rs == SQR_OK) then
+                print '(a,i0,a)', '  alter_wedge fault ', n, ': the change reported success'
+                bad = bad + 1
+                call close_g()
+                cycle sweep_loop
+            end if
+            marker = c_path_exists(DBDIR // '/people.altering')
+            call op_insert(rs)
+            if (rs == SQR_OK) then
+                plain = plain + 1
+                call close_g()
+                call db_open(db, DBDIR, rs)
+                em = ''; st = SQR_ERR; nc = 0
+                if (rs == SQR_OK) then
+                    call db_verify(db, 'people', st, em)
+                    nc = db%tables(db_table_index(db, 'people'))%ncols
+                end if
+                if (marker .or. rs /= SQR_OK .or. st /= SQR_OK .or. nc /= 4 .or. &
+                    .not. zoe_at(db, 4_int32) .or. db_row_count(db, 'people') /= 3) then
+                    print '(a,i0,a,l1,1x,i0,1x,i0,1x,i0,1x,a)', '  alter_wedge fault ', n, &
+                        ': insert accepted, then marker/open/verify/ncols ', marker, rs, st, nc, trim(em)
+                    bad = bad + 1
+                end if
+                call db_close(db)
+                cycle sweep_loop
+            end if
+            wedged = wedged + 1
+            ti = db_table_index(gdb, 'people')
+            call row_alloc(buf, gdb%tables(ti)%record_size)
+            call db_get(gdb, 'people', 1_int32, buf, rs)
+            if (rs == SQR_OK) bad = bad + 1
+            call db_close(gdb, rs); gopen = .false.
+            if (rs /= SQR_OK) bad = bad + 1
+            call db_open(db, DBDIR, rs)
+            em = ''; st = SQR_ERR; nc = 0
+            if (rs == SQR_OK) then
+                call db_verify(db, 'people', st, em)
+                nc = db%tables(db_table_index(db, 'people'))%ncols
+            end if
+            if (rs /= SQR_OK .or. st /= SQR_OK .or. (nc /= 4 .and. nc /= 5)) then
+                print '(a,i0,a,i0,1x,i0,1x,i0,1x,a)', '  alter_wedge fault ', n, &
+                    ': insert refused, then open/verify/ncols ', rs, st, nc, trim(em)
+                bad = bad + 1
+            end if
+            call db_close(db)
+        end do sweep_loop
+        call check(plain > 0 .and. wedged > 0, 'alter_wedge: faults fall both before and past the commit')
+        call check(bad == 0, 'alter_wedge: a failed change is ordinary (old layout, later row kept) or wedged')
+    end subroutine alter_wedge
+
+    ! Row `rid` of `people` in `db` is Zoe (age 99, op_insert's row).
+    logical function zoe_at(db, rid) result(ok)
+        type(db_t),     intent(inout) :: db
+        integer(int32), intent(in)    :: rid
+        character(len=:), allocatable :: buf
+        integer :: ti, rs
+        ok = .false.
+        ti = db_table_index(db, 'people')
+        if (ti == 0) return
+        call row_alloc(buf, db%tables(ti)%record_size)
+        call db_get(db, 'people', rid, buf, rs)
+        if (rs /= SQR_OK) return
+        ok = row_get_int(buf, db%tables(ti)%cols(2)) == 99_int32
+    end function zoe_at
+
+    ! E7 and 5.5, for db_compact: a row deleted in the session (stale
+    ! counters), then a fault at each I/O point.  Wherever the compact marker
+    ! is left behind the session is wedged (insert and row read refused,
+    ! db_close succeeds) and the reopened table is the compacted one (Alice
+    ! alone) and verifies.  Where the compact failed and left no marker the
+    ! insert decides the case.  Accepted: the failure was ordinary, and after
+    ! close and reopen the table verifies and holds that row, uncompacted.
+    ! Refused: the marker's own retirement failed after the compact was
+    ! complete, so the table is wedged like the marker-left case; that is
+    ! allowed only beyond the commit point, i.e. once an earlier fault of the
+    ! sweep has left the marker.
+    subroutine compact_wedge()
+        type(db_t), target :: db
+        character(len=:), allocatable :: buf
+        character(len=128) :: em
+        integer :: rs, nops, n, ti, st, bad, past, plain, retired
+        logical :: marker
+        call fault_disarm()
+        call prep_compactable()
+        call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
+        call db_delete(gdb, 'people', 3_int32, rs)
+        call fault_arm(BIG)
+        call op_compact(rs)
+        nops = fault_count()
+        call fault_disarm()
+        call close_g()
+        bad = 0; past = 0; plain = 0; retired = 0
+        sweep_loop: do n = 1, nops
+            call prep_compactable()
+            call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
+            call db_delete(gdb, 'people', 3_int32, rs)
+            call fault_arm(n)
+            call op_compact(rs)
+            call fault_disarm()
+            if (rs == SQR_OK) then
+                call close_g()
+                cycle sweep_loop
+            end if
+            marker = c_path_exists(DBDIR // '/people.compacting')
+            call op_insert(rs)
+            if (.not. marker .and. rs /= SQR_OK .and. past == 0) then
+                print '(a,i0,a)', '  compact_wedge fault ', n, &
+                    ': no marker and not past the commit point, but the insert is refused'
+                bad = bad + 1
+                call close_g()
+                cycle sweep_loop
+            end if
+            if (.not. marker .and. rs == SQR_OK) then
+                ! case 2: an ordinary failure, the table untouched and usable
+                plain = plain + 1
+                call close_g()
+                call db_open(db, DBDIR, rs)
+                em = ''; st = SQR_ERR
+                if (rs == SQR_OK) call db_verify(db, 'people', st, em)
+                if (rs /= SQR_OK .or. st /= SQR_OK .or. .not. zoe_at(db, 4_int32) .or. &
+                    db_row_count(db, 'people') /= 2) then
+                    print '(a,i0,a,i0,1x,i0,1x,a)', '  compact_wedge fault ', n, &
+                        ': no marker, the later row lost or the table unsound ', rs, st, trim(em)
+                    bad = bad + 1
+                end if
+                call db_close(db)
+                cycle sweep_loop
+            end if
+            ! case 3: wedged, with the marker left or its retirement in doubt
+            if (marker) then
+                past = past + 1
+            else
+                retired = retired + 1
+            end if
+            if (rs == SQR_OK) then
+                print '(a,i0,a)', '  compact_wedge fault ', n, ': marker left, but an insert is accepted'
+                bad = bad + 1
+            end if
+            ti = db_table_index(gdb, 'people')
+            call row_alloc(buf, gdb%tables(ti)%record_size)
+            call db_get(gdb, 'people', 1_int32, buf, rs)
+            if (rs == SQR_OK) bad = bad + 1
+            call db_close(gdb, rs); gopen = .false.
+            if (rs /= SQR_OK) bad = bad + 1
+            call db_open(db, DBDIR, rs)
+            em = ''
+            call db_verify(db, 'people', st, em)
+            if (rs /= SQR_OK .or. st /= SQR_OK .or. db_row_count(db, 'people') /= 1) then
+                print '(a,i0,a,i0,1x,i0,1x,a)', '  compact_wedge fault ', n, ': ', rs, st, trim(em)
+                bad = bad + 1
+            end if
+            call db_close(db)
+        end do sweep_loop
+        call check(past > 0 .and. plain > 0 .and. retired > 0, &
+            'compact_wedge: ordinary failures, marker-left wedges and retirement wedges all seen')
+        call check(bad == 0, 'compact_wedge: wedged = compacted on reopen; ordinary failure = the later row kept')
+    end subroutine compact_wedge
+
+    ! E8: compact on a non-durable handle does no fsync, so it has fewer I/O
+    ! points, and every failure still reopens to a database that verifies.
+    subroutine compact_nondurable()
+        type(db_t), target :: db
+        character(len=128) :: em
+        integer :: rs, nd, nn, n, st, bad
+        call fault_disarm()
+        call prep_compactable()
+        call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
+        call fault_arm(BIG)
+        call op_compact(rs)
+        nd = fault_count()
+        call fault_disarm()
+        call close_g()
+        call prep_compactable()
+        call db_open(gdb, DBDIR, rs, durable=.false.); gopen = rs == SQR_OK
+        call fault_arm(BIG)
+        call op_compact(rs)
+        nn = fault_count()
+        call fault_disarm()
+        call close_g()
+        call check(rs == SQR_OK .and. nn < nd, 'compact: a non-durable handle has fewer I/O points')
+        bad = 0
+        sweep_loop: do n = 1, nn
+            call prep_compactable()
+            call db_open(gdb, DBDIR, rs, durable=.false.); gopen = rs == SQR_OK
+            call fault_arm(n)
+            call op_compact(rs)
+            call fault_disarm()
+            call close_g()
+            call db_open(db, DBDIR, rs)
+            em = ''
+            call db_verify(db, 'people', st, em)
+            if (rs /= SQR_OK .or. st /= SQR_OK .or. db_row_count(db, 'people') /= 2) bad = bad + 1
+            call db_close(db)
+        end do sweep_loop
+        call check(bad == 0, 'compact: every non-durable failure reopens to a database that verifies')
+    end subroutine compact_nondurable
+
+    ! E11 and 5.5: a failure at each I/O point of db_drop_table, then an
+    ! insert in the same session.  Accepted: after close and reopen the table
+    ! still exists and holds that row.  Refused (wedged, or the table already
+    ! out of memory): after close and reopen the table is either intact and
+    ! verifies, or absent with its name free for db_create_table.
+    subroutine drop_table_faults()
+        type(db_t), target :: db
+        character(len=128) :: em
+        integer :: rs, nops, n, st, bad, gone, kept
+        logical :: accepted
+        call fault_disarm()
+        call prep_indexed()
+        call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
+        call fault_arm(BIG)
+        call db_drop_table(gdb, 'people', rs)
+        nops = fault_count()
+        call fault_disarm()
+        call close_g()
+        call check(rs == SQR_OK .and. nops > 0, 'drop_table: the clean drop does I/O')
+        bad = 0; gone = 0; kept = 0
+        sweep_loop: do n = 1, nops
+            call prep_indexed()
+            call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
+            call fault_arm(n)
+            call db_drop_table(gdb, 'people', rs)
+            call fault_disarm()
+            if (rs == SQR_OK) bad = bad + 1
+            accepted = .false.
+            if (db_table_index(gdb, 'people') > 0) then
+                call op_insert(rs)
+                accepted = rs == SQR_OK
+            end if
+            call close_g()
+            call db_open(db, DBDIR, rs)
+            if (rs /= SQR_OK) then
+                print '(a,i0,a,i0)', '  drop_table fault ', n, ': reopen failed ', rs
+                bad = bad + 1
+                cycle sweep_loop
+            end if
+            if (accepted) then
+                kept = kept + 1
+                em = ''; st = SQR_ERR
+                if (db_table_index(db, 'people') > 0) call db_verify(db, 'people', st, em)
+                if (st /= SQR_OK .or. .not. zoe_at(db, 4_int32)) then
+                    print '(a,i0,a)', '  drop_table fault ', n, &
+                        ': insert accepted after the failed drop, but the table or the row is gone'
+                    bad = bad + 1
+                end if
+            else if (db_table_index(db, 'people') > 0) then
+                em = ''
+                call db_verify(db, 'people', st, em)
+                if (st /= SQR_OK .or. db_row_count(db, 'people') /= 3) bad = bad + 1
+            else
+                gone = gone + 1
+                call db_create_table(db, 'people', people_cols(), rs)
+                if (rs /= SQR_OK) then
+                    print '(a,i0,a,i0)', '  drop_table fault ', n, ': name not free ', rs
+                    bad = bad + 1
+                end if
+            end if
+            call db_close(db)
+        end do sweep_loop
+        call check(kept > 0, 'drop_table: some failures leave the table usable in the session')
+        call check(bad == 0, 'drop_table: every failure leaves the table intact (with any later row) or wholly gone')
+    end subroutine drop_table_faults
 
     logical function no_zoe_and_sound() result(ok)
         integer :: st
@@ -1390,7 +1806,7 @@ contains
     ! bytes.  (Recovery's undo write/fsync are the injectable io_check points;
     ! the header reads are not, which is exactly the "mid-replay" fault we want.)
     subroutine recover_fault()
-        type(db_t) :: db
+        type(db_t), target :: db
         character(len=*), parameter :: REL = 'jf.bin'
         character(len=:), allocatable :: full
         integer :: rs, n, nops, bad, r
@@ -1460,7 +1876,7 @@ contains
     ! Sweep a fault across every io_check of the first arm: the arm must fail,
     ! and after a clean rollback the journal must never be hot.
     subroutine arm_fault_void()
-        type(db_t) :: db
+        type(db_t), target :: db
         character(len=*), parameter :: REL = 'jf.bin'
         character(len=:), allocatable :: full
         integer :: rs, n0, n1, k, r, silent, hot, wrong

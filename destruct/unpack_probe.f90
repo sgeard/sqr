@@ -4,7 +4,7 @@ program unpack_probe
     use, intrinsic :: iso_fortran_env, only: output_unit
     use :: sqr
     implicit none
-    type(db_t)         :: db
+    type(db_t), target         :: db
     character(len=512) :: pf, od
     character(len=256) :: emsg
     character(len=SQR_NAME_LEN), allocatable :: tn(:)

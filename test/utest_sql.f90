@@ -414,7 +414,7 @@ contains
     ! ===================== DDL + INSERT =====================
 
     subroutine test_ddl_and_insert()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
 
@@ -443,7 +443,7 @@ contains
     ! case) created, filled, queried, ordered and altered by their quoted
     ! names.
     subroutine test_quoted_names_exec()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
 
@@ -477,7 +477,7 @@ contains
     ! happy-path DDL test above only covers CREATE.  Each op is followed by
     ! a query that observes the structural change it made.
     subroutine test_ddl_drop_alter()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
 
@@ -520,7 +520,7 @@ contains
     ! ===================== SELECT projection =====================
 
     subroutine test_select_projection()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
 
@@ -543,7 +543,7 @@ contains
     ! ===================== WHERE predicates =====================
 
     subroutine test_where_predicates()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
 
@@ -584,7 +584,7 @@ contains
     end function
 
     subroutine test_order_and_limit()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
 
@@ -632,7 +632,7 @@ contains
     ! ===================== NULL handling =====================
 
     subroutine test_null_handling()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
 
@@ -802,7 +802,7 @@ contains
     end subroutine
 
     subroutine test_like()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
         character(len=200) :: em
@@ -862,7 +862,7 @@ contains
     end subroutine
 
     subroutine test_in_and_not()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
         character(len=200) :: em
@@ -909,7 +909,7 @@ contains
     end subroutine
 
     subroutine test_const_projection()
-        type(db_t) :: db, closed
+        type(db_t), target :: db, closed
         type(sql_result_t) :: res
         integer :: rs
         character(len=200) :: em
@@ -953,7 +953,7 @@ contains
     end subroutine
 
     subroutine test_aggregates()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
         character(len=200) :: em
@@ -1043,7 +1043,7 @@ contains
     ! ===================== column metadata =====================
 
     subroutine test_column_metadata()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
 
@@ -1073,7 +1073,7 @@ contains
     ! ===================== binary cell mode =====================
 
     subroutine test_binary_cells()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
         character(len=200) :: em
@@ -1120,7 +1120,7 @@ contains
     ! ===================== TEXT column =====================
 
     subroutine test_text_column()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
 
@@ -1140,7 +1140,7 @@ contains
     ! ===================== UPDATE / DELETE =====================
 
     subroutine test_update_delete()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
 
@@ -1171,7 +1171,7 @@ contains
     ! full scan (no index) or an index cursor.  Build the answer first without
     ! an index, then create the index and re-run, comparing cell by cell.
     subroutine test_index_scan_parity()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: scan_res, idx_res
         integer :: rs, i
         logical :: same
@@ -1208,7 +1208,7 @@ contains
     subroutine parity_probe(tag, ddl, ins, idxcol, qry, expect)
         character(len=*), intent(in) :: tag, ddl, ins, idxcol, qry
         integer,          intent(in) :: expect
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs, nscan
 
@@ -1388,7 +1388,7 @@ contains
     ! actually go through the index: without ORDER BY an index-driven
     ! gather yields key order, a scan yields rowid (insertion) order.
     subroutine test_band_uses_index()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
         call fresh_db(db)
@@ -1414,7 +1414,7 @@ contains
     ! ===================== transactions =====================
 
     subroutine test_transactions()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
 
@@ -1443,7 +1443,7 @@ contains
     ! Review finding Q1: inside BEGIN a statement that fails after writing some
     ! of its rows dooms the transaction; one that fails before writing does not.
     subroutine test_txn_statement_failure()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
         character(len=200) :: em
@@ -1528,7 +1528,7 @@ contains
     ! ===================== executor error paths =====================
 
     subroutine test_exec_errors()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
 
@@ -1570,7 +1570,7 @@ contains
     ! filtering / ordering / limiting, an update, a delete, and a re-query —
     ! the "simple example" required of every project.
     subroutine test_functional_example()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
 
@@ -1620,7 +1620,7 @@ contains
     ! Review §3: INSERT naming the same column twice silently took the
     ! later value — it must be rejected.
     subroutine test_insert_dup_column()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
         call fresh_db(db)
@@ -1637,7 +1637,7 @@ contains
     ! Review §3: the int32 minimum was rejected because the magnitude was
     ! read before the sign was applied.
     subroutine test_int_min_literal()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
         call fresh_db(db)
@@ -1657,7 +1657,7 @@ contains
     ! Review §5.4: assert what the error MESSAGES say, not just the codes —
     ! substring matches so wording can evolve without breaking the suite.
     subroutine test_errmsg_content()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
         character(len=200) :: em
@@ -1684,7 +1684,7 @@ contains
     ! Review §5.5: sql_render had no direct coverage at all — render each
     ! result kind to a scratch unit and assert the lines.
     subroutine test_render()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res, empty
         integer :: rs, u, ios, nl
         character(len=256) :: lines(12)
@@ -1726,7 +1726,7 @@ contains
 
     ! Review §3: a bare ';' is an empty statement, not a parse error.
     subroutine test_bare_semicolon()
-        type(db_t) :: db
+        type(db_t), target :: db
         type(sql_result_t) :: res
         integer :: rs
         call fresh_db(db)

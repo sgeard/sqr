@@ -33,6 +33,14 @@
 !! can still ask `db_last_error` what the most recent call did and why
 !! (detail where the failure site recorded it, the canonical
 !! `sqr_errstr(code)` text otherwise).
+!!
+!! THE HANDLE MUST BE A TARGET.  Declare the handle `type(db_t), target`.
+!! While a transaction is open the index trees hold a pointer to it, and
+!! the Fortran standard keeps that pointer defined only when the caller's
+!! variable has the `target` attribute.  A handle held as a component of
+!! another type needs that variable to be the target.  Every write opens a
+!! transaction (an auto-commit one if none is open), so this applies to
+!! every program that writes.
 
 module sqr
     use, intrinsic :: iso_fortran_env, only: int8, int32, int64, real64
@@ -192,6 +200,7 @@ module sqr
         type(index_t), allocatable  :: indices(:)  !! Secondary indices
         integer                     :: blob_unit      = -1       !! Open unit for `<table>.blob`, -1 if none
         integer(int64)              :: blob_next      = 1_int64  !! Next blob append position (1-based)
+        logical                     :: wedged         = .false.  !! Failed after its compact/layout-change commit marker; unusable until the database is reopened
         character(len=:), allocatable :: rbuf_scratch   !! Reusable record buffer (ins_core's wbuf); transient, re-sized lazily by ensure_len
         character(len=:), allocatable :: rbuf_scratch2  !! Second record buffer for unique_violation's row read, live while rbuf_scratch is
     end type
@@ -329,6 +338,8 @@ module sqr
 
     !! An open database handle.  Obtain with `db_open`; release with
     !! `db_close`.  A handle is bound to one directory for its lifetime.
+    !! Declare the handle `type(db_t), target`.  While a transaction is open
+    !! the index trees hold a pointer to it (see the module header).
     type, public :: db_t
         character(len=:), allocatable :: dir  !! Database directory path
         type(table_t), allocatable    :: tables(:)  !! Open tables
@@ -553,15 +564,14 @@ module sqr
         !! A read-write open creates the directory if needed; a read-only
         !! open requires an already-initialised database.
         !!
-        !! CONTRACT: `db` is `intent(out)`, so any state from a prior open
-        !! is discarded before `db_open` can act on it.  The caller MUST
-        !! `db_close` an open handle before reopening it (or opening a
-        !! different db into it): the old data/index/blob unit numbers
-        !! would otherwise be leaked with the files left open.  `db_open`
-        !! cannot defend against this internally — the handle is already
-        !! wiped on entry.
+        !! A handle that is already open is refused with `SQR_INVALID`
+        !! ("handle is already open; close it first") and left open and
+        !! untouched: `db_close` it before reopening it or opening another
+        !! database into it.  A closed (or never opened) handle is reset to
+        !! its default state before the open begins.
+        !! The handle must be declared `target` (module header).
         module subroutine db_open(db, dir, stat, errmsg, readonly, durable)
-            class(db_t),       intent(out)             :: db  !! Database handle (overwritten)
+            class(db_t),       intent(inout)           :: db  !! Database handle (must not be open)
             character(len=*), intent(in)              :: dir  !! Database directory name
             integer,          intent(out),  optional  :: stat  !! `SQR_OK` or an error code
             character(len=*), intent(inout), optional :: errmsg  !! Human-readable failure detail
@@ -604,9 +614,10 @@ module sqr
 
         !! Reopen the units `db_quiesce` closed, from the same on-disk state.
         !! Refused (`SQR_INVALID`) on a handle that is not quiesced.  A
-        !! failure leaves the handle wedged exactly as a failed `db_compact`
-        !! reopen does: the on-disk database is intact, but this handle must
-        !! be closed and reopened before further use.
+        !! failure leaves the on-disk database intact and the handle still
+        !! quiesced, so that `db_resume` can be called again (say once a
+        !! missing file is back); it reopens only what is still closed.
+        !! `db_close` is also safe on such a handle.
         module subroutine db_resume(db, stat, errmsg)
             class(db_t), intent(inout)               :: db  !! Quiesced database handle
             integer,    intent(out),       optional :: stat  !! `SQR_OK` or the first reopen failure
@@ -649,7 +660,18 @@ module sqr
         end subroutine
 
         !! Drop a table and delete all of its files (data, schema,
-        !! indices, blob).
+        !! indices, blob).  A durable marker, `_dropping` in the database
+        !! directory, is written first and names the table; then the catalog
+        !! is rewritten without it, its files are removed (the schema last)
+        !! and the marker is cleared.  If a crash or a failure interrupts the
+        !! drop after the marker, the next read-write `db_open` (or this
+        !! handle's `db_close`) finishes it, so the name is free again for
+        !! `db_create_table`.  A read-only open that finds the marker is
+        !! refused with `SQR_READONLY`.  A marker write that fails and cannot
+        !! be withdrawn cleanly wedges the table, as `db_compact` describes.
+        !! A marker never completely written (power lost while it was made)
+        !! means no drop began: a read-write open removes it, a read-only
+        !! open ignores it.
         module subroutine db_drop_table(db, name, stat, errmsg)
             class(db_t),       intent(inout)        :: db  !! Database handle
             character(len=*), intent(in)           :: name  !! Table to drop
@@ -669,13 +691,18 @@ module sqr
         !! read-write open db; a read-only open is rejected with
         !! `SQR_READONLY`.
         !!
-        !! On-disk consistency is preserved on any failure
-        !! (build-then-swap).  But if the post-swap reopen of the
-        !! compacted data/blob fails, that table's in-memory handle is
-        !! left wedged (units = -1) for the rest of the session even
-        !! though the on-disk state is the correct compacted file: `stat`
-        !! reports the error, and the caller should `db_close` and
-        !! `db_open` afresh rather than keep using the handle.
+        !! On-disk consistency is preserved on any failure: the compacted
+        !! files are built beside the originals, made durable, and a marker
+        !! commits them before the swap.
+        !! A failure after the commit point, or a failed marker write whose
+        !! marker cannot be withdrawn cleanly, leaves the database consistent
+        !! on disk (the next read-write `db_open` finishes the job from the
+        !! marker, or finds none and the table as it was), but the table is
+        !! WEDGED for the rest of the session: its
+        !! files are closed, reads of it fail, and every write and structural
+        !! change on the handle is refused with `SQR_ERR`, 'table "<t>" needs
+        !! recovery: close and reopen the database'.  `db_close` succeeds and
+        !! does not write the wedged table's schema; close and reopen.
         module subroutine db_compact(db, table_name, stat, errmsg)
             class(db_t),       intent(inout)         :: db  !! Database handle
             character(len=*), intent(in)            :: table_name  !! Table to compact
@@ -767,6 +794,15 @@ module sqr
         !! the marker leaves the old table; a crash after it is rolled forward
         !! by the next read-write `db_open`, so the table is never seen in a
         !! mixture of the two layouts.
+        !! A failure after the commit point, or a failed marker write whose
+        !! marker cannot be withdrawn cleanly, leaves the database consistent
+        !! on disk (the next read-write `db_open` finishes the job from the
+        !! marker, or finds none and the table as it was), but the table is
+        !! WEDGED for the rest of the session: its
+        !! files are closed, reads of it fail, and every write and structural
+        !! change on the handle is refused with `SQR_ERR`, 'table "<t>" needs
+        !! recovery: close and reopen the database'.  `db_close` succeeds and
+        !! does not write the wedged table's schema; close and reopen.
         module subroutine db_add_column(db, table_name, col, stat, errmsg)
             class(db_t),      intent(inout)           :: db  !! Database handle
             character(len=*), intent(in)              :: table_name  !! Target table
@@ -786,7 +822,8 @@ module sqr
         !! column deletes the table's blob file.  Fails with `SQR_NOT_FOUND`
         !! (no such table or column), `SQR_INVALID` (the column is the table's
         !! only one — a table must keep at least one column), or `SQR_READONLY`.
-        !! Same build-then-swap durability as `db_add_column`.
+        !! Same build-then-swap durability as `db_add_column`, and the same
+        !! wedged table after a failure past the commit point.
         module subroutine db_drop_column(db, table_name, col_name, stat, errmsg)
             class(db_t),      intent(inout)           :: db  !! Database handle
             character(len=*), intent(in)              :: table_name  !! Target table
@@ -813,7 +850,8 @@ module sqr
         !! malformed column set, a duplicate name, or a matched column whose type
         !! or size differs - no conversion is attempted), `SQR_READONLY`, or
         !! inside a transaction.  Same build-then-swap durability as
-        !! `db_add_column`.  A dropped `DT_TEXT` column's blob bytes are kept
+        !! `db_add_column`, and the same wedged table after a failure past the
+        !! commit point.  A dropped `DT_TEXT` column's blob bytes are kept
         !! until the table's text is rewritten (the whole blob file is deleted
         !! when the last `DT_TEXT` column goes).
         module subroutine db_reshape_table(db, table_name, cols, stat, errmsg)
@@ -940,6 +978,7 @@ module sqr
         !! populated afterwards with `db_set_text`.  A unique-index
         !! violation fails with `SQR_DUP` and writes no row; an exhausted
         !! row-id space fails with `SQR_FULL`.
+        !! The handle must be declared `target` (module header).
         module subroutine db_insert(db, table_name, buf, row_id, stat, errmsg)
             class(db_t),       intent(inout)        :: db  !! Database handle
             character(len=*), intent(in)           :: table_name  !! Target table
@@ -970,6 +1009,7 @@ module sqr
         !! via `db_set_text`, as for insert).  As for insert, `buf` must be
         !! exactly `db_record_size(db, table_name)` long or the update is
         !! rejected with `SQR_INVALID`.
+        !! The handle must be declared `target` (module header).
         module subroutine db_update(db, table_name, row_id, buf, stat, errmsg)
             class(db_t),       intent(inout)        :: db  !! Database handle
             character(len=*), intent(in)           :: table_name  !! Target table
@@ -981,6 +1021,7 @@ module sqr
 
         !! Tombstone a live row.  Space is not reclaimed until
         !! `db_compact`.
+        !! The handle must be declared `target` (module header).
         module subroutine db_delete(db, table_name, row_id, stat, errmsg)
             class(db_t),       intent(inout)        :: db  !! Database handle
             character(len=*), intent(in)           :: table_name  !! Target table
@@ -1078,6 +1119,7 @@ module sqr
         !! batch with nothing inserted (`row_ids = 0`).  `row_ids` must be at
         !! least `size(bufs)` long, and — as for `db_insert` — the buffers
         !! exactly `db_record_size(db, table_name)` long.
+        !! The handle must be declared `target` (module header).
         module subroutine db_insert_many(db, table_name, bufs, row_ids, stat, errmsg)
             class(db_t),       intent(inout)         :: db  !! Database handle
             character(len=*), intent(in)            :: table_name  !! Target table
@@ -1123,6 +1165,7 @@ module sqr
 
         !! Update a row by natural key (resolve via the unique index,
         !! then delegate to `db_update`).
+        !! The handle must be declared `target` (module header).
         module subroutine db_update_by_key(db, table_name, col_names, keyrow, newrow, stat, errmsg)
             class(db_t),       intent(inout)         :: db  !! Database handle
             character(len=*), intent(in)            :: table_name  !! Target table
@@ -1135,6 +1178,7 @@ module sqr
 
         !! Delete a row by natural key (resolve via the unique index,
         !! then delegate to `db_delete`).
+        !! The handle must be declared `target` (module header).
         module subroutine db_delete_by_key(db, table_name, col_names, keyrow, stat, errmsg)
             class(db_t),       intent(inout)         :: db  !! Database handle
             character(len=*), intent(in)            :: table_name  !! Target table
@@ -1390,6 +1434,7 @@ module sqr
         !! redo history if it changed anything: a step restores absolute byte
         !! images, which a change the history did not record would invalidate.
         !! An application that offers Undo therefore makes every write a gesture.
+        !! The handle must be declared `target` (module header).
         module subroutine db_begin(db, stat, label, errmsg)
             class(db_t), intent(inout), target :: db  !! Database handle
             integer,    intent(out),  optional :: stat  !! `SQR_OK` or an error code

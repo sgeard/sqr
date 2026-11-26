@@ -12,7 +12,7 @@ submodule (sqr:sqr_base) sqr_table
 contains
 
     module subroutine db_open(db, dir, stat, errmsg, readonly, durable)
-        class(db_t),       intent(out)             :: db
+        class(db_t),       intent(inout)           :: db
         character(len=*), intent(in)              :: dir
         integer,          intent(out),  optional  :: stat
         character(len=*), intent(inout), optional :: errmsg
@@ -29,6 +29,13 @@ contains
             'indices are in the sqr 1.x format; open the database read-write' // &
             ' once to upgrade it, or read it with sqr 1.8.x: "'
 
+        ! An open handle is refused and left as it is: wiping it would leak its
+        ! units and its lock, and the lock would then refuse the new open.
+        if (db%opened) then
+            call raise_db(db, SQR_INVALID, stat, errmsg, 'handle is already open; close it first')
+            return
+        end if
+        call wipe_handle(db)       ! the default state, as intent(out) gave it
         rs = SQR_OK
         ! Fold any '\' to '/' so the engine reasons about a single separator on
         ! every platform (Windows accepts both); see norm_seps.
@@ -124,6 +131,29 @@ contains
                     end block why_block
                     exit open_seq
                 end if
+            end if
+
+            ! An interrupted db_drop_table (a complete `_dropping` marker) is
+            ! finished below, once the tables are loaded; a read-only handle
+            ! cannot, so it refuses, as for the other markers.  An incomplete
+            ! marker means no drop began: a read-only handle ignores it.
+            if (db%readonly) then
+                ro_marker: block
+                    character(len=:), allocatable :: mname
+                    logical :: exists, complete
+                    call read_drop_marker(db, exists, complete, mname, rs)
+                    if (rs /= SQR_OK) then
+                        call raise_db(db, rs, stat, errmsg, 'cannot read the drop marker')
+                        exit open_seq
+                    end if
+                    if (complete) then
+                        rs = SQR_READONLY
+                        call raise_db(db, rs, stat, errmsg, &
+                            'database needs drop-table recovery; reopen read-write: "' &
+                            // trim(db%dir) // '"')
+                        exit open_seq
+                    end if
+                end block ro_marker
             end if
 
             call read_catalog(db, names, n, rs, catver)
@@ -274,8 +304,15 @@ contains
                                     end if
                                 end do rebuild_all
                                 call write_schema(db, t, rs)
-                                if (rs == SQR_OK .and. interrupted) &
-                                    call clear_compact_marker(db, trim(names(i)), rs)
+                                if (rs == SQR_OK .and. interrupted) then
+                                    retire: block
+                                        logical :: gone
+                                        character(len=1) :: none(0)
+                                        call retract_marker(db, compact_marker_path(db, trim(names(i))), &
+                                                            none, gone)
+                                        rs = merge(SQR_OK, SQR_ERR, gone)
+                                    end block retire
+                                end if
                                 if (rs /= SQR_OK) then
                                     if (interrupted) then
                                         call raise_db(db, rs, stat, errmsg, &
@@ -302,6 +339,17 @@ contains
                     end associate
                 end do tables_open
                 db%ntables = n
+            end if
+
+            if (.not. db%readonly) then
+                finish_marker: block
+                    character(len=:), allocatable :: why
+                    call finish_drop(db, rs, why)
+                    if (rs /= SQR_OK) then
+                        call raise_db(db, rs, stat, errmsg, why)
+                        exit open_seq
+                    end if
+                end block finish_marker
             end if
 
             ! Every table is at the current version now; say so in the
@@ -344,6 +392,18 @@ contains
         if (db%jrnl%active .and. .not. db%readonly) then
             call txn_rollback(db, rs)
             if (rs /= SQR_OK .and. first == SQR_OK) first = rs
+        end if
+        ! A drop left half done in this session (its `_dropping` marker is
+        ! still there) is finished before the catalog is settled.
+        if (.not. db%readonly) then
+            finish_marker: block
+                character(len=:), allocatable :: why
+                call finish_drop(db, rs, why)
+                if (rs /= SQR_OK .and. first == SQR_OK) then
+                    first = rs
+                    call set_last_err(db, rs, why)
+                end if
+            end block finish_marker
         end if
         ! Schema counters (next_id/live_count) and a catalog whose last write
         ! failed reach the disk here, so capture the first write failure for
@@ -391,6 +451,7 @@ contains
         end if
         call jrnl_close_unit(db)      ! a read-only handle never opened one; harmless
         db%jrnl%needs_recovery = .false.   ! the latch belongs to the session just closed
+        call db_reset_history(db)     ! a closed handle has nothing to undo or redo
         if (allocated(db%tables)) deallocate(db%tables)
         if (allocated(db%dir))    deallocate(db%dir)
         ! Release the advisory lock (closing its descriptor/handle).
@@ -470,15 +531,20 @@ contains
         first = SQR_OK
         ! Reopen from the on-disk state db_quiesce flushed.  Every failure is
         ! recorded but the loop runs to the end: a handle with some units open
-        ! and some not is what db_close expects to tidy up.
+        ! and some not is what db_close expects to tidy up.  Only what is still
+        ! closed is opened, so a retry after a partial failure does not open a
+        ! file twice (each open leaves its unit at -1 when it fails).
         resume_tables: do i = 1, db%ntables
             associate (t => db%tables(i))
-                call open_data(db, t, 'old', rs)
-                if (rs /= SQR_OK .and. first == SQR_OK) then
-                    first = rs
-                    call set_last_err(db, rs, 'cannot reopen data file for ' // trim(t%name))
+                if (t%wedged) cycle resume_tables   ! stays closed until a reopen
+                if (t%unit == -1) then
+                    call open_data(db, t, 'old', rs)
+                    if (rs /= SQR_OK .and. first == SQR_OK) then
+                        first = rs
+                        call set_last_err(db, rs, 'cannot reopen data file for ' // trim(t%name))
+                    end if
                 end if
-                if (table_has_text(t)) then
+                if (table_has_text(t) .and. t%blob_unit == -1) then
                     call open_blob(db, t, 'old', rs)
                     if (rs /= SQR_OK .and. first == SQR_OK) then
                         first = rs
@@ -487,6 +553,7 @@ contains
                 end if
                 resume_indices: do j = 1, t%nindices
                     if (.not. idx_live(t%indices(j))) cycle resume_indices
+                    if (t%indices(j)%bt%unit /= -1) cycle resume_indices
                     call open_index(db, t, t%indices(j), j, 'old', rs)
                     if (rs /= SQR_OK .and. first == SQR_OK) then
                         first = rs
@@ -496,7 +563,8 @@ contains
             end associate
         end do resume_tables
         ! Only a clean reopen lifts the flag: a wedged handle stays quiesced so
-        ! a second db_resume is refused rather than opening units twice.
+        ! that db_resume can be called again; it reopens only what is still
+        ! closed.
         if (first == SQR_OK) db%quiesced = .false.
         call report(db, first, stat, errmsg)
     end subroutine
@@ -703,6 +771,12 @@ contains
         if (.not. yes) yes = c_path_exists(blob_path(db, name))
     end function
 
+    ! The default state of a handle, as `intent(out)` on db_open's dummy gave
+    ! it before db_open began refusing an open handle.
+    subroutine wipe_handle(h)
+        type(db_t), intent(out) :: h
+    end subroutine
+
     !! Undo a half-created table: close its open units (deleting the files
     !! they are connected to) and remove the schema file.  Used only by the
     !! db_create_table failure tails, where the contract is "no trace left"
@@ -727,33 +801,63 @@ contains
         character(len=*), intent(in)           :: name
         integer,          intent(out), optional :: stat
         character(len=*), intent(inout), optional :: errmsg
-        type(table_t), allocatable :: nt(:)
-        integer :: j, rs, idx, ni
+        integer :: rs, idx
+        logical :: gone
+        character(len=1) :: none(0)
         call clear_last_err(db)
         if (readonly_block(db, stat, errmsg)) return
         if (txn_block(db, stat, errmsg)) return
-        db%generation = db%generation + 1   ! shifts table slots: invalidate cursors
-        call db_reset_history(db)           ! slot shift ⇒ captured undo/redo steps can't replay
         idx = db_table_index(db, name)
         if (idx == 0) then
             call report(db, SQR_NOT_FOUND, stat, errmsg)
             return
         end if
+        db%generation = db%generation + 1   ! shifts table slots: invalidate cursors
+        call db_reset_history(db)           ! slot shift ⇒ captured undo/redo steps can't replay
 
-        ! Order matters: drop the table from the catalog *before* deleting any
-        ! files. If we deleted first and the catalog write then failed (or the
-        ! process died in between), the catalog would still name a table whose
-        ! schema file is gone, and db_open would hard-fail the whole database.
-        ! With catalog-first the worst case is orphaned files on disk (benign,
-        ! re-creatable) rather than an unopenable store.
+        ! 1. The commit point: a durable `_dropping` marker naming the table.
+        ! A failed write may still have left the marker on disk: it is
+        ! withdrawn, and if that cannot be confirmed the table is wedged, so
+        ! nothing is written that a drop finished later would throw away.
+        ! From a written marker on, a crash or a failure below is finished by
+        ! the next writable open or by db_close (finish_drop): the table's
+        ! name is never left blocked by orphaned files.
+        call write_drop_marker(db, db%tables(idx)%name, rs)
+        if (rs /= SQR_OK) then
+            call retract_marker(db, drop_marker_path(db), none, gone)
+            if (.not. gone) then
+                call wedge_table(db, db%tables(idx))
+                rs = SQR_ERR
+            end if
+            call report(db, rs, stat, errmsg)
+            return
+        end if
+        ! 2. to 4.: out of memory and the catalog, files removed, marker cleared.
+        call drop_loaded_table(db, idx, rs)
+        call report(db, rs, stat, errmsg)
+    end subroutine
 
-        ! Close all of this table's units while db%tables(idx) is still live.
+    ! Steps 2 to 4 of a drop (db_drop_table, finish_drop) for table `idx`,
+    ! which is loaded: close its units (a failed close is ignored: the files
+    ! are about to be deleted), take it out of db%tables, write the catalog,
+    ! then remove its files and clear the marker.  Catalog first: if the
+    ! catalog still named a table whose schema was gone, db_open would fail on
+    ! the whole database.  A failure returns with the marker in place.
+    subroutine drop_loaded_table(db, idx, stat)
+        type(db_t), intent(inout) :: db
+        integer,    intent(in)    :: idx
+        integer,    intent(out)   :: stat
+        type(table_t), allocatable :: nt(:)
+        character(len=SQR_NAME_LEN) :: nm
+        integer :: j, ni, ios
+        nm = db%tables(idx)%name
         ni = db%tables(idx)%nindices
-        if (db%tables(idx)%unit /= -1) close(db%tables(idx)%unit)
-        if (db%tables(idx)%blob_unit /= -1) close(db%tables(idx)%blob_unit)
+        if (db%tables(idx)%unit /= -1) close(db%tables(idx)%unit, iostat=ios)
+        if (db%tables(idx)%blob_unit /= -1) close(db%tables(idx)%blob_unit, iostat=ios)
         close_indices: do j = 1, ni
             associate (ix => db%tables(idx)%indices(j))
                 call bt_discard(ix%bt)
+                if (associated(ix%jctx)) deallocate(ix%jctx)
             end associate
         end do close_indices
 
@@ -765,24 +869,189 @@ contains
         db%ntables = db%ntables - 1
         db%catalog_dirty = .true.
 
-        call write_catalog(db, rs)
-        if (rs /= SQR_OK) then
-            ! Catalog not updated: leave the files in place so the table is
-            ! still recoverable rather than orphaning a half-dropped table.
-            call report(db, rs, stat, errmsg)
+        call write_catalog(db, stat)
+        if (stat /= SQR_OK) return
+        call remove_dropped_files(db, trim(nm), ni, stat)
+    end subroutine
+
+    ! Steps 3 and 4 of a drop, once the catalog no longer names `name`: remove
+    ! its index files (`ni` slots), blob and data file, the schema LAST (so a
+    ! schema still present means the others may be too), then clear the
+    ! marker.  Each step tolerates a file already gone, so it can be re-run.
+    subroutine remove_dropped_files(db, name, ni, stat)
+        type(db_t),       intent(in)  :: db
+        character(len=*), intent(in)  :: name
+        integer,          intent(in)  :: ni
+        integer,          intent(out) :: stat
+        integer :: j, ios
+        logical :: gone
+        character(len=1) :: none(0)
+        ios = 0
+        del_indices: do j = 1, ni
+            call remove_existing(index_path(db, name, j), ios)
+            if (ios /= 0) exit del_indices
+        end do del_indices
+        if (ios == 0) call remove_existing(blob_path(db, name), ios)
+        if (ios == 0) call remove_existing(data_path(db, name), ios)
+        if (ios == 0) call remove_existing(schema_path(db, name), ios)
+        if (ios /= 0) then
+            stat = SQR_ERR
             return
         end if
+        call retract_marker(db, drop_marker_path(db), none, gone)
+        stat = merge(SQR_OK, SQR_ERR, gone)
+    end subroutine
 
-        ! Catalog no longer references the table — now reclaim its files.
-        ! Any failure here leaves harmless orphans, not a broken database.
-        call remove_file(data_path(db, name))
-        call remove_file(blob_path(db, name))
-        del_indices: do j = 1, ni
-            call remove_file(index_path(db, name, j))
-        end do del_indices
-        call remove_file(schema_path(db, name))
+    ! Delete `path` if it exists; ios is the failure, 0 when there was nothing.
+    subroutine remove_existing(path, ios)
+        character(len=*), intent(in)  :: path
+        integer,          intent(out) :: ios
+        ios = 0
+        if (.not. c_path_exists(path)) return
+        ios = c_remove(path)
+        call io_check(ios)
+    end subroutine
 
-        call report(db, SQR_OK, stat, errmsg)
+    ! Write the drop marker naming `name` and make it durable: `DROP`, the
+    ! name, then checksum(`DROP` // name) as a 4-byte integer (as the journal
+    ! stores its own), in one write.  read_drop_marker takes anything else -
+    ! an empty or zero-filled file left by power loss - for a write that
+    ! never finished.
+    subroutine write_drop_marker(db, name, stat)
+        type(db_t),       intent(in)  :: db
+        character(len=*), intent(in)  :: name
+        integer,          intent(out) :: stat
+        integer :: u, ios
+        open(newunit=u, file=drop_marker_path(db), access='stream', &
+             form='unformatted', status='replace', action='write', iostat=ios)
+        if (ios /= 0) then
+            stat = SQR_ERR
+            return
+        end if
+        write(u, iostat=ios) 'DROP' // trim(name), checksum('DROP' // trim(name))
+        call io_check(ios)
+        if (ios /= 0) then
+            close(u, iostat=ios)
+            stat = SQR_ERR
+            return
+        end if
+        close(u, iostat=ios)
+        call io_check(ios)
+        if (ios == 0 .and. db%durable) ios = c_fsync_path(drop_marker_path(db))
+        call io_check(ios)
+        if (ios == 0 .and. db%durable) ios = c_fsync_dir(db%dir)   ! the new marker must be durable
+        call io_check(ios)
+        stat = merge(SQR_ERR, SQR_OK, ios /= 0)
+    end subroutine
+
+    ! The `_dropping` marker as finish_drop and a read-only db_open see it.
+    ! `exists`: the file is there.  `complete`: it holds `DROP`, a name of 1
+    ! to SQR_NAME_LEN bytes and the checksum write_drop_marker stores; `nm` is
+    ! then that name, still untrusted.  An incomplete marker is a write that
+    ! never finished, so no drop began.  stat is SQR_ERR only when the file
+    ! is there but cannot be read.
+    subroutine read_drop_marker(db, exists, complete, nm, stat)
+        type(db_t),                    intent(in)  :: db
+        logical,                       intent(out) :: exists, complete
+        character(len=:), allocatable, intent(out) :: nm
+        integer,                       intent(out) :: stat
+        character(len=:), allocatable :: buf
+        integer :: u, ios, cs, n
+        integer(int64) :: sz
+        nm       = ''
+        complete = .false.
+        stat     = SQR_OK
+        exists   = c_path_exists(drop_marker_path(db))
+        if (.not. exists) return
+        open(newunit=u, file=drop_marker_path(db), access='stream', &
+             form='unformatted', status='old', action='read', iostat=ios)
+        if (ios /= 0) then
+            stat = SQR_ERR
+            return
+        end if
+        inquire(unit=u, size=sz)
+        if (sz < 9 .or. sz > SQR_NAME_LEN + 8) then
+            close(u, iostat=cs)   ! read only: a failed close is ignored
+            return
+        end if
+        n = int(sz)
+        allocate(character(len=n) :: buf)
+        read(u, iostat=ios) buf
+        call io_check(ios)
+        close(u, iostat=cs)       ! read only: a failed close is ignored
+        if (ios /= 0) then
+            stat = SQR_ERR
+            return
+        end if
+        if (buf(1:4) /= 'DROP') return
+        if (transfer(buf(n-3:n), 0) /= checksum(buf(1:n-4))) return
+        complete = .true.
+        nm = buf(5:n-4)
+    end subroutine
+
+    ! Finish a drop that a crash or a failure left half done (the `_dropping`
+    ! marker exists).  Called by db_open on a writable handle once the tables
+    ! are loaded and the journal recovered, and by db_close on a writable
+    ! handle before it settles the catalog.  An incomplete marker (see
+    ! read_drop_marker) means no drop began: it is withdrawn and nothing else
+    ! is touched.  A complete marker's name is untrusted: it must pass the
+    ! checks a catalog name passes, or nothing is touched (SQR_INVALID,
+    ! "corrupt drop marker").  A table still loaded is dropped
+    ! by the ordinary path; otherwise the catalog is brought level if it is
+    ! behind, its files are removed (the index slot count from its schema if
+    ! that still reads) and the marker cleared.  Idempotent.
+    subroutine finish_drop(db, stat, why)
+        type(db_t),       intent(inout) :: db
+        integer,          intent(out)   :: stat
+        character(len=:), allocatable, intent(out) :: why
+        character(len=:), allocatable :: nm
+        integer :: idx, ni
+        logical :: exists, complete, gone
+        character(len=1) :: none(0)
+        why  = ''
+        call read_drop_marker(db, exists, complete, nm, stat)
+        if (.not. exists) return
+        if (stat /= SQR_OK) then
+            why  = 'cannot read the drop marker'
+            return
+        end if
+        if (.not. complete) then
+            call retract_marker(db, drop_marker_path(db), none, gone)
+            if (.not. gone) then
+                stat = SQR_ERR
+                why  = 'cannot finish an interrupted drop table'
+            end if
+            return
+        end if
+        if (.not. valid_name(nm)) then
+            stat = SQR_INVALID
+            why  = 'corrupt drop marker'
+            return
+        end if
+        idx = db_table_index(db, nm)
+        if (idx > 0) then
+            call drop_loaded_table(db, idx, stat)
+        else
+            ! Step 2 may have taken the table out of memory without the
+            ! catalog write succeeding: the catalog first, as in step 2.
+            if (db%catalog_dirty) then
+                call write_catalog(db, stat)
+                if (stat /= SQR_OK) then
+                    why = 'cannot finish an interrupted drop table'
+                    return
+                end if
+            end if
+            ni = 0
+            schema_count: block
+                type(table_t) :: gone
+                integer :: rs
+                if (.not. c_path_exists(schema_path(db, nm))) exit schema_count
+                call read_schema(db, nm, gone, rs)
+                if (rs == SQR_OK) ni = gone%nindices
+            end block schema_count
+            call remove_dropped_files(db, nm, ni, stat)
+        end if
+        if (stat /= SQR_OK) why = 'cannot finish an interrupted drop table'
     end subroutine
 
     module subroutine db_compact(db, table_name, stat, errmsg)
@@ -793,19 +1062,20 @@ contains
         integer :: idx, ud, ub, ios, rs, j, ci
         integer(int32) :: rid, new_rid, length
         integer(int64) :: off, newpos
-        logical :: has_text
+        logical :: has_text, gone
         character(len=:), allocatable :: rbuf, dpath, dtmp, bpath, btmp
+        character(len=1) :: none(0)
         call clear_last_err(db)
 
         if (readonly_block(db, stat, errmsg)) return
         if (txn_block(db, stat, errmsg)) return
-        db%generation = db%generation + 1   ! renumbers rows: invalidate cursors
-        call db_reset_history(db)           ! row renumber ⇒ captured undo/redo steps can't replay
         idx = db_table_index(db, table_name)
         if (idx == 0) then
             call report(db, SQR_NOT_FOUND, stat, errmsg)
             return
         end if
+        db%generation = db%generation + 1   ! renumbers rows: invalidate cursors
+        call db_reset_history(db)           ! row renumber ⇒ captured undo/redo steps can't replay
         ud = -1; ub = -1
         rs = SQR_OK
         associate (t => db%tables(idx))
@@ -907,16 +1177,21 @@ contains
             end block build
 
             if (rs /= SQR_OK) then
-                ! Originals untouched — discard the partial temp files.
-                if (ud /= -1) close(ud, status='delete')
-                if (ub /= -1) close(ub, status='delete')
+                ! Originals untouched — discard the partial temp files (a
+                ! failed close of a temp being deleted is ignored).
+                if (ud /= -1) close(ud, status='delete', iostat=ios)
+                if (ub /= -1) close(ub, status='delete', iostat=ios)
                 call report(db, rs, stat, errmsg)
                 return
             end if
             ! Guard the temp closes: a failed final flush here means the temp is
             ! not fully written, so abort before the swap rather than error stop.
             close(ud, iostat=ios)
-            if (ios == 0 .and. has_text) close(ub, iostat=ios)
+            if (has_text) then
+                close(ub, iostat=rs)            ! closed even when ud's close failed
+                if (ios == 0) ios = rs
+                rs = SQR_OK
+            end if
             if (ios /= 0) then
                 call report(db, SQR_ERR, stat, errmsg)
                 return
@@ -926,15 +1201,18 @@ contains
             ! A rename is only as safe as the bytes behind it: without this,
             ! power loss just after a "successful" compact could leave the new
             ! data file empty/partial while the original is already gone.
-            ios = c_fsync_path(dtmp)
-            call io_check(ios)
-            if (ios == 0 .and. has_text) then
-                ios = c_fsync_path(btmp)
+            ! A non-durable handle (durable=.false.) skips every fsync.
+            if (db%durable) then
+                ios = c_fsync_path(dtmp)
                 call io_check(ios)
-            end if
-            if (ios == 0) then
-                ios = c_fsync_dir(db%dir)
-                call io_check(ios)
+                if (ios == 0 .and. has_text) then
+                    ios = c_fsync_path(btmp)
+                    call io_check(ios)
+                end if
+                if (ios == 0) then
+                    ios = c_fsync_dir(db%dir)
+                    call io_check(ios)
+                end if
             end if
             if (ios /= 0) then
                 call report(db, SQR_ERR, stat, errmsg)
@@ -947,74 +1225,81 @@ contains
             ! the next open sees the marker and finishes the compact (the temps
             ! are already durable, so completion always rolls forward). rename(2)
             ! atomically replaces the destination, so no separate delete needed.
+            ! A failed marker write may still have left the marker on disk: it
+            ! and the temps are withdrawn (an ordinary failure, the table
+            ! untouched), and if that cannot be confirmed the table is wedged,
+            ! so no later write is rolled over by the next open.
             call write_compact_marker(db, t%name, rs)
             if (rs /= SQR_OK) then
-                call report(db, rs, stat, errmsg)
-                return
-            end if
-            close(t%unit); t%unit = -1
-            if (c_rename(dtmp, dpath) /= 0) then
-                call report(db, SQR_ERR, stat, errmsg)
-                return
-            end if
-            if (has_text) then
-                close(t%blob_unit); t%blob_unit = -1
-                if (c_rename(btmp, bpath) /= 0) then
+                if (has_text) then
+                    call retract_marker(db, compact_marker_path(db, t%name), &
+                        [character(len=max(len(dtmp), len(btmp))) :: dtmp, btmp], gone)
+                else
+                    call retract_marker(db, compact_marker_path(db, t%name), [dtmp], gone)
+                end if
+                if (gone) then
+                    call report(db, rs, stat, errmsg)
+                else
+                    call wedge_table(db, t)
                     call report(db, SQR_ERR, stat, errmsg)
-                    return
                 end if
-            end if
-            ios = c_fsync_dir(db%dir)   ! the renames themselves must be durable
-            call io_check(ios)
-            if (ios /= 0) then
-                call report(db, SQR_ERR, stat, errmsg)
                 return
             end if
-
-            ! Adopt the compacted counters BEFORE reopening. The renamed file is
-            ! the shorter one now, and open_data cross-checks next_id against
-            ! its size — a schema claiming ids past the end of the data file is
-            ! corruption. Carrying the pre-compact next_id across the reopen
-            ! would trip that check on a table we have just rewritten.
-            t%next_id    = new_rid + 1
-            t%live_count = new_rid
-
-            call open_data(db, t, 'old', rs)
-            if (rs /= SQR_OK) then
-                call report(db, rs, stat, errmsg)
-                return
-            end if
-            if (has_text) then
-                call open_blob(db, t, 'old', rs)
-                if (rs /= SQR_OK) then
-                    call report(db, rs, stat, errmsg)
-                    return
+            ! From here every failure wedges the table (wedge_table): the
+            ! marker is the truth and the next open finishes the compact; the
+            ! session must not go on with indexes holding pre-compact row ids.
+            past_marker: block
+                close(t%unit, iostat=ios); t%unit = -1   ! superseded: ignored
+                ios = c_rename(dtmp, dpath)
+                if (ios /= 0) exit past_marker
+                if (has_text) then
+                    close(t%blob_unit, iostat=ios); t%blob_unit = -1   ! superseded: ignored
+                    ios = c_rename(btmp, bpath)
+                    if (ios /= 0) exit past_marker
                 end if
-            end if
-
-            reindex: do j = 1, t%nindices
-                if (.not. idx_live(t%indices(j))) cycle reindex
-                call rebuild_index(db, idx, j, rs)
-                if (rs /= SQR_OK) then
-                    call report(db, rs, stat, errmsg)
-                    return
+                if (db%durable) then
+                    ios = c_fsync_dir(db%dir)   ! the renames themselves must be durable
+                    call io_check(ios)
+                    if (ios /= 0) exit past_marker
                 end if
-            end do reindex
 
-            call write_schema(db, t, rs)
-            if (rs /= SQR_OK) then
-                call report(db, rs, stat, errmsg)
+                ! Adopt the compacted counters BEFORE reopening. The renamed file
+                ! is the shorter one now, and open_data cross-checks next_id
+                ! against its size — a schema claiming ids past the end of the
+                ! data file is corruption. Carrying the pre-compact next_id
+                ! across the reopen would trip that check on a table we have
+                ! just rewritten.
+                t%next_id    = new_rid + 1
+                t%live_count = new_rid
+
+                call open_data(db, t, 'old', rs)
+                if (rs /= SQR_OK) exit past_marker
+                if (has_text) then
+                    call open_blob(db, t, 'old', rs)
+                    if (rs /= SQR_OK) exit past_marker
+                end if
+
+                reindex: do j = 1, t%nindices
+                    if (.not. idx_live(t%indices(j))) cycle reindex
+                    call rebuild_index(db, idx, j, rs)
+                    if (rs /= SQR_OK) exit past_marker
+                end do reindex
+
+                call write_schema(db, t, rs)
+                if (rs /= SQR_OK) exit past_marker
+                ! Fully durable: data+blob renamed, indices rebuilt, schema
+                ! written atomically. Retire the marker so the next open does no
+                ! recovery. A retirement that cannot be confirmed wedges the
+                ! table: the marker may reappear after power loss, and a later
+                ! compact in this session would write new temps under it.
+                call retract_marker(db, compact_marker_path(db, t%name), none, gone)
+                if (.not. gone) exit past_marker
+                call report(db, SQR_OK, stat, errmsg)
                 return
-            end if
-            ! Fully durable: data+blob renamed, indices rebuilt, schema written
-            ! atomically. Retire the marker so the next open does no recovery.
-            ! (A fault here leaves the marker; recovery is idempotent, so the
-            ! next open simply re-finishes and clears it.)
-            call clear_compact_marker(db, t%name, rs)
-            if (rs /= SQR_OK) then
-                call report(db, rs, stat, errmsg)
-                return
-            end if
+            end block past_marker
+            call wedge_table(db, t)
+            call report(db, SQR_ERR, stat, errmsg)
+            return
         end associate
         call report(db, SQR_OK, stat, errmsg)
     end subroutine
@@ -1034,24 +1319,39 @@ contains
             return
         end if
         close(u, iostat=ios)
-        if (ios == 0) ios = c_fsync_path(compact_marker_path(db, name))
+        if (ios == 0 .and. db%durable) ios = c_fsync_path(compact_marker_path(db, name))
         call io_check(ios)
-        if (ios == 0) ios = c_fsync_dir(db%dir)   ! the new marker must be durable
+        if (ios == 0 .and. db%durable) ios = c_fsync_dir(db%dir)   ! the new marker must be durable
         call io_check(ios)
         stat = merge(SQR_ERR, SQR_OK, ios /= 0)
     end subroutine
 
-    subroutine clear_compact_marker(db, name, stat)
+    ! Withdraw a marker: remove the marker FIRST, then each `staged` file (a
+    ! crash in between leaves staged files without a marker, which every open
+    ! ignores), then, on a durable handle, sync the directory.  Each removal
+    ! is an io_check point and a file already gone is not a failure.  Every
+    ! step is attempted whatever an earlier one returned, so as little as
+    ! possible is left; `gone` is .true. only if every step succeeded.  Used
+    ! after a marker write that failed (the marker may be on disk) and to
+    ! retire a marker once its operation is complete (no staged files).  A
+    ! non-durable handle takes a removal that returned success as gone.
+    subroutine retract_marker(db, marker, staged, gone)
         type(db_t),       intent(in)  :: db
-        character(len=*), intent(in)  :: name
-        integer,          intent(out) :: stat
-        integer :: ios
-        ios = 0
-        if (c_path_exists(compact_marker_path(db, name))) &
-            ios = c_remove(compact_marker_path(db, name))
-        if (ios == 0) ios = c_fsync_dir(db%dir)   ! the removal must be durable
-        call io_check(ios)
-        stat = merge(SQR_ERR, SQR_OK, ios /= 0)
+        character(len=*), intent(in)  :: marker
+        character(len=*), intent(in)  :: staged(:)
+        logical,          intent(out) :: gone
+        integer :: k, ios
+        call remove_existing(marker, ios)
+        gone = ios == 0
+        each_staged: do k = 1, size(staged)
+            call remove_existing(trim(staged(k)), ios)
+            if (ios /= 0) gone = .false.
+        end do each_staged
+        if (db%durable) then
+            ios = c_fsync_dir(db%dir)   ! the removals must be durable
+            call io_check(ios)
+            if (ios /= 0) gone = .false.
+        end if
     end subroutine
 
     ! Finish an interrupted compact detected on open: roll each surviving
@@ -1187,8 +1487,6 @@ contains
         call clear_last_err(db)
         if (readonly_block(db, stat, errmsg)) return
         if (txn_block(db, stat, errmsg)) return
-        db%generation = db%generation + 1   ! structural change: invalidate cursors
-        call db_reset_history(db)           ! record_size change ⇒ captured undo/redo steps can't replay
         ti = db_table_index(db, table_name)
         if (ti == 0) then
             call raise_db(db, SQR_NOT_FOUND, stat, errmsg, 'no such table: ' // trim(table_name))
@@ -1218,6 +1516,8 @@ contains
         src(nold + 1) = 0
         allocate(cascade(0))
 
+        db%generation = db%generation + 1   ! structural change: invalidate cursors
+        call db_reset_history(db)           ! record_size change ⇒ captured undo/redo steps can't replay
         call apply_layout_change(db, ti, newcols, new_rs, src, cascade, rs)
         call report(db, rs, stat, errmsg)
     end subroutine
@@ -1235,8 +1535,6 @@ contains
         call clear_last_err(db)
         if (readonly_block(db, stat, errmsg)) return
         if (txn_block(db, stat, errmsg)) return
-        db%generation = db%generation + 1   ! structural change: invalidate cursors
-        call db_reset_history(db)           ! record_size change ⇒ captured undo/redo steps can't replay
         ti = db_table_index(db, table_name)
         if (ti == 0) then
             call raise_db(db, SQR_NOT_FOUND, stat, errmsg, 'no such table: ' // trim(table_name))
@@ -1272,6 +1570,8 @@ contains
             call cascade_indices(t, col_name, cascade)
         end associate
 
+        db%generation = db%generation + 1   ! structural change: invalidate cursors
+        call db_reset_history(db)           ! record_size change ⇒ captured undo/redo steps can't replay
         call apply_layout_change(db, ti, newcols, new_rs, src, cascade, rs)
         call report(db, rs, stat, errmsg)
     end subroutine
@@ -1450,7 +1750,8 @@ contains
     !      anywhere after the marker is rolled forward on the next open
     !      (complete_alter_swap), before the schema is read.
     ! A failure past the commit returns an error but leaves the database
-    ! consistent on disk in the NEW layout (a reopen sees it whole).
+    ! consistent on disk in the NEW layout (a reopen sees it whole); the
+    ! table is wedged for the rest of the session (wedge_table).
     subroutine apply_layout_change(db, ti, newcols, new_rs, src, cascade, stat)
         type(db_t),     intent(inout) :: db
         integer,        intent(in)    :: ti
@@ -1461,7 +1762,7 @@ contains
         integer,        intent(out)   :: stat
         integer :: ud, ios, rs, j, m, k, old_rs
         integer(int32) :: rid
-        logical :: had_text, has_text_new
+        logical :: had_text, has_text_new, gone
         character(len=:), allocatable :: rbuf, nbuf, dpath, dtmp, spath, stmp, btmp
         type(column_t), allocatable :: oldcols(:)
         type(table_t) :: nt
@@ -1512,7 +1813,7 @@ contains
                 rs = SQR_OK
             end block build
             if (rs /= SQR_OK) then
-                if (ud /= -1) close(ud, status='delete')
+                if (ud /= -1) close(ud, status='delete', iostat=ios)   ! a temp: ignored
                 stat = rs
                 return
             end if
@@ -1564,20 +1865,36 @@ contains
             end if
 
             ! ---- 2. COMMIT: the marker makes the staged pair authoritative.
+            ! A failed marker write may still have left the marker on disk: it
+            ! and the staged files are withdrawn (an ordinary failure, the
+            ! table untouched), and if that cannot be confirmed the table is
+            ! wedged, so the next open never swaps a stale layout over later
+            ! writes.
             call write_alter_marker(db, t%name, rs)
             if (rs /= SQR_OK) then
-                call remove_file(alter_marker_path(db, t%name))
-                call remove_file(dtmp)
-                call remove_file(stmp)
-                call remove_file(btmp)
-                stat = rs
+                call retract_marker(db, alter_marker_path(db, t%name), &
+                    [character(len=max(len(dtmp), len(stmp), len(btmp))) :: dtmp, stmp, btmp], gone)
+                if (gone) then
+                    stat = rs
+                else
+                    call wedge_table(db, t)
+                    stat = SQR_ERR
+                end if
                 return
             end if
 
             ! ---- 3. SWAP: renames only; the next open finishes an interrupted one.
-            close(t%unit, iostat=ios); t%unit = -1
+            ! From here every failure wedges the table (wedge_table): the
+            ! marker on disk is the truth, and the session neither adopts the
+            ! new layout over a swap that may not have happened nor writes the
+            ! old one over a swap that did.
+            close(t%unit, iostat=ios); t%unit = -1   ! superseded: a failed close is ignored
             call complete_alter_swap(db, t%name, rs)
-            if (rs /= SQR_OK) stat = rs          ! on disk: rolled forward by the next open
+            if (rs /= SQR_OK) then
+                call wedge_table(db, t)
+                stat = SQR_ERR
+                return
+            end if
 
             ! In-memory table now takes the new layout (the staged schema's).
             t%cols        = newcols
@@ -1604,7 +1921,8 @@ contains
             ! ---- Past the swap: reopen data, adjust the blob, drop cascade files.
             call open_data(db, t, 'old', rs)
             if (rs /= SQR_OK) then
-                stat = rs
+                call wedge_table(db, t)
+                stat = SQR_ERR
                 return
             end if
 
@@ -1613,13 +1931,14 @@ contains
                 ! swap has just moved its staged blob file into place.
                 call open_blob(db, t, 'old', rs)
                 if (rs /= SQR_OK) then
-                    stat = rs
+                    call wedge_table(db, t)
+                    stat = SQR_ERR
                     return
                 end if
             else if (had_text .and. .not. has_text_new) then
                 ! Last DT_TEXT column gone: the blob file is now orphaned.
                 if (t%blob_unit /= -1) then
-                    close(t%blob_unit)
+                    close(t%blob_unit, iostat=ios)   ! about to be deleted: ignored
                     t%blob_unit = -1
                 end if
                 call remove_file(blob_path(db, t%name))
@@ -1630,19 +1949,6 @@ contains
                 call remove_file(index_path(db, t%name, cascade(k)))
             end do del_cascade
         end associate
-    end subroutine
-
-    ! An index slot emptied in place (its number stays reserved, so the
-    ! surviving indices' file names do not move).
-    subroutine tombstone_slot(ix)
-        type(index_t), intent(inout) :: ix
-        ix%ncols    = 0
-        ix%key_size = 0
-        ix%nentries = 0
-        ix%unique   = .false.
-        if (allocated(ix%columns)) deallocate(ix%columns)
-        if (allocated(ix%col_idx)) deallocate(ix%col_idx)
-        if (allocated(ix%key_off)) deallocate(ix%key_off)
     end subroutine
 
     ! Drop the layout-change commit marker (alter_marker_path) durably.
@@ -1695,6 +2001,8 @@ contains
         character(len=*), intent(in)  :: name
         integer,          intent(out) :: stat
         integer :: ios
+        logical :: gone
+        character(len=1) :: none(0)
         character(len=:), allocatable :: dpath, spath, bpath
         ios = 0
         dpath = data_path(db, name)
@@ -1720,11 +2028,8 @@ contains
                 return
             end if
         end if
-        ios = 0
-        if (c_path_exists(alter_marker_path(db, name))) ios = c_remove(alter_marker_path(db, name))
-        if (ios == 0 .and. db%durable) ios = c_fsync_dir(db%dir)
-        call io_check(ios)
-        stat = merge(SQR_ERR, SQR_OK, ios /= 0)
+        call retract_marker(db, alter_marker_path(db, name), none, gone)
+        stat = merge(SQR_OK, SQR_ERR, gone)
     end subroutine
 
 end submodule sqr_table

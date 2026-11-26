@@ -311,7 +311,7 @@ contains
         character(len=:), allocatable :: hdr, payload, dest
         character(len=64), allocatable :: collines(:), cells(:,:)
         logical,           allocatable :: isnull(:,:)
-        type(db_t) :: restored
+        type(db_t), target :: restored
         integer :: nr, nc, rs2
         logical :: ok
         dest = c_abspath(TEST_DIR // '.sqr')

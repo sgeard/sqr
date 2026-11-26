@@ -179,8 +179,9 @@ contains
         ! journal again at payload offset 0 and destroy the only record that
         ! can finish the repair, so no transaction opens until a close and
         ! reopen has replayed it.
-        if (db%jrnl%needs_recovery) then
-            call set_last_err(db, SQR_ERR, NEEDS_RECOVERY_MSG)
+        ! The same gate refuses a handle with a wedged table (recovery_block).
+        ! Not passed `stat`: recovery_block defines it only when it blocks.
+        if (recovery_block(db)) then
             if (present(stat)) stat = SQR_ERR
             return
         end if
@@ -1794,6 +1795,10 @@ contains
         call clear_last_err(db)
         st = SQR_OK
         if (present(label)) label = ''
+        if (.not. db%opened) then
+            call raise_db(db, SQR_INVALID, stat, errmsg, 'database is not open')
+            return
+        end if
         if (db%readonly) then
             call report(db, SQR_READONLY, stat, errmsg)
             return
@@ -1835,6 +1840,10 @@ contains
         call clear_last_err(db)
         st = SQR_OK
         if (present(label)) label = ''
+        if (.not. db%opened) then
+            call raise_db(db, SQR_INVALID, stat, errmsg, 'database is not open')
+            return
+        end if
         if (db%readonly) then
             call report(db, SQR_READONLY, stat, errmsg)
             return

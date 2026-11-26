@@ -62,11 +62,6 @@ contains
         type(index_t) :: ix
         if (readonly_block(db, stat)) return
         if (txn_block(db, stat)) return
-        ! A freshly built index is not covered by any earlier gesture's captured
-        ! deltas, so a later db_undo would restore the rows but leave this tree
-        ! reflecting the post-gesture keys — a silent index/row disagreement.
-        ! Drop the history (create_index does not shift rows, hence no gen bump).
-        call db_reset_history(db)
         uniq = .false.
         if (present(unique)) uniq = unique
         nc = size(col_names)
@@ -112,6 +107,13 @@ contains
             ix%nentries = 0
             ix%unique   = uniq
 
+            ! A freshly built index is not covered by any earlier gesture's
+            ! captured deltas, so a later db_undo would restore the rows but
+            ! leave this tree reflecting the post-gesture keys — a silent
+            ! index/row disagreement.  Drop the history once the request is
+            ! known to be valid, before the index file is created
+            ! (create_index does not shift rows, hence no gen bump).
+            call db_reset_history(db)
             allocate(new_idx(t%nindices + 1))
             new_idx(1:t%nindices) = t%indices(1:t%nindices)
             new_idx(t%nindices + 1) = ix
@@ -182,7 +184,8 @@ contains
     ! member can be (build_leading_bounds' lo key), so the seek lands at the start of the
     ! run and the walk yields entries in (trailing members, row id) order;
     ! for a natural-key find nmem = ix%ncols and this is plain key
-    ! equality.  row_id = 0 / SQR_NOT_FOUND if none.
+    ! equality.  row_id = 0 / SQR_NOT_FOUND if none; SQR_ERR (row_id = 0)
+    ! when a row cannot be read.
     subroutine index_find(db, ti, j, probe, nmem, row_id, stat)
         type(db_t),       intent(inout) :: db
         integer,          intent(in)    :: ti, j
@@ -216,7 +219,11 @@ contains
                 if (key_cmp_lead(t, ix, ckey, probe, nmem) /= 0) exit scan
                 read(t%unit, rec=rid, iostat=ios) rbuf
                 call io_check(ios)
-                if (ios == 0 .and. row_status(rbuf) == ROW_ALIVE) then
+                if (ios /= 0) then          ! never read through an I/O error
+                    stat = SQR_ERR
+                    return
+                end if
+                if (row_status(rbuf) == ROW_ALIVE) then
                     row_id = rid
                     stat = SQR_OK
                     return

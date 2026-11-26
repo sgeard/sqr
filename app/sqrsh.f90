@@ -10,7 +10,7 @@ module sqrsh_state
     use sqr
     implicit none
 
-    type(db_t), save :: db
+    type(db_t), save, target :: db
 
     ! Pending-table-creation state
     integer, parameter :: MAX_PENDING_COLS = 64
