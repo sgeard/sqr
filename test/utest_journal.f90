@@ -67,6 +67,9 @@ program utest_journal
     call payload_limit_raw()
     call payload_limit_api()
 
+    ! A region that covers a record only partly, through the held data unit.
+    call partial_record_rollback()
+
     ios = c_rmtree(DIR)
     print '(a,i0,a,i0,a)', 'sqr journal tests: ', pass, ' passed, ', fail, ' failed'
     if (fail > 0) error stop 1
@@ -273,6 +276,50 @@ contains
         call db_close(db)
         call check(.not. c_path_exists(JPATH), 'limit api: clean close removes the journal')
     end subroutine payload_limit_api
+
+    ! A region need not align to the data file's records.  Log two bytes in
+    ! the middle of the second record, rewrite a row in the same transaction,
+    ! and roll back: the partly covered record is read, patched and written
+    ! whole, so every row comes back exactly as it was.
+    subroutine partial_record_rollback()
+        integer, parameter :: NROWS = 3
+        type(db_t) :: db
+        type(column_t) :: c(1)
+        character(len=:), allocatable :: buf, want(:), got
+        character(len=128) :: emsg
+        integer :: st, r, i, recl, wrong
+        integer(int32) :: rid
+        r = c_rmtree(DIR)
+        c(1)%name = 'v'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        call db_open(db, DIR, stat=st)
+        call db_create_table(db, 't', c, st)
+        recl = db%tables(1)%record_size
+        call row_alloc(buf, recl)
+        allocate(character(len=recl) :: want(NROWS), got)
+        do i = 1, NROWS
+            call row_set_int(buf, db%tables(1)%cols(1), int(11 * i, int32))
+            call db_insert(db, 't', buf, rid, st)
+            call db_get(db, 't', rid, want(i), st)
+        end do
+        call db_begin(db, st)
+        call jrnl_log_region(db, 't.dat', int(recl, int64) + 2_int64, 2_int64, stat=st)
+        call check(st == SQR_OK, 'partial record: region logged')
+        call row_set_int(buf, db%tables(1)%cols(1), 99_int32)
+        do i = 1, NROWS
+            call db_update(db, 't', int(i, int32), buf, st)
+        end do
+        call db_rollback(db, st)
+        call check(st == SQR_OK .and. .not. jrnl_hot(db), 'partial record: rollback succeeds')
+        wrong = 0
+        do i = 1, NROWS
+            call db_get(db, 't', int(i, int32), got, st)
+            if (st /= SQR_OK .or. got /= want(i)) wrong = wrong + 1
+        end do
+        call check(wrong == 0, 'partial record: every row is as it was')
+        call db_verify(db, 't', st, emsg)
+        call check(st == SQR_OK, 'partial record: table verifies')
+        call db_close(db)
+    end subroutine partial_record_rollback
 
     ! Log the tail of a 16-byte file beyond byte 8, leave the file `left`
     ! bytes long (8 = the truncation the record guards; 16 = it never

@@ -1441,6 +1441,10 @@ module sqr
         !! cannot be undone on their own), or when the caller said so with
         !! `db_doom_txn`.  Until it ends, every further write in it is refused
         !! with `SQR_INVALID`; reads still work.
+        !!
+        !! A commit that fails has rolled the transaction back.  The Undo/Redo
+        !! history is touched only by a commit that succeeds: after a failed
+        !! commit of a labelled gesture both stacks are as they were.
         module subroutine db_commit(db, stat, errmsg)
             class(db_t), intent(inout) :: db  !! Database handle
             integer,    intent(out), optional :: stat  !! `SQR_OK` or an error code

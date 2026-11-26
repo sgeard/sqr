@@ -100,8 +100,8 @@ contains
         integer,    intent(out), optional :: stat
         character(len=*), intent(inout), optional :: errmsg
         integer :: cst, st
-        logical :: pushed
-        type(hist_step_t) :: dead
+        logical :: captured
+        type(hist_step_t) :: step
         call clear_last_err(db)
         call report(db, SQR_OK, stat, errmsg)
         if (.not. (db%jrnl%active .and. db%jrnl%explicit)) then
@@ -128,18 +128,24 @@ contains
         ! A capture failure only costs the (session-only) history — capture_step
         ! discards it and resets to empty; the commit's own durability stands, so
         ! db_commit still returns txn_commit's status.
-        pushed = .false.
+        captured = .false.
         if (db%hist%capturing) then
-            call capture_step(db, cst, pushed)
+            call capture_step(db, cst, step, captured)
             ! Captured — or the capture failed and emptied the history itself.
             ! Either way this commit is one the history has accounted for.
             db%hist%tracked = .true.
         end if
         db%hist%capturing = .false.
         call txn_commit(db, st)           ! also clears the explicit latch
-        ! A commit that fails has rolled the gesture back, so the step captured
-        ! for it describes a change that never happened: take it off again.
-        if (st /= SQR_OK .and. pushed) call pop_step(db%hist%undo, dead)
+        ! The history changes only once the gesture is committed.  A commit
+        ! that fails has rolled the gesture back, so its step describes a
+        ! change that never happened and is dropped here, with both stacks
+        ! exactly as they were: the redo steps still apply to the restored
+        ! files, and a full undo ring has not lost its oldest step.
+        if (st == SQR_OK .and. captured) then
+            call reset_stack(db%hist%redo)     ! a new gesture forks the timeline
+            call push_step(db%hist%undo, step, db%hist%cap)
+        end if
         if (st /= SQR_OK) call report(db, st, stat, errmsg)
     end subroutine
 
@@ -147,13 +153,15 @@ contains
         class(db_t), intent(inout) :: db
         integer,    intent(out), optional :: stat
         character(len=*), intent(inout), optional :: errmsg
+        integer :: st
         call clear_last_err(db)
         call report(db, SQR_OK, stat, errmsg)
         if (.not. (db%jrnl%active .and. db%jrnl%explicit)) then
             call report(db, SQR_INVALID, stat, errmsg)
             return
         end if
-        call txn_rollback(db, stat)       ! also clears the explicit latch
+        call txn_rollback(db, st)         ! also clears the explicit latch
+        if (st /= SQR_OK) call report(db, st, stat, errmsg)
     end subroutine
 
     ! ---- public transaction API ----
@@ -668,7 +676,7 @@ contains
         fsize = file_len(db%jrnl%path)
         if (ios /= 0 .or. magic /= JMAGIC .or. fmt /= JFMT &
                      .or. state /= JSTATE_HOT) then
-            if (.not. held) close(u)       ! absent/void/foreign -> nothing to do
+            if (.not. held) close(u, iostat=cs)   ! absent/void/foreign -> nothing to do
             if (present(stat)) stat = SQR_OK
             return
         end if
@@ -762,7 +770,7 @@ contains
         logical                 :: hot
         character(len=:), allocatable :: jpath
         character(len=len(JMAGIC)) :: magic
-        integer          :: u, ios, fmt, state
+        integer          :: u, ios, fmt, state, cs
         hot = .false.
         ! Probe only — never mutates db (db%jrnl%path may not be set yet).
         if (allocated(db%jrnl%path)) then
@@ -783,7 +791,7 @@ contains
                  status='old', action='read', iostat=ios)
             if (ios /= 0) return
             read(u, pos=1, iostat=ios) magic, fmt, state
-            close(u)
+            close(u, iostat=cs)
         end if
         hot = (ios == 0 .and. magic == JMAGIC .and. fmt == JFMT &
                          .and. state == JSTATE_HOT)
@@ -892,17 +900,24 @@ contains
     subroutine resync_base_files(db, stat)
         class(db_t), intent(inout) :: db
         integer,     intent(inout) :: stat
-        integer :: ti, st
+        integer :: ti, st, ios
+        ! A close that fails is reported (the rollback then leaves the journal
+        ! hot) but the unit is still reopened: the handle must not be left
+        ! holding a unit number that is no longer connected.
         do ti = 1, db%ntables
             associate (t => db%tables(ti))
                 if (t%unit /= -1) then
-                    close(t%unit)
+                    close(t%unit, iostat=ios)
+                    call io_check(ios)
+                    if (ios /= 0 .and. stat == SQR_OK) stat = SQR_ERR
                     t%unit = -1
                     call open_data(db, t, 'old', st)
                     if (st /= SQR_OK .and. stat == SQR_OK) stat = st
                 end if
                 if (t%blob_unit /= -1) then
-                    close(t%blob_unit)
+                    close(t%blob_unit, iostat=ios)
+                    call io_check(ios)
+                    if (ios /= 0 .and. stat == SQR_OK) stat = SQR_ERR
                     t%blob_unit = -1
                     call open_blob(db, t, 'old', st)
                     if (st /= SQR_OK .and. stat == SQR_OK) stat = st
@@ -1615,15 +1630,18 @@ contains
 
     ! Write `bytes` at byte `offset` of a connected unit and flush it.  A direct
     ! unit writes whole records: a record the range covers only partly is read
-    ! first and patched (read as zeros when it lies past the end of the file).
-    subroutine unit_write(u, recl, offset, bytes, ios)
+    ! first and patched.  Only a record that is not wholly inside the file
+    ! (`path`, the file the unit is connected to) starts as zeros; that is
+    ! decided from the file's size, never from a failed read, so a read error
+    ! on a live record is returned and nothing is written over it.
+    subroutine unit_write(u, recl, offset, bytes, path, ios)
         integer,          intent(in)  :: u, recl
         integer(int64),   intent(in)  :: offset
         character(len=*), intent(in)  :: bytes
+        character(len=*), intent(in)  :: path
         integer,          intent(out) :: ios
         character(len=:), allocatable :: rec
-        integer(int64) :: k, rstart, lo, hi, last
-        integer :: rios
+        integer(int64) :: k, rstart, lo, hi, last, fsize
         ios = 0
         if (len(bytes) == 0) return
         if (recl == 0) then
@@ -1632,14 +1650,25 @@ contains
             return
         end if
         allocate(character(len=recl) :: rec)
-        last = offset + len(bytes) - 1
+        last  = offset + len(bytes) - 1
+        fsize = -1_int64                    ! not yet asked for
         do k = (offset - 1) / recl + 1, (last - 1) / recl + 1
             rstart = (k - 1) * recl + 1
             lo = max(offset, rstart);  hi = min(last, rstart + recl - 1)
-            if (lo > rstart .or. hi < rstart + recl - 1) then
-                read(u, rec=k, iostat=rios) rec
-                if (rios /= 0) rec = repeat(CH_NUL, recl)
-            end if
+            partial: if (lo > rstart .or. hi < rstart + recl - 1) then
+                if (fsize < 0_int64) then
+                    flush(u, iostat=ios)    ! the size on disk must include this unit's writes
+                    if (ios /= 0) return
+                    fsize = file_len(path)
+                end if
+                if (rstart + recl - 1 > fsize) then
+                    rec = repeat(CH_NUL, recl)
+                    exit partial
+                end if
+                read(u, rec=k, iostat=ios) rec
+                call io_check(ios)
+                if (ios /= 0) return
+            end if partial
             rec(lo - rstart + 1:hi - rstart + 1) = bytes(lo - offset + 1:hi - offset + 1)
             write(u, rec=k, iostat=ios) rec
             if (ios /= 0) return
@@ -1658,7 +1687,7 @@ contains
         integer(int64),                intent(in)  :: offset, length
         character(len=:), allocatable, intent(out) :: bytes
         integer,                       intent(out) :: ios
-        integer :: u, recl
+        integer :: u, recl, cs
         if (length < 0_int64 .or. length > int(huge(0), int64)) then
             bytes = ''
             ios   = 1
@@ -1680,7 +1709,7 @@ contains
              status='old', action='read', iostat=ios)
         if (ios /= 0) return
         read(u, pos=offset, iostat=ios) bytes
-        close(u)
+        close(u, iostat=cs)
     end subroutine
 
     ! write_region for the undo path: the part of the region beyond the file's
@@ -1693,7 +1722,7 @@ contains
         integer(int64),   intent(in)  :: offset
         character(len=*), intent(in)  :: bytes
         integer,          intent(out) :: ios
-        integer        :: u, recl
+        integer        :: u, recl, cs
         integer(int64) :: cursize, span
         call held_unit(db, rel, u, recl)
         if (u /= -1) then
@@ -1701,7 +1730,8 @@ contains
             if (ios /= 0) return
             cursize = file_len(pathjoin(db%dir, rel))
             span = min(int(len(bytes), int64), cursize - offset + 1_int64)
-            if (span > 0_int64) call unit_write(u, recl, offset, bytes(1:int(span)), ios)
+            if (span > 0_int64) call unit_write(u, recl, offset, bytes(1:int(span)), &
+                                                pathjoin(db%dir, rel), ios)
             return
         end if
         open(newunit=u, file=pathjoin(db%dir, rel), access='stream', form='unformatted', &
@@ -1713,7 +1743,10 @@ contains
             write(u, pos=offset, iostat=ios) bytes(1:int(span))
             if (ios == 0) flush(u, iostat=ios)
         end if
-        close(u)
+        ! The close can be where a deferred write error first shows.
+        close(u, iostat=cs)
+        call io_check(cs)
+        if (ios == 0) ios = cs
     end subroutine
 
     ! Write `bytes` at `offset` of base file `rel` (history apply).
@@ -1723,10 +1756,10 @@ contains
         integer(int64),   intent(in)  :: offset
         character(len=*), intent(in)  :: bytes
         integer,          intent(out) :: ios
-        integer :: u, recl
+        integer :: u, recl, cs
         call held_unit(db, rel, u, recl)
         if (u /= -1) then
-            call unit_write(u, recl, offset, bytes, ios)
+            call unit_write(u, recl, offset, bytes, pathjoin(db%dir, rel), ios)
             return
         end if
         open(newunit=u, file=pathjoin(db%dir, rel), access='stream', form='unformatted', &
@@ -1734,7 +1767,10 @@ contains
         if (ios /= 0) return
         write(u, pos=offset, iostat=ios) bytes
         if (ios == 0) flush(u, iostat=ios)
-        close(u)
+        ! The close can be where a deferred write error first shows.
+        close(u, iostat=cs)
+        call io_check(cs)
+        if (ios == 0) ios = cs
     end subroutine
 
     ! ===== in-memory Undo/Redo history (built on the journal's capture) =====
@@ -1851,20 +1887,21 @@ contains
         db%hist%epoch     = db%hist%epoch + 1
     end subroutine
 
-    ! Snapshot the committed gesture as one bidirectional history step and push
-    ! it onto the undo stack (clearing the redo stack — a new gesture forks the
-    ! timeline).  Must run BEFORE txn_commit discards jrnl%recs/snaps.  Reads the
+    ! Snapshot the gesture about to be committed as one bidirectional history
+    ! step.  The step is handed back, not stacked: db_commit pushes it (and
+    ! clears the redo stack) only once the commit has succeeded.  Must run
+    ! BEFORE txn_commit discards jrnl%recs/snaps.  Reads the
     ! post-gesture ("redo") bytes from disk, so flush every base unit AND sync
     ! the index trees first (fsync_base_files does the tree sync at commit, but
     ! that is after this point).
-    subroutine capture_step(db, stat, pushed)
-        class(db_t), intent(inout) :: db
-        integer,     intent(out)   :: stat
-        logical,     intent(out)   :: pushed   ! a step went onto the undo stack
-        type(hist_step_t) :: step
+    subroutine capture_step(db, stat, step, captured)
+        class(db_t),       intent(inout) :: db
+        integer,           intent(out)   :: stat
+        type(hist_step_t), intent(out)   :: step
+        logical,           intent(out)   :: captured   ! `step` holds the gesture
         integer :: ti, j, bs
-        stat   = SQR_OK
-        pushed = .false.
+        stat     = SQR_OK
+        captured = .false.
         if (db%jrnl%nrec == 0) return          ! a gesture that changed nothing
         call flush_base_files(db)
         do ti = 1, db%ntables
@@ -1890,9 +1927,7 @@ contains
         else
             step%label = ''
         end if
-        call reset_stack(db%hist%redo)         ! a new gesture forks the timeline
-        call push_step(db%hist%undo, step, db%hist%cap)
-        pushed = .true.
+        captured = .true.
     end subroutine
 
     ! Group the undo set by base file into per-path deltas, each holding both the

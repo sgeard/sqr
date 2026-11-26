@@ -168,6 +168,9 @@ call db_redo(db, st, label)    ! ...and back
   history**, as do the structural operations (`db_compact`, `db_create_index`,
   column changes, ...). An application that offers Undo makes every write a
   gesture.
+- A gesture enters the history only when its `db_commit` succeeds. A commit
+  that fails is rolled back and leaves both the undo and the redo steps as
+  they were.
 - `db_undo` and `db_redo` are refused inside an open transaction
   (`SQR_INVALID`), and return `SQR_NO_UNDO` when there is nothing to apply.
 

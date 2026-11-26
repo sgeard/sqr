@@ -102,6 +102,12 @@ program utest_fault
     ! C7: a rollback that fails with the journal hot latches the handle
     ! against every write and keeps the journal for the next open.
     call rollback_latch()
+
+    ! C9: a labelled commit that fails leaves both history stacks alone.
+    call commit_keeps_redo()
+
+    ! C11: a failed read of a partly covered record is an error, not zeros.
+    call partial_record_fault()
     call check(no_stranded_units(), 'all: no unit left connected after faulted runs')
 
     call cleanup()
@@ -1329,7 +1335,7 @@ contains
     ! before the transaction.
     subroutine rollback_latch()
         integer :: rs, n_before, n_after, k, ti, base_live
-        integer :: silent, unrefused, lost, unrecovered, nfailed, nhot
+        integer :: silent, unrefused, lost, unrecovered, nfailed, nhot, unreported, code
         integer(int32) :: rid
         character(len=128) :: emsg
         character(len=:), allocatable :: msg
@@ -1353,6 +1359,7 @@ contains
         call close_g()
 
         silent = 0; unrefused = 0; lost = 0; unrecovered = 0; nfailed = 0; nhot = 0
+        unreported = 0
         sweep: do k = n_before + 1, n_after
             call prep_indexed()
             call db_open(gdb, DBDIR, rs)
@@ -1360,7 +1367,8 @@ contains
             call fault_arm(k)                    ! fires during db_rollback
             call db_begin(gdb, rs)
             call insert_zoe(gdb, rid, rs)
-            call db_rollback(gdb, rs)
+            emsg = ''
+            call db_rollback(gdb, rs, emsg)
             call fault_disarm()
             if (rs == SQR_OK) then
                 silent = silent + 1
@@ -1368,6 +1376,10 @@ contains
                 cycle sweep
             end if
             nfailed = nfailed + 1
+            ! C10: the failure reaches errmsg and the handle's last error.
+            call db_last_error(gdb, code=code, msg=msg)
+            if (len_trim(emsg) == 0 .or. code /= rs .or. len(msg) == 0) &
+                unreported = unreported + 1
             if (jrnl_hot(gdb)) nhot = nhot + 1
             ! Every kind of write is now refused, and says what to do.
             call insert_zoe(gdb, rid, rs)
@@ -1402,12 +1414,156 @@ contains
             call close_g()
         end do sweep
         call check(silent == 0,      'rollback_latch: every fault in the rollback fails it')
+        call check(unreported == 0,  'rollback_latch: a failed rollback sets errmsg and the last error')
         call check(nfailed > 0 .and. nhot > 0, &
                                      'rollback_latch: failed rollbacks leave the journal hot')
         call check(unrefused == 0,   'rollback_latch: every write is refused after a failed rollback')
         call check(lost == 0,        'rollback_latch: db_close keeps the journal')
         call check(unrecovered == 0, 'rollback_latch: the next open completes the rollback')
     end subroutine rollback_latch
+
+    ! C9.  The history changes only when a gesture's commit succeeds.  Gesture
+    ! A is committed and undone, so the redo stack holds it; then a fault is
+    ! swept across the commit of gesture B.  A commit that fails was rolled
+    ! back: A must still be redoable (the redo stack used to be cleared before
+    ! the commit was attempted) and B must not be on the undo stack.  A commit
+    ! that succeeds has forked the timeline, so nothing is redoable.
+    subroutine commit_keeps_redo()
+        integer :: rs, n_before, n_after, k, bad, nfailed, nkept
+        integer(int32) :: rid
+        character(len=128) :: emsg
+
+        call redo_start()
+        call fault_arm(BIG)                      ! never fires; just counts
+        call db_begin(gdb, rs, label='B')
+        call insert_zoe(gdb, rid, rs)
+        n_before = fault_count()
+        call db_commit(gdb, rs)
+        n_after = fault_count()
+        call fault_disarm()
+        call check(rs == SQR_OK, 'commit_keeps_redo: clean commit succeeds')
+        call check(db_can_undo(gdb) .and. .not. db_can_redo(gdb), &
+                   'commit_keeps_redo: a committed gesture forks the timeline')
+        call close_g()
+
+        bad = 0; nfailed = 0; nkept = 0
+        sweep: do k = n_before + 1, n_after
+            call redo_start()
+            call fault_arm(k)                    ! fires during db_commit
+            call db_begin(gdb, rs, label='B')
+            call insert_zoe(gdb, rid, rs)
+            call db_commit(gdb, rs)
+            call fault_disarm()
+            if (rs == SQR_OK) then
+                if (db_can_redo(gdb)) bad = bad + 1
+                call close_g()
+                cycle sweep
+            end if
+            nfailed = nfailed + 1
+            ! A rollback that itself failed latched the handle; its history
+            ! is beside the point until the reopen.
+            if (gdb%jrnl%needs_recovery) then
+                call close_g()
+                cycle sweep
+            end if
+            if (db_can_undo(gdb) .or. .not. db_can_redo(gdb)) then
+                bad = bad + 1
+                call close_g()
+                cycle sweep
+            end if
+            nkept = nkept + 1
+            call db_redo(gdb, rs)                ! A goes back in
+            if (rs /= SQR_OK) bad = bad + 1
+            call db_verify(gdb, 'people', rs, emsg)
+            if (rs /= SQR_OK) bad = bad + 1
+            call close_g()
+        end do sweep
+        call check(nfailed > 0 .and. nkept > 0, &
+                   'commit_keeps_redo: some faults fail the commit with the handle usable')
+        call check(bad == 0, &
+                   'commit_keeps_redo: a failed commit leaves the redo step, and it replays')
+    end subroutine commit_keeps_redo
+
+    ! Fresh indexed db on gdb with one gesture committed and undone.
+    subroutine redo_start()
+        integer :: rs
+        integer(int32) :: rid
+        call prep_indexed()
+        call db_open(gdb, DBDIR, rs)
+        gopen = .true.
+        call db_begin(gdb, rs, label='A')
+        call insert_zoe(gdb, rid, rs)
+        call db_commit(gdb, rs)
+        call db_undo(gdb, rs)
+    end subroutine redo_start
+
+    ! C11.  A region that covers a record only partly is written back by
+    ! reading the record, patching it and writing it whole.  A failed read
+    ! used to be taken for "past the end of the file" and the record rebuilt
+    ! from zeros, wiping the bytes outside the region.  Log two bytes in the
+    ! middle of the second record, sweep a fault across the rollback, and
+    ! compare every row with what it held before: a fault fails the rollback
+    ! and, after the reopen, no row has changed.
+    subroutine partial_record_fault()
+        integer, parameter :: NROWS = 3
+        character(len=:), allocatable :: want(:), got
+        integer :: rs, n0, n1, k, i, ti, recl, silent, wiped
+        integer(int64) :: off
+
+        call prep_rows()
+        call db_open(gdb, DBDIR, rs)
+        gopen = .true.
+        ti   = db_table_index(gdb, 'people')
+        recl = gdb%tables(ti)%record_size
+        off  = int(recl, int64) + 2_int64        ! bytes 2..3 of the second record
+        allocate(character(len=recl) :: want(NROWS), got)
+        do i = 1, NROWS
+            call db_get(gdb, 'people', int(i, int32), want(i), rs)
+        end do
+        call fault_arm(BIG)                      ! never fires; just counts
+        call db_begin(gdb, rs)
+        call jrnl_log_region(gdb, 'people.dat', off, 2_int64, stat=rs)
+        call check(rs == SQR_OK, 'partial_record: region logged')
+        n0 = fault_count()
+        call db_rollback(gdb, rs)
+        n1 = fault_count()
+        call fault_disarm()
+        call check(rs == SQR_OK .and. n1 > n0, 'partial_record: clean rollback succeeds')
+        wiped = 0
+        do i = 1, NROWS
+            call db_get(gdb, 'people', int(i, int32), got, rs)
+            if (rs /= SQR_OK .or. got /= want(i)) wiped = wiped + 1
+        end do
+        call check(wiped == 0, 'partial_record: clean rollback leaves every row as it was')
+        call close_g()
+
+        silent = 0; wiped = 0
+        sweep: do k = n0 + 1, n1
+            call prep_rows()
+            call db_open(gdb, DBDIR, rs)
+            gopen = .true.
+            call fault_arm(k)                    ! fires during db_rollback
+            call db_begin(gdb, rs)
+            call jrnl_log_region(gdb, 'people.dat', off, 2_int64, stat=rs)
+            call db_rollback(gdb, rs)
+            call fault_disarm()
+            if (rs == SQR_OK) silent = silent + 1
+            call close_g()
+            call db_open(gdb, DBDIR, rs)
+            gopen = rs == SQR_OK
+            if (rs /= SQR_OK) then
+                wiped = wiped + 1
+                cycle sweep
+            end if
+            do i = 1, NROWS
+                call db_get(gdb, 'people', int(i, int32), got, rs)
+                if (rs /= SQR_OK .or. got /= want(i)) wiped = wiped + 1
+            end do
+            call close_g()
+        end do sweep
+        call check(silent == 0, 'partial_record: every fault in the rollback fails it')
+        call check(wiped == 0,  'partial_record: no fault costs a row its bytes')
+    end subroutine partial_record_fault
 
     ! Arm a hot journal capturing REL[5..8] and perform the uncommitted base
     ! overwrite, leaving the file hot for recovery to roll back to 'AAAA...'.
