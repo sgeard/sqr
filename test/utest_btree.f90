@@ -69,6 +69,7 @@ program utest_btree
     call t_duplicates()
     call t_persistence()
     call t_bulk_load()
+    call t_bulk_shrink()
     call t_split_stress()
     call t_deep_tree()
     call t_endianness()
@@ -265,6 +266,86 @@ contains
         call check(bt%nentries == 1, 'bulk: insert into empty-bulk tree')
         call bt_close(bt, st)
     end subroutine
+
+    ! A bulk load that needs fewer pages than the file already holds: the
+    ! file is not shrunk, so the page count must not fall, or the next
+    ! bt_open refuses the tree (file length /= page_size * npages).
+    subroutine t_bulk_shrink()
+        type(btree_t) :: bt
+        integer, parameter :: NBIG = 20000, NSMALL = 10, NPACK = 20100
+        character(len=4), allocatable :: ks(:)
+        integer(int32),   allocatable :: ps(:)
+        integer :: st, i, grown
+        allocate(ks(NPACK), ps(NPACK))
+        do i = 1, NPACK
+            ks(i) = k4(int(i, int32))
+            ps(i) = int(i, int32)
+        end do
+
+        ! Shrinking load: a tree grown by inserts, reloaded with a handful.
+        call fresh('utest_btree_14.bt')
+        call bt_open(bt, 'utest_btree_14.bt', 4, .true., .true., st)
+        do i = 1, NBIG
+            call bt_insert(bt, ks(i), ps(i), icmp, dummy, st)
+        end do
+        grown = bt%npages
+        call bt_bulk_load(bt, ks(1:NSMALL), ps(1:NSMALL), icmp, dummy, st)
+        call check(st == BT_OK .and. bt%npages == grown, &
+                   'shrink: page count stays at the file size')
+        call bt_close(bt, st)
+        call bt_open(bt, 'utest_btree_14.bt', 4, .true., .false., st)
+        call check(st == BT_OK .and. bt%nentries == NSMALL, 'shrink: reopens')
+        call check(scan_count(bt) == NSMALL, 'shrink: holds the loaded entries')
+        ! Growing again extends the file past the surplus and still reopens.
+        do i = NSMALL + 1, NBIG
+            call bt_insert(bt, ks(i), ps(i), icmp, dummy, st)
+        end do
+        call check(st == BT_OK .and. bt%npages > grown, 'shrink: inserts extend the file')
+        call bt_close(bt, st)
+        call bt_open(bt, 'utest_btree_14.bt', 4, .false., .false., st)
+        call check(st == BT_OK .and. scan_count(bt) == NBIG, &
+                   'shrink: reopens after growing again')
+        call bt_close(bt, st)
+        call fresh('utest_btree_14.bt')
+
+        ! Repack: more entries than before, packed into fewer pages.
+        call fresh('utest_btree_15.bt')
+        call bt_open(bt, 'utest_btree_15.bt', 4, .true., .true., st)
+        do i = 1, NBIG
+            call bt_insert(bt, ks(i), ps(i), icmp, dummy, st)
+        end do
+        grown = bt%npages
+        call bt_bulk_load(bt, ks, ps, icmp, dummy, st)
+        call check(st == BT_OK .and. bt%npages == grown, 'repack: page count kept')
+        call bt_close(bt, st)
+        call bt_open(bt, 'utest_btree_15.bt', 4, .false., .false., st)
+        call check(st == BT_OK .and. scan_count(bt) == NPACK, 'repack: reopens complete')
+        call bt_close(bt, st)
+        call fresh('utest_btree_15.bt')
+    end subroutine
+
+    ! Entries met by a full scan, or -1 if they are not in ascending order.
+    integer function scan_count(bt) result(n)
+        type(btree_t), intent(in) :: bt
+        type(bt_cursor_t) :: cur
+        integer :: st
+        integer(int32) :: pay, prev
+        character(len=4) :: kk
+        logical :: ok
+        n = 0
+        prev = -huge(prev)
+        call bt_first(bt, cur, st)
+        scan: do
+            call bt_next(bt, cur, kk, pay, ok, st)
+            if (.not. ok) exit scan
+            if (kof(kk) < prev) then
+                n = -1
+                exit scan
+            end if
+            prev = kof(kk)
+            n = n + 1
+        end do scan
+    end function
 
     ! Many random inserts then removes: exercises leaf/internal splits and
     ! lazy delete; verifies global order is never violated.

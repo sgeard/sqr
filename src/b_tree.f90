@@ -76,7 +76,7 @@ module b_tree
         integer        :: key_len    = 0         !! Fixed key length in bytes
         integer        :: root       = 0         !! Root page id
         integer        :: free_head  = 0         !! Head of the free-page list (0 = none)
-        integer        :: npages     = 0         !! Highest page id ever allocated
+        integer        :: npages     = 0         !! Pages in the file (highest page id ever allocated)
         integer        :: first_leaf = 0         !! Leftmost leaf page id (iteration start)
         integer(int64) :: nentries   = 0_int64   !! Number of live `(key,payload)` entries
         logical        :: writable   = .false.   !! Opened read-write (`.false.` = read-only)
@@ -203,11 +203,14 @@ module b_tree
         !! reinsertion.  `keys` is a rank-1 array of `key_len` byte strings,
         !! `payloads(i)` the payload for `keys(i)`.
         !!
-        !! Note: this resets the logical page count and rewrites from page 2,
-        !! but does NOT shrink the underlying file — pages above the new high
-        !! water remain allocated on disk (harmless; never read).  To actually
-        !! reclaim space (e.g. repacking after many lazy deletes), recreate the
-        !! file with `bt_open(create=.true.)` and load into the fresh tree.
+        !! Note: this rewrites from page 2 but does NOT shrink the underlying
+        !! file.  When the new tree needs fewer pages than the file holds, the
+        !! surplus pages stay in the file and stay counted in `npages` (which
+        !! is the file's page count); they are unreferenced and never read,
+        !! and later inserts extend the file rather than re-use them.  To
+        !! actually reclaim space (e.g. repacking after many lazy deletes),
+        !! recreate the file with `bt_open(create=.true.)` and load into the
+        !! fresh tree.
         module subroutine bt_bulk_load(bt, keys, payloads, cmp, ctx, stat)
             type(btree_t),    intent(inout) :: bt           !! Tree handle
             character(len=*), intent(in)    :: keys(:)      !! Keys (each `key_len` bytes)

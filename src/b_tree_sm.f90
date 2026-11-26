@@ -24,6 +24,9 @@
 ! file that a crash, a bad disk or a hostile edit may have changed, so each is
 ! checked before it can steer an access:
 !   file length    == page_size * npages                     (bt_open)
+!       npages is the file's page count, not the live tree's: after a
+!       bt_bulk_load that needed fewer pages the surplus stays in the file,
+!       counted but unreferenced.
 !   root, first_leaf in 2..npages, maxk >= MIN_FANOUT,
 !   key_len match                                            (bt_open)
 !   node kind      == K_LEAF or K_INT                        (check_node)
@@ -45,7 +48,7 @@
 !
 ! The free_head field is reserved on disk for the crash-safety journal
 ! layer; this implementation never frees pages incrementally (lazy
-! delete) and bt_bulk_load rewrites the file wholesale, so it stays 0.
+! delete) and bt_bulk_load rewrites the tree wholesale, so it stays 0.
 
 submodule (b_tree) b_tree_sm
     use, intrinsic :: iso_fortran_env, only: int8  ! int32/int64 via host association from b_tree
@@ -350,8 +353,9 @@ contains
         call write_page(bt, META_PID, pg, stat)
     end subroutine
 
-    ! Allocate a fresh page id. Lazy delete never frees pages and
-    ! bulk_load rewrites wholesale, so this only ever extends the file.
+    ! Allocate a fresh page id. Lazy delete never frees pages, so this only
+    ! ever extends the file -- except inside bulk_build, which restarts the
+    ! count at the meta page and re-uses the file's existing pages first.
     subroutine alloc_page(bt, pid)
         type(btree_t), intent(inout) :: bt
         integer,       intent(out)   :: pid
@@ -1139,6 +1143,28 @@ contains
         procedure(bt_compare)           :: cmp
         class(*),         intent(in)    :: ctx
         integer,          intent(out)   :: stat
+        integer :: held
+        ! npages counts the pages in the file, and bt_open holds the file to
+        ! exactly that length.  The build packs from page 2 and may need
+        ! fewer pages than the file already has; the file is not shrunk, so
+        ! the count must not fall either.  It is put back on a failed build
+        ! too, so the handle never describes a file shorter than the real one.
+        held = bt%npages
+        call bulk_build(bt, keys, payloads, cmp, ctx, stat)
+        bt%npages = max(bt%npages, held)
+        if (stat == BT_OK) call write_meta(bt, stat)
+    end subroutine
+
+    ! The build proper: sorts, then writes the leaves and the internal levels
+    ! from page 2 up.  Leaves bt%npages at the last page it used and does not
+    ! write the meta page (bt_bulk_load does both).
+    subroutine bulk_build(bt, keys, payloads, cmp, ctx, stat)
+        type(btree_t),    intent(inout) :: bt
+        character(len=*), intent(in)    :: keys(:)
+        integer(int32),   intent(in)    :: payloads(:)
+        procedure(bt_compare)           :: cmp
+        class(*),         intent(in)    :: ctx
+        integer,          intent(out)   :: stat
         integer :: n, mk, i, k, nleaf, fill, rem, base, e, cnt
         integer :: nlev, gi, parent, c0, c1, child
         integer, allocatable :: perm(:)
@@ -1149,7 +1175,7 @@ contains
 
         n  = size(keys)
         mk = maxk(bt)
-        ! Reset to just the meta page; everything is rewritten below.
+        ! Start again above the meta page; everything is rewritten below.
         bt%npages   = META_PID
         bt%nentries = int(n, int64)
         allocate(character(len=bt%page_size) :: pg)
@@ -1161,8 +1187,6 @@ contains
             call set_node(pg, K_LEAF, 0_int32)
             call set_leaf_next(pg, NO_PAGE)
             call write_page(bt, bt%root, pg, stat)
-            if (stat /= BT_OK) return
-            call write_meta(bt, stat)
             return
         end if
 
@@ -1240,8 +1264,7 @@ contains
             call move_alloc(nxt_lk, lev_lk)
             call move_alloc(nxt_lp, lev_lp)
         end do build
-
-        call write_meta(bt, stat)
+        stat = BT_OK
     end subroutine
 
     ! In-place heapsort of perm so that
