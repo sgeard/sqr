@@ -13,7 +13,7 @@ submodule (sqr_serve) sqr_serve_impl
     use :: sqr_consts, only: I32_BYTES, CH_LF, PATH_SEPS, INT_TEXT_LEN
     use :: clib_wrap, only: c_sock_listen, c_sock_port, c_sock_accept, c_sock_poll, c_sock_close, &
                             c_sock_send_timeout, &
-                            c_realpath, c_joincwd, C_SOCK_POLL_MAX
+                            c_realpath, c_abspath, c_joincwd, C_SOCK_POLL_MAX
     implicit none
 
     ! serve_step polls the listener plus every session in one call, so that
@@ -424,11 +424,15 @@ contains
         ! Refuse to write into the database being packed: the container and its
         ! .tmp sibling would sit among the files a later reader enumerates.
         ! The separator matters — a sibling named "<db>-backup.sqr" shares the
-        ! directory's prefix without being inside it.  Both spellings are
-        ! checked, since either can name the directory; a destination reached
-        ! through some third symlink still slips past, which is the caller's
-        ! business, not something to resolve every path in the system over.
-        if (is_within(file, srv%dbpath) .or. is_within(file, srv%dbreal)) then
+        ! directory's prefix without being inside it.  The destination is
+        ! tested as it was written against both spellings of the directory,
+        ! and once more in its resolved form against the resolved directory:
+        ! that catches a destination which names the directory some other way
+        ! (through a symlink, or on Windows without the drive, or with the
+        ! other separator).  An unresolvable destination has no resolved form
+        ! and is left for the pack itself to fail on.
+        if (is_within(file, srv%dbpath) .or. is_within(file, srv%dbreal) .or. &
+            is_within(c_abspath(file), srv%dbreal)) then
             call send_err(srv, i, SQR_INVALID, &
                 'PACK destination is inside the database directory')
             return

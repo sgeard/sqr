@@ -187,6 +187,20 @@ contains
         ok = ne == NET_OK .and. line == 'END'
     end subroutine
 
+    ! An absolute path as the platform writes one: '/...', or a Windows
+    ! drive form ('C:/...', either separator).
+    pure function rooted(path) result(yes)
+        character(len=*), intent(in) :: path
+        logical :: yes
+        yes = .false.
+        if (len(path) == 0) return
+        if (path(1:1) == '/') then
+            yes = .true.
+        else if (len(path) >= 3) then
+            yes = path(2:2) == ':' .and. scan(path(3:3), '/\') > 0
+        end if
+    end function
+
     ! Decode a binary INT / REAL cell (little-endian native bytes).
     function cell_int(s) result(v)
         character(len=*), intent(in) :: s
@@ -315,7 +329,7 @@ contains
         integer :: nr, nc, rs2
         logical :: ok
         dest = c_abspath(TEST_DIR // '.sqr')
-        call check(len(dest) > 0 .and. dest(1:1) == '/', 'pack: destination resolves to an absolute path')
+        call check(rooted(dest), 'pack: destination resolves to an absolute path')
 
         call send_req(cli1, 'PACK', TEST_DIR // '.sqr')
         call read_reply(cli1, hdr, payload)

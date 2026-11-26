@@ -22,6 +22,7 @@ program utest_net
     call t_large_payload()
     call t_limits()
     call t_eof()
+    call t_unattached()
 
     call c_sock_close(ls)
 
@@ -175,6 +176,18 @@ contains
         call check(ne == NET_LIMIT, 'limit: over-long header line rejected')
         call net_close(a)
         call net_close(b)
+    end subroutine
+
+    ! A connection that was never attached has no socket and no buffer:
+    ! both receivers report an error rather than touching either.
+    subroutine t_unattached()
+        type(net_conn_t) :: fresh
+        character(len=:), allocatable :: line, bytes
+        integer :: ne
+        call net_recv_line(fresh, line, ne)
+        call check(ne == NET_ERR, 'unattached: a line read is an error')
+        call net_recv_payload(fresh, 4, bytes, ne)
+        call check(ne == NET_ERR, 'unattached: a payload read is an error')
     end subroutine
 
     subroutine t_eof()

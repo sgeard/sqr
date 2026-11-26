@@ -13,6 +13,10 @@ contains
         type(net_conn_t), intent(inout) :: conn
         integer,          intent(out)   :: ierr
         integer :: i, n
+        if (.not. allocated(conn%rbuf)) then   ! never attached
+            ierr = NET_ERR
+            return
+        end if
         if (conn%rlo > 1) then
             ! Compact by an explicit forward loop: substring-to-substring
             ! assignment with overlap is not defined behaviour.
@@ -42,6 +46,7 @@ contains
         type(net_conn_t),   intent(out) :: conn
         integer(c_int64_t), intent(in)  :: sock
         conn%sock = sock
+        allocate(character(len=NET_BUFSIZE) :: conn%rbuf)
     end subroutine
 
     module subroutine net_close(conn)

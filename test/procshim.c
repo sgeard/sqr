@@ -1,10 +1,10 @@
-/* procshim.c — minimal POSIX process control for the two-process crash test
+/* procshim.c — minimal process control for the two-process crash test
  * (test/proctest.f90). Kept OUT of the library (osshim.c / libsqr) on purpose:
  * sqr itself spawns no subprocess, and this machinery is needed only to run a
  * real second process that crashes with a hot journal for the recovery test.
  *
- * Not built on Windows (the proctest target is POSIX-only); the stubs below
- * just let it compile there. */
+ * The Windows half does the same with _spawnl / _cwait / TerminateProcess,
+ * for the cross-built proctest.exe (`make windows`). */
 
 #include <stdint.h>
 
@@ -42,12 +42,28 @@ void sqr_test_hard_exit(int code) {
     _exit(code);
 }
 
-#else  /* _WIN32 — proctest is not built here; stubs keep the C compilable. */
+#else  /* _WIN32 — the same three calls on the C runtime and Win32. */
 
+#include <process.h>
+#include <windows.h>
+
+/* Start `path` with argv = {path, arg1} and do not wait. Returns the process
+ * handle (which is what sqr_test_wait takes here), or -1 on failure. Neither
+ * string is quoted: the test passes its own path and a one-word mode. */
 int64_t sqr_test_spawn(const char *path, const char *arg1) {
-    (void)path; (void)arg1; return -1;
+    return (int64_t)_spawnl(_P_NOWAIT, path, path, arg1, (char *)0);
 }
-int sqr_test_wait(int64_t pid) { (void)pid; return -1; }
-void sqr_test_hard_exit(int code) { (void)code; }
+
+/* Block until the process exits; return its exit status, or -1 on error. */
+int sqr_test_wait(int64_t pid) {
+    int status;
+    if (_cwait(&status, (intptr_t)pid, 0) == -1) return -1;
+    return status;
+}
+
+/* Terminate abruptly: no atexit handlers, no Fortran unit flush. */
+void sqr_test_hard_exit(int code) {
+    TerminateProcess(GetCurrentProcess(), (UINT)code);
+}
 
 #endif

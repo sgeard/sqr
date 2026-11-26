@@ -166,10 +166,21 @@ void sqr_os_exit(int code) {
     exit(code);
 }
 
+/* Paths this file hands back are written with '/', the one separator the
+   Fortran side builds paths with (every Win32 and CRT call here takes
+   either).  Left as '\\', the working directory joined to a name would mix
+   the two, and the same directory would then have two spellings that do not
+   compare equal. */
+static void fwd_slashes(char *s) {
+    for (; *s; s++) if (*s == '\\') *s = '/';
+}
+
 int sqr_os_getcwd(char *buf, int cap) {
     if (cap <= 0) return 1;
     buf[0] = '\0';
-    return _getcwd(buf, cap) == NULL ? 1 : 0;
+    if (_getcwd(buf, cap) == NULL) return 1;
+    fwd_slashes(buf);
+    return 0;
 }
 
 int sqr_os_getpid(void) {
@@ -197,6 +208,7 @@ int sqr_os_realpath(const char *p, char *buf, int cap) {
     n = strlen(tmp);
     if (n + 1 > (size_t)cap) return 2;          /* caller's buffer too small */
     memcpy(buf, tmp, n + 1);
+    fwd_slashes(buf);
     return 0;
 }
 

@@ -425,6 +425,12 @@ namespace eval shelltest {
         variable sqrsh
         variable work
         set errf [file join $work err.txt]
+        # Not a case a Windows program can be put in (a directory cannot be
+        # opened as a file there), and not one the wine wrapper can pass on.
+        if {[info exists ::env(SQR_TEST_WINDOWS)]} {
+            puts "  SKIP unreadable standard input (a directory as stdin is POSIX only)"
+            return
+        }
         foreach {shell name msg} [list $sqlsh sqlsh {^error: cannot read standard input$} \
                                        $sqrsh sqrsh {^cannot read standard input$}] {
             set db [fresh_db unreadable_$name]
@@ -463,7 +469,13 @@ namespace eval shelltest {
             "sqrsh: no database open is a failure"
         set r [run [utf8 "nosuch\nquit\n"] $sqrsh]
         check {[dict get $r status] == 1} "sqrsh: an unknown command ends with 1"
-        set r [run_args $sqrsh /nonexistent_dir_for_sqrsh/x/y]
+        # A database directory cannot be made beneath a regular file, whoever
+        # is asking and on whatever platform.
+        variable work
+        set blocker [file join $work not_a_directory]
+        close [open $blocker w]
+        set r [run_args $sqrsh [file join $blocker x y]]
+        file delete $blocker
         check {[dict get $r status] == 1 && [regexp {^open .* failed: } [dict get $r err]]} \
             "sqrsh: a failed start-up open is reported on stderr and ends with 1"
     }

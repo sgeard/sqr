@@ -37,6 +37,15 @@ proc check {cond label} {
     }
 }
 
+# The Windows programs (cross-built, run under wine by `make wintest`) name
+# an absolute directory with a drive, which this script's own names lack.
+# posix_path drops it, so the two can be compared; natively it changes nothing.
+set windows [info exists ::env(SQR_TEST_WINDOWS)]
+proc posix_path {p} {
+    if {$::windows} { regsub {^[A-Za-z]:} $p {} p }
+    return $p
+}
+
 # ---- the command line ----
 # sqrd has no options: an argument starting with '-' is refused with status
 # 2 before it can become a database directory.
@@ -207,7 +216,7 @@ foreach l [split [string trimright $payload "\n"] "\n"] {
     dict set info [string range $l 0 $eq-1] [string range $l $eq+3 end]
 }
 check {[dict get $info name] eq $dbdir} "INFO names the database"
-check {[dict get $info dir] eq [file normalize $dbdir]} "INFO gives the absolute directory"
+check {[posix_path [dict get $info dir]] eq [file normalize $dbdir]} "INFO gives the absolute directory"
 check {[dict get $info txn] eq "no"} "INFO reports no transaction in flight"
 check {[dict get $info tables] == 1} "INFO counts the tables"
 
@@ -238,7 +247,8 @@ lassign [reply [sendsql $c "DELETE FROM readings WHERE id = 6"]] hdr payload
 set bakexe [file join [file dirname $exe] sqrbak[file extension $exe]]
 if {[file executable $bakexe]} {
     set out [exec $bakexe info $port]
-    check {[string match "*dir = [file normalize $dbdir]*" $out]} "sqrbak info reports the directory"
+    check {[regexp -line {^dir = (.*)$} $out -> bdir] && [posix_path $bdir] eq [file normalize $dbdir]} \
+        "sqrbak info reports the directory"
     file delete -force sqrd_func_sqrbak.sqr
     set out [exec $bakexe backup $port sqrd_func_sqrbak.sqr]
     check {[string match "packed*" $out]} "sqrbak backup reports what it wrote"
@@ -285,15 +295,36 @@ if {[catch {file link -symbolic $linkdir $realdir2}] == 0} {
     }
     check {[dict get $info2 dir] eq $linkdir} \
         "INFO dir keeps the symlink the daemon was given"
-    check {[dict exists $info2 realdir] && [dict get $info2 realdir] eq $realdir2} \
-        "INFO realdir resolves it"
+    # Windows: the resolved form is lexical only (_fullpath), a link is not
+    # followed, so there is no realdir to tell apart from dir.
+    if {$windows} {
+        puts "  SKIP INFO realdir resolves it (links are not resolved on Windows)"
+    } else {
+        check {[dict exists $info2 realdir] && [dict get $info2 realdir] eq $realdir2} \
+            "INFO realdir resolves it"
+    }
     check {[file exists [file join $realdir2 _sqrd]]} "_sqrd lands in the real directory"
+    # A destination inside the database is refused however it is named: here
+    # through a link the daemon was never told about.  (Windows resolves no
+    # links, so the name stays a different directory there.)
+    set otherlink [file normalize sqrd_func_link3]
+    file delete -force $otherlink
+    if {!$windows && [catch {file link -symbolic $otherlink $realdir2}] == 0} {
+        lassign [reply [sendbody $c3 PACK [file join $otherlink inside.sqr]]] hdr payload
+        check {[lindex $hdr 0] eq "ERR" && [string match "*inside*" $payload]} \
+            "PACK refuses a destination inside the database reached through another link"
+        file delete -force $otherlink
+    }
     sendline $c3 "QUIT"
     reply $c3
     close $c3
     if {[file executable $bakexe]} {
         check {![catch {exec $bakexe info $linkdir} out2]} "sqrbak accepts the symlinked directory"
-        check {![catch {exec $bakexe info $realdir2} out3]} "sqrbak accepts the real directory"
+        if {$windows} {
+            puts "  SKIP sqrbak accepts the real directory (links are not resolved on Windows)"
+        } else {
+            check {![catch {exec $bakexe info $realdir2} out3]} "sqrbak accepts the real directory"
+        }
     }
     exec kill [pid $srv2]
     catch {close $srv2}

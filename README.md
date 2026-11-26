@@ -84,6 +84,7 @@ make F=aof all        # AMD AOCC aof (6.0)
 make F=ifx all        # default
 make debug=1 ...      # debug build
 make windows          # mingw-w64 cross-build (.exe)
+make wintest          # the whole suite against those .exe, under wine in podman
 ```
 
 `fpm` is also supported for the core library, app and tests (it globs `src/`,

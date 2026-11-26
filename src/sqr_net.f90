@@ -37,7 +37,10 @@ module sqr_net
     !! opaque; obtain with `net_attach`, release with `net_close`.
     type, public :: net_conn_t
         integer(c_int64_t) :: sock = -1  !! Underlying socket (-1 = closed)
-        character(len=NET_BUFSIZE) :: rbuf = ''  !! Buffered received bytes
+        !! Buffered received bytes: NET_BUFSIZE of them, allocated by
+        !! `net_attach`.  On the heap so that a connection (and a table of
+        !! them) is small enough to be a local variable on any platform.
+        character(len=:), allocatable :: rbuf
         integer :: rlo = 1  !! First unconsumed position in `rbuf`
         integer :: rhi = 0  !! Last valid position in `rbuf`
     end type

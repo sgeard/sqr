@@ -1,4 +1,4 @@
-.PHONY: all check depcheck clean veryclean distclean utest sqlttest shelltest sqrdtest calctest install uninstall install-calc faulttest run-faulttest proctest bench run-bench destruct run-destruct coverage coverage-gcov coverage-clean docs docs-clean help windows win-build sqrsh-regex test-regex
+.PHONY: all check depcheck clean veryclean distclean utest sqlttest shelltest sqrdtest calctest install uninstall install-calc faulttest run-faulttest proctest bench run-bench destruct run-destruct coverage coverage-gcov coverage-clean docs docs-clean help windows wintest sqrsh-regex test-regex
 .SUFFIXES:
 .DEFAULT_GOAL := all
 
@@ -400,9 +400,11 @@ distclean: veryclean docs-clean
 	@rm -vf depends.mk foptions_*.mk *~
 
 # --- Windows cross-build (MinGW-w64, 64-bit) -------------------------------
-# Cross-compile the library + the unit-test executables to standalone Windows
-# .exe to exercise the Windows (osshim.c) branch (run them on Windows, or under
-# wine). sqrsh is excluded — it links cmdgraph, which is not cross-built here.
+# Cross-compile the library, every test program (unit tests, the fault sweep,
+# the two-process crash test) and the four programs to standalone Windows
+# .exe, to exercise the Windows (osshim.c) branch: run them on Windows, or all
+# of them under wine with `make wintest`.  The vendored cmdgraph sources go
+# into the archive, as they do natively, so sqrsh links the library alone.
 #
 # Two non-obvious points encoded below:
 #   * The platform split now lives in osshim.c, compiled with the MinGW *C*
@@ -413,12 +415,13 @@ distclean: veryclean docs-clean
 #   * -static yields a self-contained .exe; -Wl,-u,__strcpy_chk -lssp resolves
 #     a fortify symbol libgfortran's runtime pulls in (via its directory code)
 #     under -static on this toolchain.
-# Under wine in podman give the container LC_ALL=C.UTF-8, or wine cannot
-# create a non-ASCII file name, and expect utest_sqr.exe to report four
-# checks SKIPPED: the read-only-media tests rely on chmod, which Windows
-# does not enforce on directories and root (the container's user) is not
-# subject to.  The reason is written up beside the probes in
-# test/utest_sqr.f90 ("Permission-based tests").
+# Under wine (`make wintest`, below) utest_sqr.exe reports five checks
+# SKIPPED: four read-only-media checks rely on chmod, which Windows does not
+# enforce on directories and root (the container's user) is not subject to,
+# and one case-folding check depends on the file system.  The reason is
+# written up beside the probes in test/utest_sqr.f90 ("Permission-based
+# tests").  The container needs LC_ALL=C.UTF-8, or wine cannot create a
+# non-ASCII file name.
 # The test executables carry src/sqr_utf8.manifest, which puts the process in
 # the UTF-8 code page so that non-ASCII table names become correctly named
 # files.  utest_sqr_acp.exe is utest_sqr built WITHOUT it: there the same
@@ -431,43 +434,112 @@ WIN_CC     := x86_64-w64-mingw32-gcc
 WIN_AR     := x86_64-w64-mingw32-ar
 WIN_RC     := x86_64-w64-mingw32-windres
 WIN_ODIR   := obj_mingw64
+WIN_WRAP   := $(WIN_ODIR)/wine
 WIN_FLAGS  := -O3
 WIN_CFLAGS := -O2 -Wall -Wextra
+WIN_FC_CMD := $(WIN_FC) $(WIN_FLAGS) -J$(WIN_ODIR) -I$(WIN_ODIR)
 # -lws2_32: Winsock, pulled in by the socket shim now in osshim.c/clib_wrap.
 WIN_LINK   := -static -Wl,-u,__strcpy_chk -lssp -lws2_32
-# Module/submodule order matters (parents before submodules).
-WIN_SRC   := clib_wrap b_tree sqr_fault sqr_consts sqr clib_wrap_sm b_tree_sm sqr_fault_off_sm sqr_base sqr_table sqr_record sqr_index sqr_admin sqr_rowbuf sqr_journal sqr_pack sql sql_base sql_parse sql_exec sqr_net sqr_net_sm sqr_serve sqr_serve_sm
-WIN_TESTS := utest_btree utest_sqr utest_sql
+# Module/submodule order matters (parents before submodules).  The fault
+# submodule is left out: the two archives below differ in it and nothing else.
+WIN_SRC   := clib_wrap b_tree sqr_fault sqr_consts sqr clib_wrap_sm b_tree_sm sqr_base sqr_table sqr_record sqr_index sqr_admin sqr_rowbuf sqr_journal sqr_pack sql sql_base sql_parse sql_exec sqr_net sqr_net_sm sqr_serve sqr_serve_sm dlist dlist_sm cmdgraph cmdgraph_sm
+WIN_LIBOBJ := $(WIN_ODIR)/osshim.o $(addprefix $(WIN_ODIR)/,$(addsuffix .o,$(WIN_SRC)))
+WIN_LIB    := $(WIN_ODIR)/libsqr.a
+WIN_FLIB   := $(WIN_ODIR)/libsqr_fault.a
+WIN_RES    := $(WIN_ODIR)/sqr_utf8.res.o
+WIN_TESTS  := $(basename $(notdir $(TEST_SRC)))
+# Programs that are one source file each; sqrsh has three.
+WIN_APPS   := sqlsh sqrd sqrbak
+WIN_EXES   := $(WIN_TESTS) utest_sqr_acp utest_fault proctest $(WIN_APPS) sqrsh
 
 windows:
-	@mkdir -p $(WIN_ODIR)
+	@mkdir -p $(WIN_ODIR) $(WIN_WRAP)
 	@echo "  CC  osshim"
 	$(WIN_CC) $(WIN_CFLAGS) -c $(SRC_DIR)/osshim.c -o $(WIN_ODIR)/osshim.o
-	@for f in $(WIN_SRC); do \
+	@for f in $(WIN_SRC) sqr_fault_off_sm; do \
 	    echo "  FC  $$f"; \
-	    $(WIN_FC) $(WIN_FLAGS) -J$(WIN_ODIR) -I$(WIN_ODIR) \
-	        -c $(SRC_DIR)/$$f.f90 -o $(WIN_ODIR)/$$f.o || exit 1; \
+	    $(WIN_FC_CMD) -c $(SRC_DIR)/$$f.f90 -o $(WIN_ODIR)/$$f.o || exit 1; \
 	done
-	$(WIN_AR) rcs $(WIN_ODIR)/libsqr.a $(WIN_ODIR)/*.o
+	@echo "  FC  sqr_fault_on_sm"
+	@$(WIN_FC_CMD) -c $(FAULT_DIR)/sqr_fault_on_sm.f90 -o $(WIN_ODIR)/sqr_fault_on_sm.o
+	@rm -f $(WIN_LIB) $(WIN_FLIB)
+	$(WIN_AR) rcs $(WIN_LIB)  $(WIN_LIBOBJ) $(WIN_ODIR)/sqr_fault_off_sm.o
+	$(WIN_AR) rcs $(WIN_FLIB) $(WIN_LIBOBJ) $(WIN_ODIR)/sqr_fault_on_sm.o
 	@echo "  RC  sqr_utf8"
-	$(WIN_RC) -I $(SRC_DIR) $(SRC_DIR)/sqr_utf8.rc -o $(WIN_ODIR)/sqr_utf8.res.o
+	$(WIN_RC) -I $(SRC_DIR) $(SRC_DIR)/sqr_utf8.rc -o $(WIN_RES)
 	@for t in $(WIN_TESTS); do \
 	    echo "  LD  $$t.exe"; \
-	    $(WIN_FC) $(WIN_FLAGS) -J$(WIN_ODIR) -I$(WIN_ODIR) -o $(WIN_ODIR)/$$t.exe \
-	        $(TEST_DIR)/$$t.f90 $(WIN_ODIR)/sqr_utf8.res.o $(WIN_ODIR)/libsqr.a $(WIN_LINK) || exit 1; \
+	    $(WIN_FC_CMD) -o $(WIN_ODIR)/$$t.exe \
+	        $(TEST_DIR)/$$t.f90 $(WIN_RES) $(WIN_LIB) $(WIN_LINK) || exit 1; \
 	done
 	@echo "  LD  utest_sqr_acp.exe"
-	@$(WIN_FC) $(WIN_FLAGS) -J$(WIN_ODIR) -I$(WIN_ODIR) -o $(WIN_ODIR)/utest_sqr_acp.exe \
-	    $(TEST_DIR)/utest_sqr.f90 $(WIN_ODIR)/libsqr.a $(WIN_LINK)
-	@echo "Built standalone Windows 64-bit exes in $(WIN_ODIR)/ (run on Windows or via wine):"
-	@for t in $(WIN_TESTS) utest_sqr_acp; do echo "    $(WIN_ODIR)/$$t.exe"; done
+	@$(WIN_FC_CMD) -o $(WIN_ODIR)/utest_sqr_acp.exe \
+	    $(TEST_DIR)/utest_sqr.f90 $(WIN_LIB) $(WIN_LINK)
+	@echo "  LD  utest_fault.exe"
+	@$(WIN_FC_CMD) -o $(WIN_ODIR)/utest_fault.exe \
+	    $(FAULT_DIR)/utest_fault.f90 $(WIN_RES) $(WIN_FLIB) $(WIN_LINK)
+	@echo "  LD  proctest.exe"
+	@$(WIN_CC) $(WIN_CFLAGS) -c $(TEST_DIR)/procshim.c -o $(WIN_ODIR)/procshim.o
+	@$(WIN_FC_CMD) -o $(WIN_ODIR)/proctest.exe \
+	    $(TEST_DIR)/proctest.f90 $(WIN_ODIR)/procshim.o $(WIN_RES) $(WIN_LIB) $(WIN_LINK)
+	@for a in $(WIN_APPS); do \
+	    echo "  LD  $$a.exe"; \
+	    $(WIN_FC_CMD) -o $(WIN_ODIR)/$$a.exe \
+	        $(APP_DIR)/$$a.f90 $(WIN_RES) $(WIN_LIB) $(WIN_LINK) || exit 1; \
+	done
+	@echo "  LD  sqrsh.exe"
+	@$(WIN_FC_CMD) -o $(WIN_ODIR)/sqrsh.exe \
+	    $(APP_DIR)/sqrsh_extras.f90 $(APP_DIR)/sqrsh_extras_off_sm.f90 $(APP_DIR)/sqrsh.f90 \
+	    $(WIN_RES) $(WIN_LIB) $(WIN_LINK)
+	@for x in $(WIN_EXES); do ln -sf ../../$(TEST_DIR)/winrun $(WIN_WRAP)/$$x; done
+	@echo "Built standalone Windows 64-bit exes in $(WIN_ODIR)/ (run on Windows, or 'make wintest'):"
+	@for x in $(WIN_EXES); do echo "    $(WIN_ODIR)/$$x.exe"; done
+
+# --- The suite against the Windows programs, under wine in podman ----------
+# One container is started for the whole run, with the project directory and
+# /tmp (where the harnesses keep their scratch databases) mounted at their own
+# paths and the host's network, so that the Tcl harnesses stay on the host: each name in $(WIN_WRAP) is a link to test/winrun, which
+# runs the .exe of that name inside the container and passes stdin, stdout,
+# the exit status and a kill straight through.  A harness is therefore handed
+# $(WIN_WRAP)/sqlsh exactly as it is handed $(ODIR)/sqlsh natively.
+#   WINE_PODMAN  the podman command, with any global options a host needs
+#   WINE_RUN     extra `podman run` options (--runtime ..., for instance)
+#   WINE_IMAGE   an image with wine on its PATH
+# For instance, where rootless overlay storage does not work:
+#   make wintest WINE_PODMAN='podman --storage-driver vfs --root DIR' \
+#                WINE_RUN='--runtime crun'
+# Skipped there, each with its reason printed: the checks above, a directory
+# as standard input (POSIX only), and the two sqrd checks that need a
+# symbolic link resolved (Windows path resolution here is lexical).
+WINE_PODMAN ?= podman
+WINE_RUN    ?=
+WINE_IMAGE  ?= docker.io/tobix/wine:stable
+WINE_CTR    := sqr_wintest
+
+wintest: windows
+	@$(WINE_PODMAN) rm -f $(WINE_CTR) > /dev/null 2>&1; \
+	$(WINE_PODMAN) run -d --name $(WINE_CTR) $(WINE_RUN) --network host \
+	    -e LC_ALL=C.UTF-8 -e WINEDEBUG=-all -e WINEDLLOVERRIDES="mscoree,mshtml=" \
+	    -e XDG_RUNTIME_DIR=/tmp -v $(CURDIR):$(CURDIR) -v /tmp:/tmp -w $(CURDIR) \
+	    $(WINE_IMAGE) sleep infinity > /dev/null || exit 1; \
+	trap '$(WINE_PODMAN) rm -f $(WINE_CTR) > /dev/null 2>&1' EXIT; \
+	export SQR_WINE_PODMAN='$(WINE_PODMAN)' SQR_WINE_CTR=$(WINE_CTR) SQR_TEST_WINDOWS=1; \
+	W=$(WIN_WRAP); rc=0; \
+	for t in $(WIN_TESTS) utest_sqr_acp utest_fault proctest; do \
+	    echo "==> $$t.exe"; $$W/$$t || rc=1; \
+	done; \
+	tclsh $(SQLT_DIR)/run_sqlt.tcl $$W/sqlsh $(SQLT_TESTS) || rc=1; \
+	tclsh $(SQLT_DIR)/run_shell.tcl $$W/sqlsh $$W/sqrsh || rc=1; \
+	tclsh $(TEST_DIR)/run_sqrd.tcl $$W/sqrd || rc=1; \
+	tclsh $(CALC_DIR)/test_calc.tcl $$W/sqrd || rc=1; \
+	exit $$rc
 
 help:
 	@echo "Targets : all, check (depcheck utest sqlttest shelltest), depcheck"
 	@echo "          utest, sqlttest, shelltest, sqrdtest, calctest, faulttest, destruct, bench"
 	@echo "          install, uninstall (PREFIX=$(PREFIX)), install-calc"
 	@echo "          clean, veryclean, distclean"
-	@echo "          coverage, coverage-gcov, coverage-clean, docs, docs-clean, windows"
+	@echo "          coverage, coverage-gcov, coverage-clean, docs, docs-clean, windows, wintest"
 	@echo "          sqrsh-regex, test-regex (opt-in DT_CHAR regex search via tcl_re)"
 	@echo "Options : F=gfortran|ifx|lfortran|flang|aof (default ifx)  debug=1  valgrind=1 (ifx: AVX2 cap)"
 	@echo "LIB_SRC = $(LIB_SRC)"

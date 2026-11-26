@@ -1,0 +1,32 @@
+#!/bin/bash
+# winrun - run a Windows .exe under wine in the container `make wintest` starts.
+#
+# Never called by this name: obj_mingw64/wine/NAME is a link to this file, and
+# NAME decides the program (obj_mingw64/NAME.exe).  The link stands in for the
+# native binary wherever a test harness wants one: stdin, stdout, stderr and
+# the exit status pass straight through, the working directory is the
+# caller's, and a TERM or INT sent to this process kills the program in the
+# container - a hard kill, which is what the harnesses mean by `kill`.
+#
+#   SQR_WINE_PODMAN  the podman command and its global options (default podman)
+#   SQR_WINE_CTR     the running container                  (default sqr_wintest)
+set -u
+name=$(basename "$0")
+exe=$(cd "$(dirname "$0")/.." && pwd)/$name.exe
+pod=${SQR_WINE_PODMAN:-podman}
+ctr=${SQR_WINE_CTR:-sqr_wintest}
+pidfile=/tmp/winrun.$$
+
+# The shell in the container records its pid and becomes wine, so that pid is
+# the program's.  Backgrounded with stdin kept, because bash runs a trap only
+# between commands and would otherwise sit in the foreground child.
+$pod exec -i -w "$PWD" "$ctr" sh -c 'echo $$ > "$0"; exec wine "$@"' \
+    "$pidfile" "$exe" "$@" <&0 &
+child=$!
+trap '$pod exec "$ctr" sh -c "kill -9 \$(cat $pidfile)" > /dev/null 2>&1' TERM INT
+wait $child
+rc=$?
+# A trapped signal ends the first wait early; the second collects the child.
+if [ $rc -gt 128 ]; then wait $child; rc=$?; fi
+rm -f "$pidfile"          # /tmp is the host's, mounted into the container
+exit $rc
