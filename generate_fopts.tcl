@@ -119,11 +119,37 @@ F_LOPTS  += -Wl,-z,noexecstack $(F_LOPTS_FL)
 F_SOOPTS += -Wl,-z,noexecstack $(F_LOPTS_FL)
 }
 
+# AMD AOCC's aof: LLVM flang 21 underneath (it defines __flang__ as well as
+# __AOCC__), so the flang entry's reasoning holds - module dir, NO_PDT,
+# -Qunused-arguments, -fPIC, -no-pie for the non-PIC C shims, no exec stack.
+# The driver finds the system gcc runtime through aof.cfg beside the real
+# binary (--gcc-install-dir=...; aof rejects --gcc-triple).
+dict set c aof {
+ODIR     := obj_aof_$(BUILD)
+MOD_OPTS := -module-dir $(ODIR) -I$(ODIR)
+F_BASE   := -cpp -DNO_PDT -Qunused-arguments $(F_EXTRA_AOF)
+ifdef debug
+    F_BUILD := -g -fPIC
+else
+    # Release: tuned for the build host (-march=native: znver4 on the 7950X,
+    # AVX-512 included).  -ffp-contract=off: no fused multiply-add contraction,
+    # so results round as written (as gfortran/flang at their baseline ISA) -
+    # with FMA, 2d_cad's exactly-tangent C+C+r case loses a root.  Measured on
+    # 2d_cad perf_solve (2026-11-11): -funroll-loops, -fveclib=AMDLIBM and FMA
+    # gained nothing within noise, so they are left out.
+    F_BUILD := -O3 -march=native -ffp-contract=off -fPIC
+endif
+F_LOPTS  := -no-pie
+F_SOOPTS := -shared
+F_LOPTS  += -Wl,-z,noexecstack $(F_LOPTS_AOF)
+F_SOOPTS += -Wl,-z,noexecstack $(F_LOPTS_AOF)
+}
+
 # =============================================================================
 
 # Check argument
 if {$argc != 2} {
-    puts "Usage:  $argv0 <ifx|gfortran|lfortran|flang> <output file>"
+    puts "Usage:  $argv0 <ifx|gfortran|lfortran|flang|aof> <output file>"
     exit 1
 }
 lassign $argv comp ofile
@@ -142,10 +168,12 @@ set header_mk "
 #   F_EXTRA_IFX  - extra ifx flags      (appended to F_BASE)
 #   F_EXTRA_LF   - extra lfortran flags (appended to F_BASE)
 #   F_EXTRA_FL   - extra flang flags (appended to F_BASE)
+#   F_EXTRA_AOF  - extra aof (AMD AOCC) flags (appended to F_BASE)
 #   F_LOPTS_GF   - gfortran link flags
 #   F_LOPTS_IFX  - ifx link flags
 #   F_LOPTS_LF   - lfortran link flags
 #   F_LOPTS_FL   - flang link flags
+#   F_LOPTS_AOF  - aof link flags
 #
 # Provides F_OPTS (compile), F_LOPTS (link an executable) and F_SOOPTS (link a
 # shared object: -shared, never an executable stack, no -no-pie).

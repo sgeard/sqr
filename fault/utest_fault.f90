@@ -13,7 +13,7 @@ program utest_fault
     use, intrinsic :: iso_fortran_env, only: int32, int64
     use sqr
     use sqr_fault, only: fault_arm, fault_disarm, fault_count
-    use clib_wrap, only: c_rmtree, c_path_exists
+    use clib_wrap, only: c_rmtree, c_path_exists, c_remove
     implicit none
 
     integer :: pass = 0, fail = 0
@@ -49,6 +49,7 @@ program utest_fault
     call reshape_atomicity()
     call sweep('add_text',     prep_plain,       op_addtext, .false.)
     call addtext_atomicity()
+    call unpack_faults()
     call sweep('set_text',     prep_textrow,     op_settext, .false.)
     call sweep('get_text',     prep_textset,     op_gettext, .false., expect=SQR_ERR)
     ! Every sweep closes its handle after each faulted run: an error path that
@@ -549,6 +550,54 @@ contains
         end do sweep_loop
         call check(bad == 0, 'add_text: every failed change reopens old, or new with a usable TEXT column')
     end subroutine addtext_atomicity
+
+    ! db_unpack makes every extracted file, and the directory holding them,
+    ! durable before the rename, and the rename after it.  A failure at any of
+    ! those points is reported and leaves NOTHING: neither the database
+    ! directory nor the temporary one beside it.  (Durability itself needs a
+    ! power cut to observe; this covers the failure paths.)
+    subroutine unpack_faults()
+        character(len=*), parameter :: PK = 'utest_fault_unpack.sqr', OUT = 'utest_fault_unpack_db'
+        type(db_t) :: db
+        integer :: nops, n, rs, bad, left, ios
+        character(len=128) :: em
+        call fault_disarm()
+        call prep_indexed()
+        ios = c_remove(PK)
+        ios = c_rmtree(OUT)
+        call db_pack(DBDIR, PK, rs)
+        call check(rs == SQR_OK, 'unpack: fixture packs')
+        call fault_arm(BIG)
+        call db_unpack(PK, OUT, rs)
+        nops = fault_count()
+        call fault_disarm()
+        call check(rs == SQR_OK .and. nops > 0, 'unpack: clean run succeeds, with I/O counted')
+        call db_open(db, OUT, rs)
+        em = ''
+        if (rs == SQR_OK) call db_verify(db, 'people', rs, em)
+        call check(rs == SQR_OK, 'unpack: the unpacked database opens and verifies')
+        call db_close(db)
+        call check(.not. c_path_exists(OUT // '.unpack-tmp'), 'unpack: no temporary directory left')
+        bad = 0; left = 0
+        sweep_loop: do n = 1, nops
+            ios = c_rmtree(OUT)
+            call fault_arm(n)
+            call db_unpack(PK, OUT, rs)
+            call fault_disarm()
+            if (rs == SQR_OK) bad = bad + 1
+            if (c_path_exists(OUT) .or. c_path_exists(OUT // '.unpack-tmp')) then
+                print '(a,i0,a)', '  unpack fault ', n, ': a directory was left behind'
+                left = left + 1
+                ios = c_rmtree(OUT // '.unpack-tmp')
+            end if
+        end do sweep_loop
+        call check(bad == 0,  'unpack: every injected I/O surfaced as a non-OK status')
+        call check(left == 0, 'unpack: a failed unpack leaves neither directory')
+        call db_unpack(PK, OUT, rs)
+        call check(rs == SQR_OK, 'unpack: and the retry succeeds')
+        ios = c_rmtree(OUT)
+        ios = c_remove(PK)
+    end subroutine unpack_faults
 
     subroutine op_compact(rs)
         integer, intent(out) :: rs

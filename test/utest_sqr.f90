@@ -3258,8 +3258,15 @@ contains
         call check(rs == SQR_OK, 'pack: db_pack succeeds')
         inquire(file=PFILE, exist=ex)
         call check(ex, 'pack: container file created')
+        ! A temporary directory left by an abandoned attempt is replaced, and
+        ! none is left by this one.
+        ios = c_mkdir(PDIR2 // '.unpack-tmp')
+        call put_bytes(PDIR2 // '.unpack-tmp/stale.dat', 'left by an abandoned unpack')
         call db_unpack(PFILE, PDIR2, rs)
         call check(rs == SQR_OK, 'pack: db_unpack succeeds')
+        call check(.not. c_path_exists(PDIR2 // '.unpack-tmp') .and. &
+                   .not. c_path_exists(PDIR2 // '/stale.dat'), &
+                   'pack: a stale temporary directory is replaced, and none is left')
 
         call db_open(db, PDIR2, rs, emsg)
         call check(rs == SQR_OK, 'pack: unpacked db opens')

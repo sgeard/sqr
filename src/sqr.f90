@@ -723,8 +723,9 @@ module sqr
         !! directory.  Refuses to overwrite an existing `dir` (`SQR_DUP`, as
         !! Save-As).  Verifies the checksum before writing anything (a truncated
         !! transfer is `SQR_ERR`) and validates every archived name against path
-        !! traversal, then extracts into a temporary directory and renames it
-        !! into place so a failure leaves no partial database.  Fails with
+        !! traversal, then extracts into a temporary directory, makes every
+        !! file and the directory durable, and renames it into place, so a
+        !! failure or a power loss leaves no partial database.  Fails with
         !! `SQR_ERR` (bad magic/truncated/I-O), `SQR_VERSION` (newer format or
         !! wrong byte order), `SQR_INVALID` (a malformed archived name), or
         !! `SQR_DUP` (`dir` already exists).

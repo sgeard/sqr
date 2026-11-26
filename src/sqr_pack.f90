@@ -396,7 +396,10 @@ contains
             end if
 
             ! Materialise into a temp sibling directory, then rename into place
-            ! so a failure leaves no partial database behind.
+            ! so a failure leaves no partial database behind.  Everything is
+            ! made durable BEFORE the rename - each file as it is written, then
+            ! the temp directory's entries - so a power loss cannot leave the
+            ! final name over short or empty files.
             tmpd = trim(dir) // '.unpack-tmp'
             if (c_path_exists(tmpd)) ios = c_rmtree(tmpd)
             if (.not. mkdir_p(tmpd)) then
@@ -411,12 +414,26 @@ contains
                     exit read_body
                 end if
             end do extract
-            if (c_rename(tmpd, trim(dir)) /= 0) then
-                ios = c_rmtree(tmpd)
+            ios = c_fsync_dir(tmpd)
+            call io_check(ios)
+            if (ios == 0) then
+                ios = c_rename(tmpd, trim(dir))
+                call io_check(ios)
+            end if
+            if (ios /= 0) then
+                ios = c_rmtree(tmpd)             ! whichever name it now has:
+                ios = c_rmtree(trim(dir))        ! `dir` did not exist on entry
                 rs = SQR_ERR
                 exit read_body
             end if
+            ! The rename itself.  If it cannot be made durable the unpack has
+            ! failed, and a failed unpack leaves nothing behind.
             ios = c_fsync_dir(parent_dir(trim(dir)))
+            call io_check(ios)
+            if (ios /= 0) then
+                ios = c_rmtree(trim(dir))
+                rs = SQR_ERR
+            end if
         end block read_body
         close(u, iostat=ios)
         call pk_report(rs, stat, errmsg)
@@ -463,8 +480,21 @@ contains
             stat = SQR_ERR
             return
         end if
-        if (len(bytes) > 0) write(u, iostat=ios) bytes
-        if (ios == 0) close(u, iostat=ios)
+        if (len(bytes) > 0) then
+            write(u, iostat=ios) bytes
+            call io_check(ios)
+        end if
+        if (ios /= 0) then
+            close(u, iostat=ios)                 ! never strand the unit
+            stat = SQR_ERR
+            return
+        end if
+        close(u, iostat=ios)                     ! the final flush
+        call io_check(ios)
+        if (ios == 0) then
+            ios = c_fsync_path(path)
+            call io_check(ios)
+        end if
         stat = merge(SQR_ERR, SQR_OK, ios /= 0)
     end subroutine
 

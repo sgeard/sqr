@@ -28,7 +28,7 @@ F_EXTRA_IFX := -assume byterecl -diag-disable=7712
 
 # --- Compiler selection: default ifx (release), validated ------------------
 F ?= ifx
-VALID_F := gfortran ifx lfortran flang
+VALID_F := gfortran ifx lfortran flang aof
 ifeq ($(filter $(F),$(VALID_F)),)
   $(error Unknown Fortran compiler 'F=$(F)' -- choose one of: $(VALID_F))
 endif
@@ -459,7 +459,7 @@ help:
 	@echo "          clean, veryclean, distclean"
 	@echo "          coverage, coverage-gcov, coverage-clean, docs, docs-clean, windows"
 	@echo "          sqrsh-regex, test-regex (opt-in DT_CHAR regex search via tcl_re)"
-	@echo "Options : F=gfortran|ifx|lfortran|flang (default ifx)  debug=1  valgrind=1 (ifx: AVX2 cap)"
+	@echo "Options : F=gfortran|ifx|lfortran|flang|aof (default ifx)  debug=1  valgrind=1 (ifx: AVX2 cap)"
 	@echo "LIB_SRC = $(LIB_SRC)"
 	@echo "TEST_BIN= $(TEST_BIN)"
 	@echo "APP_BIN = $(APP_BIN)"

@@ -277,6 +277,32 @@ namespace eval shelltest {
         check {![file exists $out]} "pack too large: no container written"
     }
 
+    # .pack then .unpack: the restored directory is a database a later sqlsh
+    # run can open and query, and no temporary directory is left beside it.
+    proc t_pack_unpack {} {
+        variable work
+        set db  [fresh_db packsrc]
+        set dst [fresh_db packdst]
+        set pk  [file join $work packsrc.sqr]
+        file delete -force $pk $dst.unpack-tmp
+        set sql ".open $db\nCREATE TABLE t(a INTEGER, b CHAR(8), c TEXT)\n"
+        append sql "INSERT INTO t VALUES(1,'one','first body')\nINSERT INTO t VALUES(2,'two','second body')\n"
+        append sql "CREATE INDEX ON t(a)\n.quit\n"
+        run [utf8 $sql]
+        set r [run [utf8 ".pack $db $pk\n.unpack $pk $dst\n.quit\n"]]
+        check {[dict get $r status] == 0 && ![regexp {failed|error} [dict get $r err]]} \
+                                                                       "pack/unpack: both commands succeed"
+        check {[file isdirectory $dst] && ![file exists $dst.unpack-tmp]} \
+                                                                       "pack/unpack: the directory is in place, no temporary left"
+        set r [run [utf8 ".open $dst\nSELECT b FROM t WHERE a = 2\nSELECT c FROM t WHERE a = 1\n.quit\n"]]
+        check {![regexp {error|cannot open} [dict get $r err]]}        "pack/unpack: the restored database opens on the next start"
+        check {[regexp -line {^two *$} [dict get $r out]]}             "pack/unpack: an indexed lookup answers"
+        check {[regexp -line {^first body *$} [dict get $r out]]}      "pack/unpack: TEXT values came across"
+        set r [run [utf8 ".unpack $pk $dst\n.quit\n"]]
+        check {[regexp {failed} [dict get $r err]] && ![file exists $dst.unpack-tmp]} \
+                                                                       "pack/unpack: a second unpack onto it is refused, leaving no temporary"
+    }
+
     proc t_utf8_bom {} {
         variable BOM_UTF8
         set db [fresh_db utf8bom]
@@ -455,6 +481,7 @@ namespace eval shelltest {
             t_add_text_column
             t_readonly_counters
             t_pack_too_large
+            t_pack_unpack
             t_utf8_bom
             t_utf8_bom_alone
             t_wide
