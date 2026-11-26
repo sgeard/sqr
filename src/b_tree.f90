@@ -17,12 +17,13 @@
 !! may leave `npages` higher: the file is never shrunk).
 !!
 !! But WITHOUT a journal, a crash or a failed write during a mutation can
-!! leave pages it already wrote in the file: (1) the file longer than
-!! `page_size * npages`, which `bt_open` then refuses as `BT_CORRUPT`;
-!! (2) after `bt_bulk_load`, new pages written over the old tree under the
-!! old meta page; (3) after a split, a right half reachable by the leaf
-!! chain but not by descent.  Standalone, the remedy is to rebuild into a
-!! fresh file (`bt_open(create=.true.)` then `bt_bulk_load`).  A caller
+!! leave pages it already wrote in the file: (1) whole pages past the
+!! `npages` of the meta page; (2) after `bt_bulk_load`, new pages written
+!! over the old tree under the old meta page; (3) after a split, a right
+!! half reachable by the leaf chain but not by descent.  Case (1) is
+!! harmless: `bt_open` counts those pages into `npages` and they stay
+!! unreferenced.  For (2) and (3) the remedy standalone is to rebuild into
+!! a fresh file (`bt_open(create=.true.)` then `bt_bulk_load`).  A caller
 !! that needs more installs the journal hook (`bt_set_journal_hook`),
 !! restores the recorded pre-images after a failure and calls `bt_reload`,
 !! which is what sqr does.
@@ -143,7 +144,12 @@ module b_tree
         !! Open an existing tree (`create=.false.`) or create a fresh empty
         !! one (`create=.true.`, file truncated).  `writable=.false.` opens
         !! read-only.  On a non-create open `key_len` must match the value
-        !! stored in the file or `BT_CORRUPT` is returned.
+        !! stored in the file or `BT_CORRUPT` is returned.  The file must be
+        !! a whole number of pages and hold at least the `npages` its meta
+        !! page counts, or `BT_CORRUPT` is returned; if it holds more, the
+        !! handle's `npages` is the file's count (see the module text) and
+        !! a read-write handle records it at its next successful mutation
+        !! or `bt_close`.
         module subroutine bt_open(bt, path, key_len, writable, create, stat)
             type(btree_t),    intent(out) :: bt    !! Tree handle (overwritten)
             character(len=*), intent(in)  :: path  !! Paged-file path

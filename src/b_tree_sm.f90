@@ -23,10 +23,13 @@
 ! On-disk invariants. Every scalar above is untrusted data read back from a
 ! file that a crash, a bad disk or a hostile edit may have changed, so each is
 ! checked before it can steer an access:
-!   file length    == page_size * npages                     (bt_open)
+!   file length    a whole number of pages, >= npages of them (bt_open)
 !       npages is the file's page count, not the live tree's: after a
 !       bt_bulk_load that needed fewer pages the surplus stays in the file,
-!       counted but unreferenced.
+!       counted but unreferenced.  A file with more pages than the meta
+!       page counts (a failed mutation or a crash after a new page was
+!       written and before the meta page) is accepted and its pages
+!       adopted in the same way.
 !   root, first_leaf in 2..npages, maxk >= MIN_FANOUT,
 !   key_len match                                            (bt_open)
 !   node kind      == K_LEAF or K_INT                        (check_node)
@@ -709,13 +712,25 @@ contains
         ! The stored page_size becomes the direct-access recl below, so it must
         ! agree with the file itself: off by even one byte, every page read
         ! lands mid-record and nkeys/pointers come back from the middle of key
-        ! data. alloc_page/write_page always leave the file at exactly
-        ! npages*page_size, and jrnl_recover has already repaired any torn
-        ! file by the time db_open reaches an index, so demand equality.
-        if (fsize /= int(bt%page_size, int64) * int(bt%npages, int64)) then
-            stat = BT_CORRUPT
-            return
-        end if
+        ! data.  The file must therefore be a whole number of pages, and hold
+        ! at least the npages the meta page counts.
+        !
+        ! It may hold MORE.  Growing the tree is two writes, the new page and
+        ! then the meta page that counts it, and without a journal nothing
+        ! makes them one: a mutation that failed after its new page reached
+        ! the file, or a crash between the two writes, leaves whole pages past
+        ! the count.  They are adopted - npages is the file's page count - and
+        ! stay unreferenced, exactly like the surplus bt_bulk_load can leave.
+        ! Nothing is written here; the next successful mutation or bt_close
+        ! records the count.
+        associate (ps => int(bt%page_size, int64))
+            if (mod(fsize, ps) /= 0_int64 .or. fsize / ps < int(bt%npages, int64) .or. &
+                fsize / ps > int(huge(bt%npages), int64)) then
+                stat = BT_CORRUPT
+                return
+            end if
+            bt%npages = int(fsize / ps)
+        end associate
         open(newunit=u, file=path, access='direct', form='unformatted', &
              recl=bt%page_size, status='old', action=trim(act), iostat=ios)
         if (ios /= 0) then

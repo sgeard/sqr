@@ -78,7 +78,7 @@ program utest_btree
     use :: b_tree
     use :: utest_btree_cmp, only: icmp
     use :: utest_btree_hook
-    use :: clib_wrap, only: c_remove
+    use :: clib_wrap, only: c_remove, c_truncate
     implicit none
 
     integer :: pass = 0, fail = 0
@@ -101,6 +101,7 @@ program utest_btree
     call t_discard()
     call t_bad_arguments()
     call t_failed_mutators()
+    call t_surplus_pages()
 
     print '(a,i0,a,i0,a)', 'b_tree tests: ', pass, ' passed, ', fail, ' failed'
     if (fail > 0) error stop 1
@@ -910,8 +911,8 @@ contains
         integer, parameter :: MK = 339           ! entries per leaf, key_len 4
         character(len=*), parameter :: P = 'utest_btree_15.bt'
         type(btree_t)     :: bt, b0
-        integer :: st, n, ncalls, bad
-        logical :: found
+        integer :: st, n, ncalls, bad, bad_open
+        logical :: found, whole
         character(len=4), allocatable :: keys(:)
         integer(int32),   allocatable :: pays(:)
 
@@ -923,14 +924,39 @@ contains
         call check(st == BT_OK .and. ncalls >= 4, 'failmut: a splitting insert writes 4+ pages')
         call unhook(bt)
         bad = 0
+        bad_open = 0
+        whole = .false.
         ins_sweep: do n = 1, ncalls
             call hooked_tree(bt, P, MK, b0)
             call fk_arm(n, 1)
             call bt_insert(bt, k4(int(MK + 1, int32)), 1_int32, icmp, dummy, st)
             if (st == BT_OK .or. .not. same_meta(bt, b0)) bad = bad + 1
-            call unhook(bt)
+            ! Closed as it stands (the meta page keeps the old count, over
+            ! whatever pages the failed insert left), the tree must reopen.
+            call bt_set_journal_hook(bt)
+            call bt_close(bt, st)
+            call bt_open(bt, P, 4, .true., .false., st)
+            if (st /= BT_OK) then
+                bad_open = bad_open + 1
+                cycle ins_sweep
+            end if
+            if (bt%npages < b0%npages) bad_open = bad_open + 1
+            ! n = 2: only the new right leaf was written, so the tree is
+            ! whole and one page is surplus.  It takes the insert and reopens.
+            if (n == 2) then
+                whole = bt%npages == b0%npages + 1 .and. scan_count(bt) == MK
+                call bt_insert(bt, k4(int(MK + 1, int32)), 1_int32, icmp, dummy, st)
+                whole = whole .and. st == BT_OK
+                call bt_close(bt, st)
+                call bt_open(bt, P, 4, .false., .false., st)
+                whole = whole .and. st == BT_OK
+                if (st == BT_OK) whole = whole .and. scan_count(bt) == MK + 1
+            end if
+            call bt_discard(bt)
         end do ins_sweep
         call check(bad == 0, 'failmut: a failed insert leaves the handle as it was')
+        call check(bad_open == 0, 'failmut: the tree reopens after any failed insert')
+        call check(whole, 'failmut: an orphan page is adopted, the tree whole and usable')
 
         ! --- remove --------------------------------------------------
         call hooked_tree(bt, P, 600, b0)
@@ -979,6 +1005,73 @@ contains
         call check(st == BT_ERR, 'failmut: a hook status of 3 is reported as BT_ERR')
         call unhook(bt)
         call fresh(P)
+    end subroutine
+
+    ! A file may hold whole pages past the count in its meta page (a failed
+    ! mutation, or a crash, after a new page was written and before the meta
+    ! page).  bt_open adopts them; a partial page or a short file is refused.
+    subroutine t_surplus_pages()
+        integer, parameter :: PS = 4096, NENT = 600
+        character(len=*), parameter :: P = 'utest_btree_16.bt'
+        type(btree_t) :: bt
+        integer :: st, i, np0, ios
+
+        call fresh(P)
+        call bt_open(bt, P, 4, .true., .true., st)
+        do i = 1, NENT
+            call bt_insert(bt, k4(int(i, int32)), int(i, int32), icmp, dummy, st)
+        end do
+        np0 = bt%npages
+        call bt_close(bt, st)
+
+        ! Three surplus pages, read-only: counted in the handle, file untouched.
+        call append_bytes(P, 3 * PS)
+        call bt_open(bt, P, 4, .false., .false., st)
+        call check(st == BT_OK, 'surplus: whole extra pages open read-only')
+        call check(bt%npages == np0 + 3, 'surplus: they are counted in npages')
+        call check(scan_count(bt) == NENT, 'surplus: every entry is still met')
+        call bt_close(bt, st)
+
+        ! Read-write: the tree grows past the surplus and reopens exactly.
+        call bt_open(bt, P, 4, .true., .false., st)
+        call check(st == BT_OK .and. bt%npages == np0 + 3, 'surplus: open read-write')
+        do i = NENT + 1, NENT + 2000
+            call bt_insert(bt, k4(int(i, int32)), int(i, int32), icmp, dummy, st)
+        end do
+        call check(st == BT_OK .and. bt%npages > np0 + 3, 'surplus: inserts extend past them')
+        call bt_close(bt, st)
+        call bt_open(bt, P, 4, .false., .false., st)
+        call check(st == BT_OK, 'surplus: reopens after growing')
+        call check(scan_count(bt) == NENT + 2000, 'surplus: every entry after growing')
+        np0 = bt%npages
+        call bt_close(bt, st)
+
+        ! A partial page at the end is not a page.
+        call append_bytes(P, 1)
+        call bt_open(bt, P, 4, .false., .false., st)
+        call check(st == BT_CORRUPT, 'surplus: a partial last page is rejected')
+        ios = c_truncate(P, int(np0, int64) * PS)
+        call bt_open(bt, P, 4, .false., .false., st)
+        call check(st == BT_OK, 'surplus: accepted again at whole pages')
+        call bt_close(bt, st)
+
+        ! Fewer pages than the meta page counts.
+        ios = c_truncate(P, int(np0 - 1, int64) * PS)
+        call bt_open(bt, P, 4, .false., .false., st)
+        call check(st == BT_CORRUPT, 'surplus: a file short of npages is rejected')
+        call fresh(P)
+    end subroutine
+
+    ! Append `n` zero bytes to a file.
+    subroutine append_bytes(path, n)
+        character(len=*), intent(in) :: path
+        integer,          intent(in) :: n
+        integer :: u, ios
+        open(newunit=u, file=path, access='stream', form='unformatted', &
+             status='old', action='write', position='append', iostat=ios)
+        if (ios /= 0) return
+        write(u, iostat=ios) repeat(char(0), n)
+        close(u, iostat=ios)
     end subroutine
 
     ! A fresh tree of `nent` ascending entries with fail_hook installed (not
