@@ -308,6 +308,8 @@ SELECT COUNT(*) AS staff, AVG(salary), MAX(salary) FROM employee WHERE dept IN (
 SELECT name FROM employee WHERE name LIKE 'A%' AND dept NOT IN ('sales');
 ```
 
+What follows is a summary; [`SQL-REFERENCE.md`](SQL-REFERENCE.md) is the definition.
+
 The supported subset: DDL (`CREATE`/`DROP TABLE`, `CREATE [UNIQUE] INDEX`,
 `DROP INDEX`, `ALTER TABLE … ADD/DROP COLUMN`), DML (`INSERT`, `DELETE`,
 `UPDATE`), `SELECT item,…|* … [WHERE][ORDER BY col [ASC|DESC],…][LIMIT n]`, and
@@ -743,5 +745,9 @@ Honesty requires the debit column too:
 ---
 
 ## Documentation
+
+[`SQL-REFERENCE.md`](SQL-REFERENCE.md) defines the SQL subset: lexical rules, types, every
+statement, results, error messages, limits, a grammar, and the points still
+open.
 
 `make docs` generates the full FORD API reference into `ford_docs/`.
