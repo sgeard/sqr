@@ -516,7 +516,7 @@ contains
         idx = 0
         if (.not. allocated(db%tables)) return
         want = lower_ascii(trim(name))
-        do idx = 1, size(db%tables)
+        do idx = 1, db%ntables        ! a slot beyond ntables is not a table
             if (lower_ascii(trim(db%tables(idx)%name)) == want) return
         end do
         idx = 0
@@ -784,11 +784,14 @@ contains
     ! A non-durable store (db_open durable=.false.) keeps the rename — the
     ! running process never sees a torn file — and skips both fsyncs, as it
     ! does everywhere else: the host rebuilds such a store or syncs it itself.
-    subroutine atomic_replace(db, tmp, final, stat)
+    subroutine atomic_replace(db, tmp, final, stat, in_place)
         type(db_t),       intent(in)  :: db
         character(len=*), intent(in)  :: tmp, final
         integer,          intent(out) :: stat
+        logical, optional, intent(out) :: in_place  ! the rename happened: `final` is the new file,
+                                                    ! whatever `stat` says of the directory sync
         integer :: ios
+        if (present(in_place)) in_place = .false.
         if (db%durable) then
             ios = c_fsync_path(tmp)
             call io_check(ios)
@@ -808,6 +811,7 @@ contains
         end if
         ! From here there is no temporary file, whatever the fsync returns.
         stat = SQR_OK
+        if (present(in_place)) in_place = .true.
         if (db%durable) then
             ios = c_fsync_dir(db%dir)
             call io_check(ios)
@@ -817,13 +821,15 @@ contains
 
     ! Clears db%catalog_dirty on success, so db_close/db_quiesce know the
     ! on-disk table list is current and need not rewrite it.
-    subroutine write_catalog(db, stat)
+    subroutine write_catalog(db, stat, in_place)
         type(db_t), intent(inout) :: db
         integer,    intent(out)   :: stat
+        logical, optional, intent(out) :: in_place  ! as atomic_replace: the new catalog is the one on disk
         integer :: u, ios, i
         character(len=len(CATALOG_MAGIC)) :: magic
         character(len=SQR_NAME_LEN) :: nm
         character(len=:), allocatable :: final, tmp
+        if (present(in_place)) in_place = .false.
         magic = CATALOG_MAGIC
         final = catalog_path(db)
         tmp   = final // '.tmp'
@@ -854,7 +860,7 @@ contains
             stat = SQR_ERR
             return
         end if
-        call atomic_replace(db, tmp, final, stat)
+        call atomic_replace(db, tmp, final, stat, in_place)
         if (stat == SQR_OK) db%catalog_dirty = .false.
     end subroutine
 

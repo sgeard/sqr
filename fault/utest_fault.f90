@@ -1766,19 +1766,22 @@ contains
         call check(bad == 0, 'drop_table: every failure leaves the table intact (with any later row) or wholly gone')
     end subroutine drop_table_faults
 
-    ! A failure at each I/O point of db_create_table, in a database that
-    ! already holds a table.  The contract is "no trace left": the call
-    ! fails, the new table is not in the handle, and its name is free -
-    ! db_create_table refuses a name whose schema, data or blob file exists,
-    ! so a second create that succeeds shows none was left behind.  Each
-    ! fault is run twice: the second create in the same session (then the
-    ! new table takes a row and both tables verify after a reopen), and the
-    ! second create only after close and reopen.  The new table has a TEXT
-    ! column, so the blob file's creation is swept too.
+    ! A fault at each I/O point of db_create_table, in a database that
+    ! already holds a table.  Two outcomes are right.  FAILED: no trace is
+    ! left - the new table is not in the handle and its name is free
+    ! (db_create_table refuses a name whose schema, data or blob file
+    ! exists, so a second create that succeeds shows none was left behind).
+    ! MADE: the catalog naming the table reached its place and only the
+    ! directory sync after it failed; the create reports success and the
+    ! table is there.  Either way the table (made by the faulted call, or by
+    ! the second create) takes a row and both tables verify after a reopen.
+    ! Each fault is run twice: carrying on in the same session, and after
+    ! close and reopen.  The new table has a TEXT column, so the blob
+    ! file's creation is swept too.
     subroutine create_table_faults()
         character(len=160) :: em
-        integer :: rs, nops, n, bad
-        logical :: later
+        integer :: rs, nops, n, bad, made, failed
+        logical :: later, there
         call fault_disarm()
         call prep_indexed()
         call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
@@ -1788,46 +1791,56 @@ contains
         call fault_disarm()
         call close_g()
         call check(rs == SQR_OK .and. nops > 0, 'create_table: the clean create does I/O')
-        bad = 0
+        bad = 0; made = 0; failed = 0
         sweep_loop: do n = 1, 2*nops
-            later = n > nops                  ! second pass: retry after a reopen
+            later = n > nops                  ! second pass: carry on after a reopen
             call prep_indexed()
             call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
             call fault_arm(merge(n - nops, n, later))
             call db_create_table(gdb, 'extra', people_cols(), rs)
             call fault_disarm()
-            if (rs == SQR_OK .or. db_table_index(gdb, 'extra') > 0) then
+            there = rs == SQR_OK
+            if (there .neqv. db_table_index(gdb, 'extra') > 0) then
                 print '(a,i0,a,i0)', '  create_table fault ', n, &
-                    ': reported success or kept the table, status ', rs
+                    ': the status and the handle disagree about the table, status ', rs
                 bad = bad + 1
+                call close_g()
+                cycle sweep_loop
             end if
             if (later) then
                 call close_g()
                 em = ''
                 call db_open(gdb, DBDIR, rs, em); gopen = rs == SQR_OK
-                if (rs /= SQR_OK .or. db_table_index(gdb, 'extra') > 0) then
+                if (rs /= SQR_OK .or. (there .neqv. db_table_index(gdb, 'extra') > 0)) then
                     print '(a,i0,a,i0,2a)', '  create_table fault ', n, &
-                        ': reopen failed or found the table, status ', rs, ' ', trim(em)
+                        ': reopen failed, or disagrees with the create, status ', rs, ' ', trim(em)
                     bad = bad + 1
                     call close_g()
                     cycle sweep_loop
                 end if
             end if
-            em = ''
-            call db_create_table(gdb, 'extra', people_cols(), rs, em)
-            if (rs /= SQR_OK) then
-                print '(a,i0,a,i0,2a)', '  create_table fault ', n, ': name not free ', rs, ' ', trim(em)
-                bad = bad + 1
-                call close_g()
-                cycle sweep_loop
+            if (there) then
+                made = made + 1
+            else
+                failed = failed + 1
+                em = ''
+                call db_create_table(gdb, 'extra', people_cols(), rs, em)
+                if (rs /= SQR_OK) then
+                    print '(a,i0,a,i0,2a)', '  create_table fault ', n, ': name not free ', rs, ' ', trim(em)
+                    bad = bad + 1
+                    call close_g()
+                    cycle sweep_loop
+                end if
             end if
             if (.not. extra_takes_a_row()) then
                 print '(a,i0,a)', '  create_table fault ', n, &
-                    ': the table made afterwards, or the one already there, is not sound'
+                    ': the new table, or the one already there, is not sound'
                 bad = bad + 1
             end if
         end do sweep_loop
-        call check(bad == 0, 'create_table: every failure leaves no trace and the name free')
+        call check(failed > 0, 'create_table: most faults fail the create')
+        call check(made == 2, 'create_table: only the sync after the catalog is in place leaves the table made')
+        call check(bad == 0, 'create_table: a failure leaves no trace and the name free; a made table is whole')
     end subroutine create_table_faults
 
     ! gdb is open and holds people (3 rows) and an empty extra.  Insert one

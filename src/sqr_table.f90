@@ -627,6 +627,7 @@ contains
         type(table_t), allocatable :: new_tables(:)
         type(table_t) :: tbl
         integer :: rs, other
+        logical :: in_place
         character(len=SQR_ERRMSG_LEN) :: em
         character(len=:), allocatable :: fault
 
@@ -720,6 +721,9 @@ contains
 
         call write_schema(db, tbl, rs)
         if (rs /= SQR_OK) then
+            ! The schema may be in place all the same (its rename done, the
+            ! directory sync after it failed): remove it, or the name is taken.
+            call discard_new_table(db, tbl)
             call report(db, rs, stat, errmsg)
             return
         end if
@@ -745,8 +749,13 @@ contains
         db%ntables = db%ntables + 1
         db%catalog_dirty = .true.
 
-        call write_catalog(db, rs)
-        if (rs /= SQR_OK) then
+        call write_catalog(db, rs, in_place)
+        ! A catalog that reached its place names the table, so the table
+        ! stays even if the directory sync after the rename failed: removing
+        ! its files then would leave a database that cannot be opened.  The
+        ! create has succeeded; catalog_dirty is still set, so the close
+        ! writes the catalog again.
+        if (rs /= SQR_OK .and. .not. in_place) then
             ! The on-disk catalog does not name the table: take it back out
             ! of memory (the slot beyond ntables is never referenced) and
             ! remove its files so no orphans remain.

@@ -88,7 +88,7 @@ module sqr
     !! Release of the library and its programs, as `sqlsh --version` prints
     !! it.  Kept level with `version` in fpm.toml (the shell tests compare
     !! the two).
-    character(len=*), parameter, public :: SQR_RELEASE = '2.0.1'
+    character(len=*), parameter, public :: SQR_RELEASE = '2.0.2'
 
     ! --- On-disk format version ---
     !! Current on-disk format version: composite index records (ncols,
@@ -680,6 +680,12 @@ module sqr
         !! refused with `SQR_DUP`.
         !! These rules apply to creation: a table already in a database opens
         !! under whatever name it has.
+        !!
+        !! A create that fails leaves nothing behind: no file of the table,
+        !! and the name free for another attempt in the same session.  Once
+        !! the catalog naming the table is in place the create has succeeded,
+        !! and reports `SQR_OK` even if the directory sync that follows
+        !! fails; the catalog is then written again by `db_close`.
         module subroutine db_create_table(db, name, cols, stat, errmsg)
             class(db_t),       intent(inout)           :: db  !! Database handle
             character(len=*), intent(in)              :: name  !! New table name
