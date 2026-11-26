@@ -174,7 +174,7 @@ module sqr
         integer, allocatable :: col_idx(:)  !! Index of each member into the owning `table%cols(:)`
         integer, allocatable :: key_off(:)  !! 1-based offset of each member's value within the key; its flag byte is the one before
         integer :: key_size = 0  !! Sum over the members of `csize` plus one flag byte (the B+-tree key length)
-        integer :: nentries = 0  !! Cached live-entry count, mirrored from `bt`
+        integer :: nentries = 0  !! Entries in the tree, mirrored from `bt`: rows deleted since the last `db_compact` are still counted
         type(btree_t) :: bt  !! On-disk B+-tree mapping the key to the `int32` row id
         logical :: unique   = .false.  !! Enforce no duplicate live keys
         class(*), pointer :: jctx => null()  !! Heap-owned `bt_jhook_ctx_t` while a txn's journal hook is installed on `bt`; freed at txn end
@@ -434,19 +434,25 @@ module sqr
     end type
 
     !! A forward (ascending) cursor over the live rows of a table in the key
-    !! order of one of its single-column indices.  Obtain it from
-    !! `db_open_cursor` (the whole index) or `db_find_range` (an inclusive
-    !! `[lo,hi]` band), then pull rows with `db_cursor_next` until it reports
-    !! exhaustion — the pull complement to the `db_scan` callback.
+    !! order of an index on one column: an index on that column alone, or
+    !! else a composite index whose leading member it is (its B+-tree order
+    !! is primarily by that member).  Obtain it from `db_open_cursor` (the
+    !! whole index) or `db_find_range` (an inclusive `[lo,hi]` band), then
+    !! pull rows with `db_cursor_next` until it reports exhaustion — the pull
+    !! complement to the `db_scan` callback.
     !!
     !! CONTRACT: the cursor rides on the table's already-open index, so there
-    !! is nothing to close; but it is invalidated by any mutating call on the
-    !! handle (`db_insert` / `db_update` / `db_delete` / `db_compact`, and the
-    !! structural `db_create_table` / `db_drop_table`, which can shift table
-    !! slots) — re-open it after mutating.  This is enforced: the cursor
-    !! snapshots `db%generation` at creation and `db_cursor_next` returns
-    !! `SQR_INVALID` (rather than reading a stale/own slot) if it has since
-    !! changed.  The component layout is exposed for `transfer`-free storage
+    !! is nothing to close; but it is invalidated by every call that bumps
+    !! `db%generation`: `db_insert`, `db_insert_many`, `db_update`,
+    !! `db_delete` (and so `db_update_by_key`, `db_delete_by_key`),
+    !! `db_compact`, `db_create_table`, `db_drop_table`, `db_add_column`,
+    !! `db_drop_column`, `db_reshape_table`, `db_drop_index`, `db_undo` and
+    !! `db_redo` — on any table of the handle, and even when the call then
+    !! fails (only a refusal before it starts, such as on a read-only handle,
+    !! leaves the cursor valid).  Re-open it after such a call.  This is
+    !! enforced: the cursor snapshots `db%generation` at creation and
+    !! `db_cursor_next` returns `SQR_INVALID` (rather than reading a stale or
+    !! foreign slot) if it has since changed.  The component layout is exposed for `transfer`-free storage
     !! only; callers should treat it as opaque.
     type, public :: db_cursor_t
         integer :: ti = 0  !! Owning table slot in `db%tables` (0 = unset)
@@ -543,9 +549,17 @@ module sqr
         !! is passed through so the callback can resolve `DT_TEXT` columns
         !! for the current row via `db_get_text(db, table, row_id, ...)` —
         !! the in-row `buf` holds only the blob descriptor, not the text.
-        !! The callback must not make structural changes to `db` (create or
-        !! drop a table) during the scan, as that would invalidate the scan
-        !! in progress; reading rows / text and mutating row data are fine.
+        !! The callback may read rows and text, set text with `db_set_text`,
+        !! and change row data with `db_insert`, `db_update` and `db_delete`
+        !! (and their `_many` and `_by_key` forms).  The scan visits the row
+        !! ids that existed when it began: a row inserted from the callback
+        !! is not visited, a row deleted before the scan reaches it is
+        !! skipped, and a row updated before the scan reaches it is seen as
+        !! updated.  The callback must not call `db_compact`,
+        !! `db_create_table`, `db_drop_table`, `db_add_column`,
+        !! `db_drop_column`, `db_reshape_table`, `db_undo` or `db_redo`:
+        !! those renumber rows, change the record layout, move table slots
+        !! or take rows away under the scan in progress.
         subroutine scan_cb(db, row_id, buf, ctx, stop)
             import :: int32, db_t
             class(db_t),      intent(inout) :: db  !! The database being scanned (for TEXT resolution)
@@ -629,13 +643,23 @@ module sqr
 
         !! Demote an open read-write handle to read-only: subsequent writes
         !! return `SQR_READONLY`, and the exclusive lock is downgraded to a
-        !! shared one so other read-only connections may attach.  The row
-        !! counters are saved first, since a read-only handle writes nothing
-        !! more, not even at `db_close`; if that fails the handle stays
-        !! read-write and the error is returned.  Refused (`SQR_INVALID`) on
-        !! a closed handle or while a transaction is live; a no-op on a
-        !! handle already read-only.  If the lock cannot be downgraded the
-        !! handle is closed and `SQR_ERR` returned: reopen it.
+        !! shared one so other read-only connections may attach.
+        !!
+        !! - A no-op on a handle already read-only.
+        !! - Refused, the handle unchanged: `SQR_INVALID` on a closed handle
+        !!   or while a transaction is open; `SQR_ERR` after a rollback that
+        !!   failed (the hot journal must survive to the next open) or with a
+        !!   wedged table.
+        !! - First the schema counters and catalog are saved and the idle
+        !!   journal removed, as at a writable `db_close`, since a read-only
+        !!   handle writes nothing more.  If that fails, the error is
+        !!   returned and the handle stays read-write with its exclusive
+        !!   lock: nothing is lost, and the call may be retried.
+        !! - Then the lock is downgraded.  That is not atomic everywhere
+        !!   (Windows releases the range and takes it again), so if it fails
+        !!   the handle may hold no lock at all: it is closed (units released,
+        !!   `db%opened` false) and `SQR_ERR` returned.  Everything was saved
+        !!   in the step before, so nothing is lost; reopen the database.
         module subroutine db_set_readonly(db, stat, errmsg)
             class(db_t), intent(inout)               :: db  !! Database handle
             integer,    intent(out),       optional :: stat  !! `SQR_OK` or an error code
@@ -1167,7 +1191,8 @@ module sqr
         end subroutine
 
         !! Update a row by natural key (resolve via the unique index,
-        !! then delegate to `db_update`).
+        !! then delegate to `db_update`).  A key with a NULL member names no
+        !! row: `SQR_NOT_FOUND`, nothing changed (see `db_get_by_key`).
         !! The handle must be declared `target` (module header).
         module subroutine db_update_by_key(db, table_name, col_names, keyrow, newrow, stat, errmsg)
             class(db_t),       intent(inout)         :: db  !! Database handle
@@ -1180,7 +1205,8 @@ module sqr
         end subroutine
 
         !! Delete a row by natural key (resolve via the unique index,
-        !! then delegate to `db_delete`).
+        !! then delegate to `db_delete`).  A key with a NULL member names no
+        !! row: `SQR_NOT_FOUND`, nothing deleted (see `db_get_by_key`).
         !! The handle must be declared `target` (module header).
         module subroutine db_delete_by_key(db, table_name, col_names, keyrow, stat, errmsg)
             class(db_t),       intent(inout)         :: db  !! Database handle
@@ -1466,6 +1492,15 @@ module sqr
         !! before it returns, so a crash leaves the gesture wholly undone or
         !! wholly in place.  A failed undo changes nothing and leaves the step
         !! on the undo history.
+        !!
+        !! One write falls outside that journalled transaction: before it
+        !! begins, the schema file of each table whose row counter the step
+        !! lowers is rewritten with the step's counters (a schema claiming
+        !! more rows than its data file holds would refuse to open).  If the
+        !! step then fails or the process ends, that schema is merely too low,
+        !! the ordinary crash-stale case that the next open repairs from the
+        !! data file.  Every other change is journalled.  An undo also
+        !! invalidates open cursors (`db_cursor_t`).
         module subroutine db_undo(db, stat, label, errmsg)
             class(db_t), intent(inout) :: db  !! Database handle
             integer,    intent(out), optional :: stat  !! `SQR_OK`, `SQR_NO_UNDO`, ...
@@ -1474,8 +1509,9 @@ module sqr
         end subroutine
 
         !! Redo the most recently undone gesture: re-apply it and move the step
-        !! back onto the undo history.  Mirror of `db_undo` in every respect;
-        !! `SQR_NO_UNDO` when the redo history is empty.
+        !! back onto the undo history.  Mirror of `db_undo` in every respect
+        !! (refused inside a transaction, the same schema write outside the
+        !! journal); `SQR_NO_UNDO` when the redo history is empty.
         module subroutine db_redo(db, stat, label, errmsg)
             class(db_t), intent(inout) :: db  !! Database handle
             integer,    intent(out), optional :: stat  !! `SQR_OK`, `SQR_NO_UNDO`, ...
@@ -1540,10 +1576,14 @@ module sqr
             character(len=*), intent(inout), optional :: errmsg  !! Failure detail
         end subroutine
 
-        !! Begin a transaction.  Clears the in-memory undo set and marks the
-        !! journal header invalid (reusing the file).  Lazily creates and
-        !! pre-sizes `<db>/_journal.dat` on the first transaction of a
-        !! session.  Fails `SQR_READONLY` on a read-only handle.
+        !! Begin a transaction.  Writes nothing to the journal: it starts an
+        !! empty in-memory undo set, flushes the buffered base-file writes
+        !! (the undo records read extents and bytes from disk) and snapshots
+        !! the row counters.  The journal file is created, and pre-sized, by
+        !! the session's first `txn_arm`.  Fails `SQR_READONLY` on a
+        !! read-only handle, and `SQR_ERR` after a rollback that failed
+        !! (until a reopen has replayed the hot journal) or with a wedged
+        !! table.
         !! Also installs the rollback journal hook on every live index tree, so
         !! their B+-tree page writes capture undo records.  `db` is `target` so
         !! each hook context can hold a lasting pointer back to the handle — the
@@ -1598,20 +1638,27 @@ module sqr
             class(db_t), intent(inout) :: db  !! Database handle
         end subroutine
 
-        !! Arm the journal (make it hot): serialise the undo set to the file,
-        !! write a valid header with count + checksum, and `fsync`.  Must be
-        !! called after all `jrnl_log_*` and before any base-file write, so a
-        !! crash between here and commit is recoverable.  Refuses with
-        !! `SQR_FULL`, writing nothing, when the transaction's undo data would
-        !! pass `SQR_JRNL_MAX_PAYLOAD`.
+        !! Arm the journal (make it hot): append the undo records not yet on
+        !! disk, `fsync`, then write a valid header with count + checksum and
+        !! `fsync` again.  The session's first arm creates and pre-sizes
+        !! `<db>/_journal.dat`.  Each `jrnl_log_*` arms by itself once it has
+        !! captured something, so its pre-image is durable before the caller's
+        !! base-file write; a caller calls `txn_arm` only after staging
+        !! records some other way.  Refuses with `SQR_FULL`, writing nothing,
+        !! when the transaction's undo data would pass
+        !! `SQR_JRNL_MAX_PAYLOAD`.
         module subroutine txn_arm(db, stat)
             class(db_t), intent(inout)        :: db  !! Database handle (transaction active)
             integer,    intent(out), optional :: stat  !! `SQR_OK` or an error code
         end subroutine
 
-        !! Commit: the durable commit point.  Zeroes the journal header and
-        !! `fsync`s it, so recovery sees nothing to do.  The caller must have
-        !! already `fsync`ed its base-file writes.
+        !! Commit: the durable commit point.  If the journal was armed, first
+        !! flushes and `fsync`s every base file the transaction touched
+        !! (data, blob and index trees), then voids the journal header and
+        !! `fsync`s it, so recovery sees nothing to do; the caller syncs
+        !! nothing itself.  If either step fails, the transaction is rolled
+        !! back and the error returned.  A transaction that never armed wrote
+        !! nothing, and commits without touching the disk.
         module subroutine txn_commit(db, stat)
             class(db_t), intent(inout)        :: db  !! Database handle (transaction active)
             integer,    intent(out), optional :: stat  !! `SQR_OK` or an error code

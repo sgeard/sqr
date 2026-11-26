@@ -11,6 +11,14 @@ program utest_sqr
         type(column_t) :: age_col
     end type
 
+    type :: scan_mut_ctx_t
+        integer :: count = 0
+        integer :: sum   = 0
+        integer :: bad   = 0
+        integer :: record_size = 0
+        type(column_t) :: cols(2)
+    end type
+
     type :: scan_text_ctx_t
         integer :: count = 0
         character(len=:), allocatable :: joined
@@ -80,6 +88,7 @@ program utest_sqr
     call test_engine_errmsg()
     call test_wide_table()
     call test_scan_empty()
+    call test_scan_mutation()
     call test_name_boundary()
     call test_index_reopen_after_removes()
     call test_idx_live_direct()
@@ -6159,6 +6168,77 @@ contains
         call check(rs == SQR_OK .and. ctx%count == 0, 'scan: zero-row table -> OK, no callbacks')
         call db_close(db)
         ios = c_rmtree(SDIR)
+    end subroutine
+
+    ! scan_cb's contract (LOWS G6): the callback may insert, update and
+    ! delete.  The scan visits the row ids that existed when it began: a row
+    ! updated ahead of it is seen as updated, one deleted ahead of it is
+    ! skipped, one inserted is not visited.  An index is kept through it.
+    subroutine test_scan_mutation()
+        character(len=*), parameter :: SDIR = 'utest_sqr_scanmut_db'
+        type(db_t), target :: db
+        type(column_t) :: c(2)
+        type(scan_mut_ctx_t) :: ctx
+        character(len=:), allocatable :: buf
+        integer :: rs, ios, ti, k, st
+        integer(int32) :: rid
+        character(len=128) :: emsg
+        ios = c_rmtree(SDIR)
+        c(1)%name = 'id' ; c(1)%dtype = DT_INT; c(1)%csize = 4
+        c(2)%name = 'age'; c(2)%dtype = DT_INT; c(2)%csize = 4
+        call db_open(db, SDIR, rs, emsg)
+        call db_create_table(db, 'p', c, rs, emsg)
+        call db_create_index(db, 'p', 'age', rs)
+        ti = db_table_index(db, 'p')
+        ctx%cols = db%tables(ti)%cols(1:2)
+        ctx%record_size = db%tables(ti)%record_size
+        call row_alloc(buf, ctx%record_size)
+        fill: do k = 1, 4
+            call row_set_int(buf, ctx%cols(1), int(k, int32))
+            call row_set_int(buf, ctx%cols(2), int(10 * k, int32))
+            call db_insert(db, 'p', buf, rid, rs)
+        end do fill
+        call db_scan(db, 'p', scan_and_mutate, ctx, rs)
+        call check(rs == SQR_OK .and. ctx%bad == 0, 'scan mutation: every change from the callback succeeded')
+        call check(ctx%count == 3 .and. ctx%sum == 10 + 20 + 33, &
+                   'scan mutation: updated row seen updated, deleted row skipped, inserted row not visited')
+        emsg = ''
+        call db_verify(db, 'p', st, emsg)
+        call check(st == SQR_OK .and. db_row_count(db, 'p') == 4, 'scan mutation: table and index verify, 4 rows')
+        call db_find_by_int(db, 'p', 'age', 50_int32, rid, rs)
+        call check(rs == SQR_OK .and. rid == 5, 'scan mutation: the inserted row is found by its index')
+        call db_close(db)
+        ios = c_rmtree(SDIR)
+    end subroutine
+
+    ! At row 1: update row 3 (age 33), delete row 4, insert a row (age 50).
+    subroutine scan_and_mutate(scan_db, rid, buf, ctx, stop)
+        class(db_t),      intent(inout) :: scan_db
+        integer(int32),   intent(in)    :: rid
+        character(len=*), intent(in)    :: buf
+        class(*),         intent(inout) :: ctx
+        logical,          intent(out)   :: stop
+        character(len=:), allocatable :: nb
+        integer(int32) :: newid
+        integer :: rs
+        stop = .false.
+        select type (ctx)
+        type is (scan_mut_ctx_t)
+            ctx%count = ctx%count + 1
+            ctx%sum   = ctx%sum + row_get_int(buf, ctx%cols(2))
+            if (rid /= 1) return
+            call row_alloc(nb, ctx%record_size)
+            call row_set_int(nb, ctx%cols(1), 3_int32)
+            call row_set_int(nb, ctx%cols(2), 33_int32)
+            call db_update(scan_db, 'p', 3_int32, nb, rs)
+            if (rs /= SQR_OK) ctx%bad = ctx%bad + 1
+            call db_delete(scan_db, 'p', 4_int32, rs)
+            if (rs /= SQR_OK) ctx%bad = ctx%bad + 1
+            call row_set_int(nb, ctx%cols(1), 5_int32)
+            call row_set_int(nb, ctx%cols(2), 50_int32)
+            call db_insert(scan_db, 'p', nb, newid, rs)
+            if (rs /= SQR_OK .or. newid /= 5) ctx%bad = ctx%bad + 1
+        end select
     end subroutine
 
     ! Review §5.5: SQR_NAME_LEN boundary — a 32-char table name works and
