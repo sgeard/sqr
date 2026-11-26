@@ -209,7 +209,8 @@ Every `db_*` procedure also has a type-bound equivalent on `db_t`
 
 ## The `sqrsh` shell
 
-`sqrsh` is a small state-graph REPL over the engine. The command set:
+`sqrsh` is a small state-graph REPL over the engine; [`SQRSH-REFERENCE.md`](SQRSH-REFERENCE.md)
+is its definition. The command set:
 
 ```
 root:    open <dir>   close   readonly   tables   desc <table>
@@ -745,6 +746,9 @@ Honesty requires the debit column too:
 ---
 
 ## Documentation
+
+[`SQRSH-REFERENCE.md`](SQRSH-REFERENCE.md) defines the `sqrsh` shell in the same way: states,
+commands, arguments, output, messages and open points.
 
 [`SQL-REFERENCE.md`](SQL-REFERENCE.md) defines the SQL subset: lexical rules, types, every
 statement, results, error messages, limits, a grammar, and the points still
