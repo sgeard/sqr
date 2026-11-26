@@ -52,6 +52,7 @@ program utest_sql
     call test_bare_semicolon()
     call test_errmsg_content()
     call test_render()
+    call test_render_display()
     call test_functional_example()
     call test_strip_bom()
     call test_encodings()
@@ -1946,7 +1947,7 @@ contains
         call check(index(lines(1), 'id') > 0 .and. index(lines(1), 'name') > 0, &
                    'render: header names the columns')
         call check(index(lines(2), '--') > 0, 'render: rule under the header')
-        call check(index(lines(3), '1.50000000E+00') > 0, 'render: real in es15.8')
+        call check(index(lines(3), '1.50000000E+00') > 0, 'render: real as d.ddddddddE+dd')
         call check(index(lines(4), 'NULL') > 0, 'render: NULL cell rendered as NULL')
         call check(index(lines(5), '(2 row(s))') > 0, 'render: row-count trailer')
         call check(index(lines(6), '1 row(s) affected') > 0, 'render: DML count line')
@@ -1954,6 +1955,63 @@ contains
         call check(index(lines(8), '(no columns)') > 0, 'render: zero-column grid')
         call db_close(db)
     end subroutine
+
+    ! R15, R16, R18: a real always shows its E and zero is unsigned; columns
+    ! are padded by characters, so a column after a non-ASCII value starts at
+    ! the same character on every line; no line ends in a blank.
+    subroutine test_render_display()
+        type(db_t), target :: db
+        type(sql_result_t) :: res
+        integer :: rs, u, ios, n, nl, k, at(4)
+        character(len=512) :: buf
+        logical :: no_trailing
+        call fresh_db(db)
+        call run(db, "CREATE TABLE t (id INTEGER, name CHAR(8), v REAL)", res, rs)
+        call run(db, "INSERT INTO t VALUES (1, 'é', -0.0), (2, 'ab', 1e-300)", res, rs)
+        call run(db, "SELECT name, v FROM t ORDER BY id", res, rs)
+        call check(rs == SQR_OK .and. res%nrows == 2, 'display: query ran')
+        if (rs /= SQR_OK .or. res%nrows /= 2) then
+            call db_close(db)
+            return
+        end if
+        call check(cell(res,1,2) == '0.00000000E+00', 'display: -0.0 shown unsigned')
+        call check(cell(res,2,2) == '1.00000000E-300', 'display: three-digit exponent keeps its E')
+
+        open(newunit=u, status='scratch', action='readwrite', form='formatted')
+        call sql_render(res, u)
+        rewind(u)
+        nl = 0
+        no_trailing = .true.
+        at = -1
+        lines: do
+            read(u, '(a)', advance='no', size=n, iostat=ios) buf
+            if (ios /= 0 .and. .not. is_iostat_eor(ios)) exit lines
+            nl = nl + 1
+            if (n > 0) then
+                if (buf(n:n) == ' ') no_trailing = .false.
+            end if
+            ! the first byte of the second column: after the first run of "  "
+            ! that follows the first column's text
+            k = index(buf(1:n), '  ')
+            if (nl <= size(at) .and. k > 0) then
+                k = k + verify(buf(k:n), ' ') - 1
+                at(nl) = nchars(buf(1:k-1))
+            end if
+        end do lines
+        close(u)
+        call check(nl == 5, 'display: header, rule, two rows, trailer')
+        call check(no_trailing, 'display: no line ends in a blank')
+        call check(all(at == at(1)) .and. at(1) > 0, &
+                   'display: second column starts at the same character on every line')
+        call db_close(db)
+    end subroutine
+
+    ! The characters in UTF-8 text: its bytes that are not continuation bytes.
+    pure integer function nchars(s)
+        character(len=*), intent(in) :: s
+        integer :: j
+        nchars = count([(iand(iachar(s(j:j)), 192) /= 128, j = 1, len(s))])
+    end function
 
     ! Review §3: a bare ';' is an empty statement, not a parse error.
     subroutine test_bare_semicolon()

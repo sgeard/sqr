@@ -110,6 +110,26 @@ contains
         val = transfer(buf(col%offset : col%offset + R64_BYTES - 1), val)
     end function
 
+    ! es16.8e3 always writes the E; a leading 0 of the three exponent digits
+    ! is then removed, so the values that fit two digits read as es15.8 does.
+    ! Zero is written as a literal: one compiler shows -0.0 with its sign.
+    pure module function real_text(v) result(s)
+        real(real64), intent(in)      :: v
+        character(len=:), allocatable :: s
+        character(len=NUM_TEXT_LEN) :: buf
+        integer :: e
+        if (v == 0.0_real64) then
+            s = '0.00000000E+00'
+            return
+        end if
+        write(buf, '(es16.8e3)') v
+        s = trim(adjustl(buf))
+        e = index(s, 'E')
+        if (e > 0 .and. len(s) >= e + 2) then
+            if (s(e+2:e+2) == '0') s = s(1:e+1) // s(e+3:)
+        end if
+    end function
+
     pure module subroutine row_set_char(buf, col, val)
         character(len=*), intent(inout) :: buf
         type(column_t),   intent(in)    :: col

@@ -206,7 +206,7 @@ call db_redo(db, st, label)    ! ...and back
 - **Row buffers:** `row_alloc`, `row_clear`, `row_status`, `row_set_status`,
   `row_set_null`, `row_clear_null`, `row_is_null`, `row_set_int` /
   `row_get_int`, `row_set_real` / `row_get_real`, `row_set_char` /
-  `row_get_char`
+  `row_get_char`; `real_text` gives the text form every shell shows a real in
 
 Every `db_*` procedure also has a type-bound equivalent on `db_t`
 (`db%open`, `db%insert`, `db%create_index`, …).
@@ -253,6 +253,8 @@ The directory is created if it does not exist, so an argument that starts
 with `-` is always taken as an option and an unknown one is refused (exit
 status 2) rather than opened; `sqrsh` and `sqrd` refuse one likewise. A
 directory whose name really starts with `-` is given as `./-name`.
+`sqlsh` ends with status 1 when any statement or meta-command failed, and 0
+when none did.
 
 Meta-commands: `.open <dir>`, `.close`, `.tables`, `.schema [table]`,
 `.pack <dir> <file>`, `.unpack <file> <dir>`, `.help`, `.quit`. Everything else is SQL:

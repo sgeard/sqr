@@ -9,8 +9,9 @@
 # natural body of black-box tests to point at sqr's SQL subset (`sqlsh`).
 #
 # It implements the slice of the format that sqr's subset can actually exercise
-# (no JOIN / aggregate / subquery / LIKE / IN), and parses sqlsh's human-readable
-# table output rather than a machine mode (see LIMITATIONS in sqlt/README.md).
+# (single-table SELECT with WHERE, LIKE, IN, BETWEEN, ORDER BY, LIMIT and the
+# aggregates; no JOIN or subquery), and parses sqlsh's human-readable table
+# output rather than a machine mode (see LIMITATIONS in sqlt/README.md).
 # It is pure Tcl + the system `md5sum`; no tcllib needed.
 #
 # Usage:   tclsh run_sqlt.tcl <sqlsh-binary> <file.test> [more.test ...]
@@ -22,7 +23,9 @@
 # that persists on disk for the whole file (sqr auto-commits + fsyncs per
 # mutator, so a later process sees an earlier one's writes). That makes output
 # attribution trivial: an invocation's stdout is exactly that statement's result
-# and its stderr ("error: ...") flags failure — sqlsh always exits 0.
+# and its stderr ("error: ...") flags failure.  sqlsh exits 0, or 1 when the
+# statement failed; any other status, or a signal, means sqlsh itself ended
+# abnormally, and the record fails whatever it expected.
 
 set ::PASS 0
 set ::FAIL 0
@@ -34,25 +37,44 @@ set ::failures {}        ;# list of human-readable failure reports
 # --------------------------------------------------------------------------
 
 # Run one SQL statement against the file's database dir. Returns a dict with
-#   out    : stdout as a list of lines (query result table / messages)
-#   failed : 1 if sqlsh reported an "error: ..." on stderr, else 0
-#   err    : the raw stderr text
+#   out     : stdout as a list of lines (query result table / messages)
+#   failed  : 1 if sqlsh reported an "error: ..." on stderr, else 0
+#   crashed : 1 if sqlsh ended abnormally - a status other than 0 or 1, or
+#             killed by a signal - else 0
+#   err     : the raw stderr text (for a crash, with the reason appended)
 proc run_sqlsh {sql} {
     set errfile [file join [file dirname $::dbdir] sqlt_err_[pid].txt]
+    # stderr goes to a file, so exec raises only for a non-zero status or a
+    # signal (or a program that cannot be run at all).
     set rc [catch {
         exec $::sqlsh $::dbdir << "$sql\n" 2> $errfile
-    } out]
+    } out opts]
     set err ""
     if {[file exists $errfile]} {
         set fh [open $errfile r]; set err [read $fh]; close $fh
         file delete -force $errfile
     }
-    # exec raises on non-zero exit; sqlsh exits 0 even on SQL errors, so a
-    # raised rc is a real crash — surface it as a failure with the message.
-    if {$rc && $err eq ""} { set err $out }
+    set crashed 0
+    if {$rc} {
+        set ec [dict get $opts -errorcode]
+        if {[lindex $ec 0] eq "CHILDSTATUS" && [lindex $ec 2] in {0 1}} {
+            # status 1: a statement failed; exec appends its own line to out
+            regsub {\n?child process exited abnormally$} $out {} out
+        } else {
+            set crashed 1
+            append err "\n$out ($ec)"
+        }
+    }
     set failed [regexp -line {^error:} $err]
     set lines [split $out "\n"]
-    return [dict create out $lines failed $failed err $err]
+    return [dict create out $lines failed $failed crashed $crashed err $err]
+}
+
+# A crashed run fails its record whatever the record expected.
+proc crashed {loc sql r} {
+    if {![dict get $r crashed]} { return 0 }
+    fail $loc $sql "sqlsh ended abnormally: [string trim [dict get $r err]]"
+    return 1
 }
 
 # --------------------------------------------------------------------------
@@ -111,8 +133,8 @@ proc parse_table {lines} {
 # --------------------------------------------------------------------------
 # Per the spec, each value is rendered to text by its declared column type:
 #   I  integer   R  real (3 d.p.)   T  text (empty -> "(empty)")
-# NULL is the literal "NULL" in every type. sqlsh prints reals as es15.8, so the
-# R path re-parses and reformats to the canonical %.3f.
+# NULL is the literal "NULL" in every type. sqlsh prints reals as
+# d.ddddddddE+dd, so the R path re-parses and reformats to the canonical %.3f.
 proc fmt_cell {val type} {
     if {$val eq "NULL"} { return "NULL" }
     switch -- $type {
@@ -172,6 +194,7 @@ proc fail {loc sql msg} {
 
 proc run_statement {loc sql expect} {
     set r [run_sqlsh $sql]
+    if {[crashed $loc $sql $r]} return
     set failed [dict get $r failed]
     if {$expect eq "ok" && $failed} {
         fail $loc $sql "expected success, got error: [string trim [dict get $r err]]"
@@ -184,6 +207,7 @@ proc run_statement {loc sql expect} {
 
 proc run_query {loc sql types sortmode expected} {
     set r [run_sqlsh $sql]
+    if {[crashed $loc $sql $r]} return
     if {[dict get $r failed]} {
         fail $loc $sql "query failed: [string trim [dict get $r err]]"
         return

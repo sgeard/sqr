@@ -31,8 +31,7 @@ contains
             write(buf, '(i0)') node%data
             s = trim(buf)
         type is (dlist_node_real)
-            write(buf, '(es15.8)') node%data
-            s = trim(adjustl(buf))
+            s = real_text(node%data)
         type is (dlist_node_char)
             s = node%data
         class default
@@ -1144,7 +1143,7 @@ contains
                 case (DT_INT)
                     write(*,'(2x,i16)', advance='no') row_get_int(buf, c)
                 case (DT_REAL)
-                    write(*,'(2x,es16.8)', advance='no') row_get_real(buf, c)
+                    write(*,'(2x,a16)', advance='no') real_text(row_get_real(buf, c))
                 case (DT_CHAR)
                     write(*,'(2x,a16)', advance='no') trim(row_get_char(buf, c))
                 case (DT_TEXT)

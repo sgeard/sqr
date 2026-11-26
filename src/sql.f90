@@ -403,8 +403,10 @@ module sql
         end subroutine
 
         !! Render a result to a formatted unit: an aligned table for a SELECT,
-        !! a `"N row(s)"` line for DML, or the message for DDL.  Used by the
-        !! REPL; tests inspect `sql_result_t` directly instead.
+        !! a `"N row(s)"` line for DML, or the message for DDL.  Columns are
+        !! padded by characters (UTF-8), and the last one is not padded, so
+        !! no line ends in blanks.  Reals are in the `real_text` form.  Used
+        !! by the REPL; tests inspect `sql_result_t` directly instead.
         module subroutine sql_render(res, unit)
             type(sql_result_t), intent(in) :: res   !! Result to print
             integer,            intent(in) :: unit  !! Output unit

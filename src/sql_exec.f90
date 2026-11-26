@@ -1473,13 +1473,11 @@ contains
         real(real64),     intent(in)  :: v
         logical,          intent(in)  :: binary
         type(sql_cell_t), intent(out) :: cell
-        character(len=NUM_TEXT_LEN) :: nb
         character(len=R64_BYTES) :: b8
         if (binary) then
             cell%text = transfer(v, b8)
         else
-            write(nb, '(es15.8)') v
-            cell%text = trim(adjustl(nb))
+            cell%text = real_text(v)
         end if
     end subroutine
 
@@ -1704,44 +1702,53 @@ contains
             end if
             allocate(w(res%ncols))
             do j = 1, res%ncols
-                w(j) = len_trim(res%colnames(j))
+                w(j) = char_count(trim(res%colnames(j)))
                 do i = 1, res%nrows
-                    w(j) = max(w(j), len(res%cells(i, j)%text))
+                    w(j) = max(w(j), char_count(res%cells(i, j)%text))
                 end do
             end do
             ! header
             do j = 1, res%ncols
                 call put_field(unit, trim(res%colnames(j)), w(j), j == res%ncols)
             end do
-            write(unit, *)
+            write(unit, '(a)')
             do j = 1, res%ncols
                 call put_field(unit, repeat('-', w(j)), w(j), j == res%ncols)
             end do
-            write(unit, *)
+            write(unit, '(a)')
             do i = 1, res%nrows
                 do j = 1, res%ncols
                     call put_field(unit, res%cells(i, j)%text, w(j), j == res%ncols)
                 end do
-                write(unit, *)
+                write(unit, '(a)')
             end do
             write(unit, '(a,i0,a)') '(', res%nrows, ' row(s))'
         end select
     end subroutine
 
+    ! One cell of the row display.  Widths are in characters (char_count),
+    ! and the last column is written unpadded, so no line ends in blanks.
     subroutine put_field(unit, text, width, last)
         integer,          intent(in) :: unit
         character(len=*), intent(in) :: text
         integer,          intent(in) :: width
         logical,          intent(in) :: last
-        character(len=:), allocatable :: pad
-        integer :: gap
-        gap = max(0, width - len(text))
-        pad = repeat(' ', gap)
         if (last) then
-            write(unit, '(a)', advance='no') text // pad
+            write(unit, '(a)', advance='no') text
         else
-            write(unit, '(a)', advance='no') text // pad // '  '
+            write(unit, '(a)', advance='no') &
+                text // repeat(' ', max(0, width - char_count(text))) // '  '
         end if
     end subroutine
+
+    ! The number of characters in UTF-8 text: its bytes that are not
+    ! continuation bytes (10xxxxxx).  Characters, not display cells: a wide
+    ! or combining character still counts one.
+    pure function char_count(s) result(n)
+        character(len=*), intent(in) :: s
+        integer :: n
+        integer :: k
+        n = count([(iand(iachar(s(k:k)), int(z'C0')) /= int(z'80'), k = 1, len(s))])
+    end function
 
 end submodule sql_executor

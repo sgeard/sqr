@@ -307,7 +307,9 @@ then one line per row:
 - Each further column is preceded by two blanks and, except a text column,
   right-aligned in 16 columns:
   - an int in plain decimal;
-  - a real as `d.ddddddddE±dd`, eight decimals;
+  - a real as `d.ddddddddE±dd`, eight decimals, as `sqlsh` shows it: a
+    three-digit exponent is written in full (`1.00000000E-300`) and zero
+    is `0.00000000E+00`, without a sign;
   - a char value without its trailing blanks;
   - NULL as the four letters `NULL`.
 - A text value is printed in full, not aligned and not padded.
@@ -362,7 +364,6 @@ writing this document.
 | — | The word `null` is NULL even when quoted, so the text cannot be stored. | Quoted `"null"` should be text. |
 | — | A backslash before a double quote inside a quoted text is kept, and the quote does not end the text: `"x \"q\" y"` is stored as `x \"q\" y`. cmdgraph documents no escape. | Decide in cmdgraph. |
 | — | A real with an empty exponent (`1e`) is 1.0 in the ifx build and is not a number in the gfortran build. | Refuse it. |
-| — | A real with a three-digit exponent is shown without its `E` (`1.00000000-300`). | Use a form that always has it. |
 | — | `delete` leaves the row's entries in the indexes; lookups skip them and `compact` removes them. `desc` counts them, so `live=3` can stand beside `(4 entries)`. (`update` does remove the old entries.) | By design in the engine; should `desc` show the live count, or say what it counts? |
 | — | A failed `done` cannot be repaired, only cancelled. | A command to remove a pending column? |
 | — | `create` allows 64 columns where SQL allows 256. | One limit. |

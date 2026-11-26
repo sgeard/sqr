@@ -164,7 +164,7 @@ namespace eval shelltest {
         set r [run [utf8 $sql]]
         set err [dict get $r err]
         set out [dict get $r out]
-        check {[dict get $r status] == 0}                     "txn fail: exit status 0"
+        check {[dict get $r status] == 1}                     "txn fail: exit status 1 (a statement failed)"
         check {[regexp {ROLLBACK is required} $err]}          "txn fail: the next write is refused, with the remedy"
         check {[regexp {not committed.*rolled back} $err]}    "txn fail: COMMIT reports the rollback"
         check {[regexp -line {^1 *$} $out]}                   "txn fail: no row of the failed statement was kept"
@@ -217,7 +217,7 @@ namespace eval shelltest {
     proc t_reserved_name {} {
         set db [fresh_db reserved]
         set r [run [utf8 ".open $db\nCREATE TABLE t(a INTEGER)\nINSERT INTO t VALUES(1)\nCREATE TABLE _journal(a INTEGER)\nCREATE TABLE _catalog(a INTEGER)\n.quit\n"]]
-        check {[dict get $r status] == 0}                                   "reserved name: exit status 0"
+        check {[dict get $r status] == 1}                                   "reserved name: exit status 1 (a statement failed)"
         check {[regexp {reserved table name: "_journal"} [dict get $r err]]} "reserved name: _journal refused, by name"
         check {[regexp {reserved table name: "_catalog"} [dict get $r err]]} "reserved name: _catalog refused, by name"
         set r [run [utf8 ".open $db\nSELECT a FROM t\n.tables\n.quit\n"]]
@@ -236,7 +236,7 @@ namespace eval shelltest {
         set r [run [utf8 $sql]]
         set err [dict get $r err]
         set out [dict get $r out]
-        check {[dict get $r status] == 0}                                 "table names: exit status 0"
+        check {[dict get $r status] == 1}                                 "table names: exit status 1 (a statement failed)"
         check {[regexp {invalid table name: "a:b"} $err]}                 "table names: a colon is refused, by name"
         check {[regexp {differs only in case from "Notes"} $err]}         "table names: a case variant is refused, naming the other"
         check {[regexp -line {^my notes, v1\.2  \(0 rows} $out]}           "table names: space, comma and dot are accepted in a quoted name"
@@ -324,6 +324,73 @@ namespace eval shelltest {
             "engine reason: a unique violation is named"
         check {[regexp -line {^error: duplicate column: a$} [dict get $r err]]} \
             "engine reason: a column twice in SET is refused"
+    }
+
+    # R18: columns are padded by characters, so the column after one holding
+    # a non-ASCII value starts at the same character on every line, and the
+    # last column is not padded, so no line ends in a blank.
+    proc t_display {} {
+        set db [fresh_db display]
+        set sql ".open $db\nCREATE TABLE t(id INTEGER, name CHAR(8), v REAL)\n"
+        append sql "INSERT INTO t VALUES(1,'é',1.5),(2,'àé',-0.0),(3,'abc',1e-300)\n"
+        append sql "SELECT name, v FROM t ORDER BY id\n.quit\n"
+        set r [run [utf8 $sql]]
+        set lines [lrange [split [dict get $r out] "\n"] 2 6]   ;# header, rule, 3 rows
+        set starts {}
+        set trailing 0
+        foreach ln $lines {
+            if {[regexp {[ \t]$} $ln]} { set trailing 1 }
+            regexp -indices {^\S+ +} $ln m
+            lappend starts [expr {[lindex $m 1] + 1}]
+        }
+        check {[llength $lines] == 5 && [llength [lsort -unique $starts]] == 1} \
+            "display: the column after non-ASCII values starts at one character position"
+        check {!$trailing && ![regexp -line {[ \t]$} [dict get $r out]]} \
+            "display: no output line ends in a blank"
+        check {[regexp -line {^àé +0\.00000000E\+00$} [dict get $r out]]} \
+            "display: -0.0 is shown unsigned"
+        check {[regexp -line {^abc +1\.00000000E-300$} [dict get $r out]]} \
+            "display: a three-digit exponent keeps its E"
+    }
+
+    # R17: .schema prints statements that sqlsh reads back to the same schema.
+    proc t_schema {} {
+        set db1 [fresh_db schema1]
+        set db2 [fresh_db schema2]
+        set sql ".open $db1\nCREATE TABLE t(id INTEGER, \"na\"\"me\" CHAR(8), v REAL, b TEXT)\n"
+        append sql "CREATE UNIQUE INDEX ON t (id)\nCREATE INDEX ON t (\"na\"\"me\", id)\n"
+        append sql "CREATE INDEX ON t (v)\nDROP INDEX ON t (v)\n"
+        append sql "CREATE TABLE \"x y\"(a INT)\n.schema\n.quit\n"
+        set r1 [run [utf8 $sql]]
+        set schema [dict get $r1 out]
+        set i [string first "CREATE TABLE" $schema]
+        set schema [string range $schema $i end]
+        check {[regexp -line {^CREATE TABLE "t" \("id" INTEGER, "na""me" CHAR\(8\), "v" REAL, "b" TEXT\);$} $schema]} \
+            "schema: CREATE TABLE with quoted names and types"
+        check {[regexp -line {^CREATE UNIQUE INDEX ON "t" \("id"\);$} $schema]
+               && [regexp -line {^CREATE INDEX ON "t" \("na""me", "id"\);$} $schema]
+               && ![regexp {"v"\);} $schema]} \
+            "schema: live indexes in slot order, dropped one left out"
+        set r2 [run [utf8 ".open $db2\n$schema.schema\n.quit\n"]]
+        set again [dict get $r2 out]
+        set again [string range $again [string last "CREATE TABLE \"t\"" $again] end]
+        set first [string range $schema [string first "CREATE TABLE \"t\"" $schema] end]
+        check {[dict get $r2 status] == 0 && $again eq $first} \
+            "schema: output read back gives the same schema"
+    }
+
+    # R13: sqlsh ends with status 1 when a statement or command failed.
+    proc t_exit_status {} {
+        set db [fresh_db status]
+        set r [run [utf8 ".open $db\nCREATE TABLE t(a INTEGER)\nSELECT a FROM t\n.quit\n"]]
+        check {[dict get $r status] == 0} "status: a clean script ends with 0"
+        set r [run [utf8 ".open $db\nSELECT nope FROM t\nSELECT a FROM t\n"]]
+        check {[dict get $r status] == 1 && [regexp -line {^\(0 row\(s\)\)$} [dict get $r out]]} \
+            "status: a failing statement ends with 1, and the script runs on"
+        set r [run [utf8 ".open $db\n.nonsense\n.quit\n"]]
+        check {[dict get $r status] == 1} "status: a failing meta-command ends with 1"
+        set r [run [utf8 ".tables\n"]]
+        check {[dict get $r status] == 1} "status: no database open ends with 1"
     }
 
     proc t_utf8_bom {} {
@@ -501,6 +568,9 @@ namespace eval shelltest {
             t_reserved_name
             t_table_names
             t_sql_reasons
+            t_display
+            t_schema
+            t_exit_status
             t_like_long
             t_add_text_column
             t_readonly_counters

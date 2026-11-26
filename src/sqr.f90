@@ -534,7 +534,7 @@ module sqr
     public :: row_status, row_set_status
     public :: row_set_null, row_clear_null, row_is_null
     public :: row_set_int, row_get_int
-    public :: row_set_real, row_get_real
+    public :: row_set_real, row_get_real, real_text
     public :: row_set_char, row_get_char
 
     abstract interface
@@ -1402,6 +1402,17 @@ module sqr
             character(len=*), intent(in) :: buf  !! Row buffer
             type(column_t),   intent(in) :: col  !! Source `DT_REAL` column
             real(real64) :: val  !! Decoded value
+        end function
+
+        !! The one text form of a real, used wherever a real is shown (the SQL
+        !! result cells, `sqlsh`, `sqrsh`): nine significant digits as
+        !! `d.ddddddddE+dd`, with a three-digit exponent when two will not do
+        !! (`1.00000000E-300`), so the `E` is always there.  Zero of either
+        !! sign is `0.00000000E+00`; NaN and the infinities are `NaN`,
+        !! `Infinity` and `-Infinity`.  Both compilers give the same text.
+        pure module function real_text(v) result(s)
+            real(real64), intent(in)      :: v  !! Value to show
+            character(len=:), allocatable :: s  !! Its text, no blanks
         end function
 
         !! Store a string into a `DT_CHAR` column slot (NUL-padded,

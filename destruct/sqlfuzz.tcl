@@ -17,6 +17,7 @@ proc writefile {p d} { set f [open $p wb]; puts -nonewline $f $d; close $f }
 
 set ::ncase 0
 set ::nbad 0
+set ::nrefused 0   ;# inputs refused for their encoding: status 1, not an abort
 set ::summary {}
 
 proc run_sql {name script} {
@@ -34,10 +35,13 @@ proc run_sql {name script} {
         elseif {[lindex $ec 0] eq "CHILDKILLED"} { set rc "SIG[lindex $ec 2]" } \
         else { set rc "ERR:$ec" }
     }
+    # sqlsh ends with 0, or 1 when a statement or command failed (or the
+    # input's encoding was refused, counted apart); anything else is an abort.
     set verdict ok
     if {$rc == 124} { set verdict HANG } \
     elseif {[string match "SIG*" $rc]} { set verdict "CRASH-$rc" } \
-    elseif {$rc != 0} { set verdict "ABORT-rc$rc" }
+    elseif {$rc ni {0 1}} { set verdict "ABORT-rc$rc" } \
+    elseif {$rc == 1 && [regexp {unsupported encoding \(} $out]} { incr ::nrefused }
     if {$verdict ne "ok"} {
         incr ::nbad
         puts "!! $verdict  $name"
@@ -234,5 +238,5 @@ for {set i 0} {$i < 150} {incr i} {
 }
 
 puts ""
-puts "=== sql: $::ncase cases, $::nbad failures ==="
+puts "=== sql: $::ncase cases, $::nbad failures, $::nrefused refused for their encoding ==="
 foreach s $::summary { puts "   [lindex $s 1]  [lindex $s 0]" }

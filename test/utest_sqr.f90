@@ -108,6 +108,7 @@ program utest_sqr
     call test_set_readonly_counters()
     call test_accessors()
     call test_last_error()
+    call test_real_text()
 
     call cleanup_dir()
 
@@ -6536,6 +6537,27 @@ contains
     end subroutine
 
     ! The procedural metadata surface: db_describe / db_row_count / db_in_txn.
+    ! R15, R16: one text form for a real, the same from every compiler - the
+    ! E always shown, a third exponent digit only when needed, zero unsigned.
+    subroutine test_real_text()
+        use, intrinsic :: ieee_arithmetic, only: ieee_value, ieee_quiet_nan, &
+                                                 ieee_positive_inf, ieee_negative_inf
+        print '(a)', 'real_text:'
+        call check(real_text(0.0_real64)    == '0.00000000E+00',   'real_text 0.0')
+        call check(real_text(-0.0_real64)   == '0.00000000E+00',   'real_text -0.0 unsigned')
+        call check(real_text(1.5_real64)    == '1.50000000E+00',   'real_text 1.5')
+        call check(real_text(1e-300_real64) == '1.00000000E-300',  'real_text 1e-300 keeps its E')
+        call check(real_text(-1e300_real64) == '-1.00000000E+300', 'real_text -1e300 keeps its E')
+        call check(real_text(1e99_real64)   == '1.00000000E+99',   'real_text 1e99 two digits')
+        call check(real_text(1e100_real64)  == '1.00000000E+100',  'real_text 1e100 three digits')
+        call check(real_text(1e-99_real64)  == '1.00000000E-99',   'real_text 1e-99 two digits')
+        call check(real_text(1e-100_real64) == '1.00000000E-100',  'real_text 1e-100 three digits')
+        call check(real_text(-2.5e7_real64) == '-2.50000000E+07',  'real_text -2.5e7')
+        call check(real_text(ieee_value(1.0_real64, ieee_quiet_nan))    == 'NaN',       'real_text NaN')
+        call check(real_text(ieee_value(1.0_real64, ieee_positive_inf)) == 'Infinity',  'real_text +Inf')
+        call check(real_text(ieee_value(1.0_real64, ieee_negative_inf)) == '-Infinity', 'real_text -Inf')
+    end subroutine
+
     subroutine test_accessors()
         character(len=*), parameter :: ADIR = 'utest_sqr_acc_db'
         type(db_t), target :: a

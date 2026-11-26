@@ -23,7 +23,7 @@ module sqr_consts
     !! at most 11 characters, sign included).
     integer, parameter, public :: INT_TEXT_LEN = 12
     !! Long enough for any number the shells and the SQL layer format: an
-    !! integer, or a real in the `es15.8` form they use.
+    !! integer, or a real in the `real_text` form they use.
     integer, parameter, public :: NUM_TEXT_LEN = 32
 
     ! --- Single characters ---

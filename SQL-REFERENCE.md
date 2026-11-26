@@ -537,9 +537,10 @@ the notices of meta-commands go to standard error. An error is one line,
 `error: <message>`, and the next line is then read: a script is not stopped
 by an error.
 
-**Exit status** is 0, whatever errors the statements gave (section 13, P3).
-It is 1 when the input is in an unsupported encoding and 2 for a bad command
-line.
+**Exit status** is 0 when nothing failed. It is 1 when any statement or
+meta-command failed (the script still runs to its end), or the input is in an
+unsupported encoding, and 2 for a bad command line. A terminal and a pipe give
+the same status.
 
 **Output of a statement:**
 
@@ -547,14 +548,22 @@ line.
 - a count: `<n> row(s) affected`;
 - rows: a line of labels, a line of dashes, one line per row, and a last line
   `(<n> row(s))`, where:
-  - each column is as wide, in bytes, as its longest cell or its label;
-  - cells are left-aligned and padded with blanks to that width, the last
-    column included, and columns are separated by two blanks;
+  - each column is as wide, in characters, as its longest cell or its
+    label. A character is counted as one whatever its display width, so a
+    wide (East Asian) or combining character still misaligns the columns;
+  - cells are left-aligned and padded with blanks to that width, and columns
+    are separated by two blanks. The last column is not padded, so no line
+    ends in a blank unless the value itself does; its line of dashes is
+    full width;
   - an integer is in plain decimal;
   - a real is in the form `d.ddddddddE±dd`: eight decimals, so nine
     significant digits, with a leading `-` if negative. `1.5` is
-    `1.50000000E+00`. (The stored value is exact; only the display is
-    rounded. The wire protocol carries the exact value.)
+    `1.50000000E+00`. An exponent of three digits is written in full:
+    `1.00000000E-300`. Zero is `0.00000000E+00`, without a sign, whichever
+    zero was stored. NaN and the infinities are `NaN`, `Infinity` and
+    `-Infinity`. (The stored value is exact; only the display is
+    rounded. The wire protocol's text cells use the same form; its binary
+    cells carry the exact value.)
   - a character value is shown without trailing blanks, a text value exactly;
   - `NULL` is shown as the four letters `NULL`, which cannot be told from the
     string `'NULL'`.
@@ -575,11 +584,27 @@ id  name   x
 | `.open <dir>` | close the current database and open (or create) another |
 | `.close` | close the current database; an open transaction is rolled back |
 | `.tables` | one line per table: `<name>  (<r> rows, <c> cols)` |
-| `.schema [<table>]` | the columns of one table, or of all |
+| `.schema [<table>]` | the statements that create one table, or all: see below |
 | `.pack <dir> <file>` | archive a database directory into one file |
 | `.unpack <file> <dir>` | restore such a file into a new directory |
 | `.help`, `.h` | list these |
 | `.quit`, `.exit`, `.q` | leave |
+
+`.schema` prints, for each table, a `CREATE TABLE` statement and then a
+`CREATE INDEX` or `CREATE UNIQUE INDEX` statement for each of its indexes in
+the order they were created, one statement per line, every name quoted.
+`sqlsh` reads the output back as a script:
+
+```
+CREATE TABLE "t" ("id" INTEGER, "name" CHAR(8), "x" REAL, "note" TEXT);
+CREATE UNIQUE INDEX ON "t" ("id");
+CREATE INDEX ON "t" ("name", "id");
+```
+
+A failure of a meta-command (a database that cannot be opened, `no such
+table`, `unknown command`, a usage message, a failed pack or unpack, `no
+database open`) is reported on standard error and counts as a failure for
+the exit status.
 
 ## 11. Limits
 
@@ -667,11 +692,6 @@ writing this document.
 
 | | Present behaviour | Question |
 |---|---|---|
-| P3 | `sqlsh` exits 0 after errors. | A non-zero status, perhaps under an option? |
-| — | A real with a three-digit exponent is displayed without its `E`: `1.00000000-300`. | Use a form that always has it. |
-| — | `-0.0` is displayed `0.00000000E+00` by the ifx build and `-0.00000000E+00` by the gfortran build. | Decide and make the builds agree. |
-| — | `.schema` output is not SQL: no parentheses, names unquoted. | Print a statement that could be read back. |
-| — | Columns of the row display are padded by bytes, so non-ASCII values misalign, and the last column carries trailing blanks. | Pad by characters; do not pad the last column. |
 | — | `CREATE TABLE` refuses a name differing only in case, but lookup is case-sensitive. | Intended (file systems that fold case); stated here so it is not taken for a defect. |
 
 ## 14. Notes for writing tests
@@ -681,7 +701,11 @@ writing this document.
   database. Transactions need one process.
 - Only one process may have a database open at a time.
 - Take results from standard output and errors from standard error. The exit
-  status says nothing about statements.
+  status is 1 when any statement in the run failed, so a process that runs one
+  statement tells by its status whether that statement failed; a process that
+  runs many tells only that one of them did.
+- Every line of the row display is free of trailing blanks unless a value
+  ends in one; the last column is not padded.
 - Use `ORDER BY` whenever the order of rows matters; nothing else fixes it.
 - Compare reals as numbers parsed from the display, to nine significant
   digits, not as text.

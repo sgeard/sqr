@@ -26,7 +26,9 @@ location, SQL and an expected-vs-got diff.
 
 `sqlsh` takes a database directory as its first argument, reads SQL from stdin,
 writes query results to **stdout** and errors to **stderr** (`error: ...`), and
-always exits 0. The harness runs **each record as its own `sqlsh` invocation**
+exits 0, or 1 when a statement failed. Any other status, or a signal, means
+`sqlsh` ended abnormally: that record fails whatever it expected
+(`sqlsh ended abnormally: ...`). The harness runs **each record as its own `sqlsh` invocation**
 against a single database directory that persists on disk for the whole file —
 sqr auto-commits and fsyncs per mutator, so a later process sees an earlier
 one's writes. That makes output attribution trivial: an invocation's stdout is
@@ -57,7 +59,7 @@ query <types> [nosort|rowsort|valuesort] [label]
 - **sort modes** — `nosort` (default), `rowsort` (sort whole rows), `valuesort`
   (sort individual values).
 - **value canonicalisation** (matches sqllogictest): `NULL` → `NULL`; empty text
-  → `(empty)`; reals → 3 decimal places (sqlsh renders `es15.8`, the harness
+  → `(empty)`; reals → 3 decimal places (sqlsh renders `d.ddddddddE+dd`, the harness
   reformats).
 - **directives** — `halt`, `hash-threshold N` (ignored), and `skipif <db>` /
   `onlyif <db>` conditionals (the engine name is `sqr`).

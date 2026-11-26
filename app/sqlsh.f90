@@ -12,6 +12,10 @@
 !! argument that starts with `-` is an option (`--help`, `--version`), never
 !! a directory, so a mistyped option cannot create one.  A directory whose
 !! name really does start with `-` is given as `./-name`.
+!!
+!! Exit status: 0 when nothing failed; 1 when a statement or a meta-command
+!! failed (the input is read to its end regardless), or the input is in an
+!! encoding sqr cannot read; 2 for a bad command line.
 
 program sqlsh
     use, intrinsic :: iso_fortran_env, only: output_unit, error_unit, iostat_end
@@ -23,6 +27,7 @@ program sqlsh
     type(db_t), save, target :: db
     character(len=:), allocatable :: line
     logical :: interactive, first_line
+    logical :: any_failed = .false.   ! a statement or meta-command failed: exit status 1
     character(len=*), parameter :: USAGE = 'usage: sqlsh [<db-dir>]   (or --help, --version)'
 
     interactive = is_a_tty()       ! prompt only when reading from a terminal
@@ -47,6 +52,7 @@ program sqlsh
     end do repl
 
     if (db%opened) call db_close(db)
+    call quit(merge(1, 0, any_failed))
 
 contains
 
@@ -98,9 +104,7 @@ contains
         character(len=SQR_ERRMSG_LEN) :: emsg
         emsg = ''
         call db_open(db, trim(arg), rs, emsg)
-        if (rs /= SQR_OK) then
-            write(error_unit,'(3a)') 'cannot open "', trim(arg), '": ' // trim(emsg)
-        end if
+        if (rs /= SQR_OK) call report('cannot open "' // trim(arg) // '": ' // trim(emsg))
     end subroutine
 
     subroutine banner()
@@ -166,7 +170,7 @@ contains
         emsg = ''
         call sql_run(db, text, res, rs, emsg)
         if (rs /= SQR_OK) then
-            write(error_unit,'(2a)') 'error: ', trim(emsg)
+            call report('error: ' // trim(emsg))
             return
         end if
         call sql_render(res, output_unit)
@@ -206,7 +210,7 @@ contains
         case ('.unpack')
             call meta_unpack(rest)
         case default
-            write(error_unit,'(2a)') 'unknown command: ', trim(cmd)
+            call report('unknown command: ' // trim(cmd))
         end select
     end function
 
@@ -228,14 +232,14 @@ contains
         integer :: rs
         character(len=SQR_ERRMSG_LEN) :: emsg
         if (len_trim(dir) == 0) then
-            write(error_unit,'(a)') 'usage: .open <dir>'
+            call report('usage: .open <dir>')
             return
         end if
         if (db%opened) call db_close(db)
         emsg = ''
         call db_open(db, trim(dir), rs, emsg)
         if (rs /= SQR_OK) then
-            write(error_unit,'(3a)') 'cannot open "', trim(dir), '": ' // trim(emsg)
+            call report('cannot open "' // trim(dir) // '": ' // trim(emsg))
         else if (interactive) then
             write(error_unit,'(2a)') 'opened ', trim(dir)
         end if
@@ -243,7 +247,7 @@ contains
 
     subroutine meta_close()
         if (.not. db%opened) then
-            write(error_unit,'(a)') 'no database open'
+            call report('no database open')
             return
         end if
         call db_close(db)
@@ -283,23 +287,65 @@ contains
         end if
     end subroutine
 
+    !! Print a table as the statements that would create it, one per line,
+    !! which `sqlsh` reads back: CREATE TABLE, then each live index in slot
+    !! order.  Every name is quoted, so any legal name is written as it is.
     subroutine schema_one(name)
         character(len=*), intent(in) :: name
         type(column_t), allocatable :: cols(:)
-        integer :: rs, i
+        character(len=:), allocatable :: stmt
+        integer :: rs, i, ti, k
         call db_describe(db, name, cols, rs)
         if (rs /= SQR_OK) then
-            write(error_unit,'(2a)') 'no such table: ', name
+            call report('no such table: ' // name)
             return
         end if
-        write(output_unit,'(2a)') 'CREATE TABLE ', name
+        stmt = 'CREATE TABLE ' // quoted(name) // ' ('
         do i = 1, size(cols)
-            associate (c => cols(i))
-                write(output_unit,'(4a,a)') '    ', trim(c%name), ' ', &
-                    type_text(c%dtype, c%csize), merge(',', ' ', i < size(cols))
-            end associate
+            stmt = stmt // quoted(trim(cols(i)%name)) // ' ' // &
+                   type_text(cols(i)%dtype, cols(i)%csize) // &
+                   merge(', ', ');', i < size(cols))
         end do
+        write(output_unit,'(a)') stmt
+        ti = db_table_index(db, name)
+        if (ti == 0) return
+        associate (t => db%tables(ti))
+            do k = 1, t%nindices
+                if (.not. idx_live(t%indices(k))) cycle
+                associate (ix => t%indices(k))
+                    if (ix%unique) then
+                        stmt = 'CREATE UNIQUE INDEX ON '
+                    else
+                        stmt = 'CREATE INDEX ON '
+                    end if
+                    stmt = stmt // quoted(name) // ' ('
+                    do i = 1, ix%ncols
+                        stmt = stmt // quoted(trim(ix%columns(i))) // merge(', ', ');', i < ix%ncols)
+                    end do
+                end associate
+                write(output_unit,'(a)') stmt
+            end do
+        end associate
     end subroutine
+
+    !! A name as a quoted name: in double quotes, each `"` doubled.
+    pure function quoted(name) result(q)
+        character(len=*), intent(in)  :: name
+        character(len=:), allocatable :: q
+        q = '"' // doubled(name) // '"'
+    end function
+
+    pure recursive function doubled(s) result(d)
+        character(len=*), intent(in)  :: s
+        character(len=:), allocatable :: d
+        integer :: k
+        k = index(s, '"')
+        if (k == 0) then
+            d = s
+        else
+            d = s(1:k) // '"' // doubled(s(k+1:))
+        end if
+    end function
 
     pure function type_text(dtype, csize) result(s)
         use :: sqr_consts, only: INT_TEXT_LEN
@@ -324,30 +370,35 @@ contains
         integer :: rs
         call two_args(args, dir, file)
         if (len_trim(file) == 0) then
-            write(error_unit,'(a)') 'usage: .pack <dir> <file>'
+            call report('usage: .pack <dir> <file>')
             return
         end if
         emsg = ''
         call db_pack(dir, file, rs, emsg)
         if (rs /= SQR_OK) then
-            write(error_unit,'(4a)') 'pack of "', trim(dir), '" failed: ', trim(emsg)
+            call report('pack of "' // trim(dir) // '" failed: ' // trim(emsg))
         else if (interactive) then
             write(error_unit,'(4a)') 'packed ', trim(dir), ' -> ', trim(file)
         end if
     end subroutine
 
     subroutine meta_unpack(args)
+        use :: sqr_consts, only: INT_TEXT_LEN
         character(len=*), intent(in) :: args
         character(len=:), allocatable :: file, dir
         integer :: rs
         call two_args(args, file, dir)
         if (len_trim(dir) == 0) then
-            write(error_unit,'(a)') 'usage: .unpack <file> <dir>'
+            call report('usage: .unpack <file> <dir>')
             return
         end if
         call db_unpack(file, dir, rs)
         if (rs /= SQR_OK) then
-            write(error_unit,'(3a,i0)') 'unpack of "', trim(file), '" failed: ', rs
+            block
+                character(len=INT_TEXT_LEN) :: code
+                write(code, '(i0)') rs
+                call report('unpack of "' // trim(file) // '" failed: ' // trim(code))
+            end block
         else if (interactive) then
             write(error_unit,'(4a)') 'unpacked ', trim(file), ' -> ', trim(dir)
         end if
@@ -374,10 +425,17 @@ contains
 
     ! ---- helpers ----
 
+    !! Report a failure on standard error and remember it for the exit status.
+    subroutine report(msg)
+        character(len=*), intent(in) :: msg
+        write(error_unit,'(a)') msg
+        any_failed = .true.
+    end subroutine
+
     function require_open() result(ok)
         logical :: ok
         ok = db%opened
-        if (.not. ok) write(error_unit,'(a)') 'no database open (use .open <dir>)'
+        if (.not. ok) call report('no database open (use .open <dir>)')
     end function
 
     pure function lower(s) result(r)
