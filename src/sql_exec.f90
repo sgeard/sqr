@@ -1741,10 +1741,7 @@ contains
         end if
     end subroutine
 
-    ! The number of characters in UTF-8 text: its bytes that are not
-    ! continuation bytes (10xxxxxx).  Characters, not display cells: a wide
-    ! or combining character still counts one.
-    pure function char_count(s) result(n)
+    pure module function char_count(s) result(n)
         character(len=*), intent(in) :: s
         integer :: n
         integer :: k

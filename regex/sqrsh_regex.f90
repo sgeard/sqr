@@ -36,7 +36,8 @@ contains
     end subroutine add_extra_commands
 
     ! db_scan callback for `match`: test the chosen DT_CHAR column of each live
-    ! row against the pre-compiled regex and print the row on a hit.
+    ! row against the pre-compiled regex and print the row on a hit.  A NULL
+    ! matches nothing: it is never applied to the pattern.
     subroutine match_cb(scan_db, row_id, buf, ctx, stop)
         class(db_t),      intent(inout) :: scan_db
         integer(int32),   intent(in)    :: row_id
@@ -47,6 +48,7 @@ contains
         stop = .false.
         select type (ctx)
         type is (match_ctx_t)
+            if (row_is_null(buf, ctx%col)) return
             val = row_get_char(buf, ctx%col)
             call ctx%rx%apply(val)
             if (ctx%rx%matched()) then
@@ -67,9 +69,9 @@ contains
         character(len=:), allocatable :: col, pat
         type(match_ctx_t) :: mctx
         integer :: ti, ci, rs, j
-        ti = db_table_index(db, ctx); if (ti == 0) return
+        if (.not. require_ctx_table(ctx, ti, rv)) return
         if (args%size() /= 2) then
-            write(*,'(a)') 'usage: match <col> <regex>'
+            call fail(rv, 'usage: match <col> <regex>')
             return
         end if
         nc = args%get(1); col = node_as_char(nc)
@@ -81,20 +83,18 @@ contains
             end if
         end do find_col
         if (ci == 0) then
-            write(*,'(a,a)') 'no such column: ', trim(col)
-            rv%errored = .true.
+            call fail(rv, 'no such column: ' // trim(col))
             return
         end if
         if (db%tables(ti)%cols(ci)%dtype /= DT_CHAR) then
-            write(*,'(a)') 'match is only supported on char columns'
-            rv%errored = .true.
+            call fail(rv, 'match is only supported on char columns')
             return
         end if
         np = args%get(2); pat = node_as_char(np)
         call mctx%rx%compile(pat)
         if (.not. mctx%rx%is_compiled()) then
-            write(*,'(a,a)') 'bad regex: ', trim(pat)
-            rv%errored = .true.
+            call mctx%rx%delete()          ! release what the failed compile holds
+            call fail(rv, 'bad regex: ' // trim(pat))
             return
         end if
         mctx%col = db%tables(ti)%cols(ci)
@@ -103,8 +103,7 @@ contains
         call db_scan(db, ctx, match_cb, mctx, rs)
         call mctx%rx%delete()
         if (rs /= SQR_OK) then
-            write(*,'(a)') 'scan failed'
-            rv%errored = .true.
+            call fail(rv, with_reason('scan failed', engine_reason()))
             return
         end if
         if (mctx%nrows == 0) write(*,'(a)') '(no rows match)'

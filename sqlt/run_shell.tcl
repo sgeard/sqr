@@ -393,6 +393,115 @@ namespace eval shelltest {
         check {[dict get $r status] == 1} "status: no database open ends with 1"
     }
 
+    # R25, R13: sqrsh piped: no banner and no prompts; failures on standard
+    # error; status 1 when any command failed, the script running on.
+    proc t_sqrsh_streams {} {
+        variable sqrsh
+        set db [fresh_db sqrsh_streams]
+        set r [run [utf8 "open $db\ncreate t\ncol a int\ndone\ntables\nquit\n"] $sqrsh]
+        check {[dict get $r status] == 0 && [dict get $r err] eq ""} "sqrsh: a clean script ends with 0, nothing on stderr"
+        check {![regexp {sqr> |cols> |row> |sqr shell} [dict get $r out]]} "sqrsh: piped, no banner and no prompts"
+        check {[regexp -line {^  t  \(0 rows, 1 cols\)$} [dict get $r out]]} "sqrsh: results on stdout"
+        set r [run [utf8 "open $db\nuse t\nget 9\ninsert 5\nselect\nquit\n"] $sqrsh]
+        check {[dict get $r status] == 1} "sqrsh: a failing command ends with 1"
+        check {[regexp -line {^no such row: 9$} [dict get $r err]] && ![regexp {no such row} [dict get $r out]]} \
+            "sqrsh: the failure is on stderr, not stdout"
+        check {[regexp -line {^inserted row 1$} [dict get $r out]]} "sqrsh: the script runs on after a failure"
+        set r [run [utf8 "tables\nquit\n"] $sqrsh]
+        check {[dict get $r status] == 1 && [regexp {no database open} [dict get $r err]]} \
+            "sqrsh: no database open is a failure"
+        set r [run [utf8 "nosuch\nquit\n"] $sqrsh]
+        check {[dict get $r status] == 1} "sqrsh: an unknown command ends with 1"
+        set r [run_args $sqrsh /nonexistent_dir_for_sqrsh/x/y]
+        check {[dict get $r status] == 1 && [regexp {^open .* failed: } [dict get $r err]]} \
+            "sqrsh: a failed start-up open is reported on stderr and ends with 1"
+    }
+
+    # R21: each message names the cause.
+    proc t_sqrsh_reasons {} {
+        variable sqrsh
+        set db [fresh_db sqrsh_reasons]
+        set cmds "open $db\ncreate t\ncol id int\ncol k char 4\ndone\nuse t\n"
+        append cmds "insert 1 a\ninsert 2 b\nfind id 1\nindex unique id\n"
+        append cmds "insert 1 c\nupdate 2 1 b\nupdate 9 3 c\ngetk k a\ngetk id 7\nfind id 7\n"
+        append cmds "back\nreadonly\nuse t\ninsert 3 c\ndelete 1\nindex k\ncompact\nquit\n"
+        set r [run [utf8 $cmds] $sqrsh]
+        set err [dict get $r err]
+        check {[regexp -line {^no index on that column$} $err]} "sqrsh reasons: find with no index says so"
+        check {[regexp -line {^insert failed: unique-key violation on index over "id"} $err]} \
+            "sqrsh reasons: insert names the unique violation"
+        check {[regexp -line {^update failed: unique-key violation on index over "id"} $err]} \
+            "sqrsh reasons: update names the unique violation, not a missing row"
+        check {[regexp -line {^update failed: no such row 9$} $err]} "sqrsh reasons: update of a missing row"
+        check {[regexp -line {^no unique index over those columns$} $err]} "sqrsh reasons: getk with no unique index says so"
+        check {[regexp -line {^no row for that key$} $err]} "sqrsh reasons: getk of a missing key"
+        check {[regexp -line {^no match$} $err]} "sqrsh reasons: find with an index and no row"
+        check {[regexp -line {^insert failed: .*read-only} $err]
+               && [regexp -line {^delete failed: .*read-only} $err]
+               && [regexp -line {^create_index failed: .*read-only} $err]
+               && [regexp -line {^compact failed: .*read-only} $err]} \
+            "sqrsh reasons: read-only failures say read-only"
+    }
+
+    # R20: a char value too long for its column is refused, not cut; names
+    # and values longer than a field are shown in full.
+    proc t_sqrsh_char {} {
+        variable sqrsh
+        set db [fresh_db sqrsh_char]
+        set long "abcdefghijklmnopqrstuvwxyz"
+        set cmds "open $db\ncreate t\ncol id int\ncol k char 3\ncol a_very_long_column_name char 32\ndone\nuse t\n"
+        append cmds "insert 1 abcd x\nindex k\nfind k abcd\ninsert 2 \"é\" $long\nupdate 2 2 wxyz q\nselect\nquit\n"
+        set r [run [utf8 $cmds] $sqrsh]
+        set out [dict get $r out]
+        set err [dict get $r err]
+        check {[regexp -all -line {^value too long for column "k"$} $err] == 3} \
+            "sqrsh char: over-long value refused by insert, find and update"
+        check {[regexp -line {^inserted row 1$} $out] && ![regexp {inserted row 2} $out]
+               && [regexp -all -line {^ +[0-9]+ +[0-9]+ } $out] == 1} \
+            "sqrsh char: the refused insert wrote nothing (the next row is row 1)"
+        check {[regexp {a_very_long_column_name} $out] && [regexp "  $long\$" [lindex [split [string trim $out] "\n"] end]]} \
+            "sqrsh char: a long name and a long value are shown in full"
+        check {[regexp -line {^       1                 2                 é  abcdefghij} $out]} \
+            "sqrsh char: a non-ASCII value is right-justified by characters"
+    }
+
+    # R24, R28, R30: ind(ex); what desc counts; 256 columns.
+    proc t_sqrsh_misc {} {
+        variable sqrsh
+        set db [fresh_db sqrsh_misc]
+        set cmds "open $db\ncreate t\n"
+        for {set i 1} {$i <= 256} {incr i} { append cmds "col c$i int\n" }
+        append cmds "col c257 int\ndone\ndesc t\nuse t\nind c1\nin [string repeat {1 } 256]\nback\ndesc t\nquit\n"
+        set r [run [utf8 $cmds] $sqrsh]
+        set out [dict get $r out]
+        check {[regexp -line {^too many columns$} [dict get $r err]]
+               && [regexp -line {^created table t with 256 columns$} $out]
+               && [regexp -line {^  col 256 c256 \(int, 4 bytes\)$} $out]} \
+            "sqrsh: create takes 256 columns, as CREATE TABLE does, and no more"
+        check {[regexp -line {^indexed 1 column\(s\)$} $out]} "sqrsh: ind runs index"
+        check {[regexp -line {^inserted row 1$} $out]} "sqrsh: in is now insert"
+        check {[regexp -line {^  index on        c1 \(1 entries, deleted rows included\)$} $out]} \
+            "sqrsh: desc says the entry count includes deleted rows"
+    }
+
+    # R23: match - a NULL matches nothing.  Only in a shell built with
+    # `make sqrsh-regex`; the ordinary build has no match command.
+    proc t_sqrsh_match {} {
+        variable sqrsh
+        set db [fresh_db sqrsh_match]
+        set probe [run [utf8 "open $db\ncreate t\ncol id int\ncol c char 4\ndone\nuse t\nhelp\nquit\n"] $sqrsh]
+        if {![regexp {m\(atch\)} [dict get $probe out]]} {
+            puts "  SKIP sqrsh match: this sqrsh has no match command (make sqrsh-regex)"
+            return
+        }
+        set r [run [utf8 "open $db\nuse t\ninsert 1 null\ninsert 2 \"\"\ninsert 3 ab\nmatch c ^\$\nmatch c (\nmatch nope x\nquit\n"] $sqrsh]
+        set rows [regexp -all -line {^ +[0-9]+ +[0-9]+ } [dict get $r out]]
+        check {$rows == 1 && [regexp -line {^       2                 2 *$} [dict get $r out]]} \
+            "sqrsh match: ^\$ lists the empty value, not the NULL"
+        check {[regexp -line {^bad regex: \($} [dict get $r err]] && [regexp -line {^no such column: nope$} [dict get $r err]]} \
+            "sqrsh match: failures on stderr"
+    }
+
     proc t_utf8_bom {} {
         variable BOM_UTF8
         set db [fresh_db utf8bom]
@@ -582,6 +691,11 @@ namespace eval shelltest {
             t_powershell_hint
             t_nul_later
             t_sqrsh_plain
+            t_sqrsh_streams
+            t_sqrsh_reasons
+            t_sqrsh_char
+            t_sqrsh_misc
+            t_sqrsh_match
             t_sqrsh_utf8_bom
             t_sqrsh_wide
             t_options

@@ -232,6 +232,10 @@ table:   insert ...   select   get <id>   delete <id>   compact
          getk ...   delk ...   back   quit
 ```
 
+Results go to standard output and failures to standard error; the banner
+and prompts appear only at a terminal. `sqrsh` ends with status 1 when any
+command failed, and 0 when none did.
+
 ---
 
 ## The `sqlsh` shell (SQL subset)
@@ -306,7 +310,8 @@ told from UTF-8; they are stored as the bytes they are, unvalidated.
 Both shells apply the same table: `sqlsh` through `sql_screen_line` in the
 library (public, with `sql_strip_bom`, `sql_encoding_name`,
 `sql_encoding_supported` and `sql_encoding_message`, for a program that
-reads its own SQL), `sqrsh` through cmdgraph 1.4.0, which reads its input.
+reads its own SQL), `sqrsh` through cmdgraph 1.4.0's public `strip_bom`,
+`encoding_name` and `encoding_supported`, on lines it reads itself.
 
 ```sql
 CREATE TABLE employee (id INTEGER, name CHAR(20), dept CHAR(12), salary REAL);

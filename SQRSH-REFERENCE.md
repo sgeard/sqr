@@ -19,35 +19,31 @@ sqrsh [<db-dir>]
 ```
 
 - With a directory, that database is opened (and created if it does not
-  exist) before the first command. If the open fails, a message is printed
-  and the shell starts with no database open.
+  exist) before the first command. If the open fails, `open <dir> failed:
+  <reason>` is written to standard error, the shell starts with no database
+  open, and the exit status will be 1.
 - An argument beginning with `-` is refused with exit status 2: `sqrsh` has no
   options. A directory really so named is given as `./-name`.
-- Commands are read from standard input, one per line, until `quit` or the
-  end of the input. The database is then closed.
+- Commands are read from standard input, one per line of any length, until
+  `quit` or the end of the input. A failed command does not stop the input.
+  The database is then closed.
 - A database serves one connection at a time. If another process has it, the
   open fails with `database is locked by another connection`.
 
-**Streams.** Everything goes to standard output: results, error messages, the
-banner and the prompts. Only the refusal of an option and the refusal of an
-unsupported input encoding go to standard error.
+**Streams.** Results and confirmations (`inserted row 3`, listings,
+`(no tables)`, the `help` list) go to standard output. Every failure and
+usage message goes to standard error, one line each. Two messages are
+written by cmdgraph, which reads the command word, and go to standard
+output: `unknown: <word>` and `ambiguous: ...`; both still count as failures.
 
-**Prompts are always written**, whether or not input is a terminal. Each
-command's output therefore begins on the same line as the prompt that
-preceded it, and a command that prints nothing leaves two prompts together:
+**Prompts and the banner are written only when standard input is a
+terminal**, to standard output. The prompt is `sqr> `, `cols> ` or `row> `
+according to the state (section 3). Output read from a pipe or a file has
+neither.
 
-```
-sqr shell — type `help` for commands
-sqr> cols>   +col 1 id (int, 4)
-cols> created table t with 1 columns
-sqr> 
-```
-
-The first line is the banner. The prompt is `sqr> `, `cols> ` or `row> `
-according to the state (section 3).
-
-**Exit status** is 0, whatever the commands reported (section 9, P3). It is 1
-when the input is in an unsupported encoding (README, "Input encoding") and 2
+**Exit status** is 0 when nothing failed. It is 1 when any command failed
+(an unknown or ambiguous command word included), the start-up open failed,
+or the input is in an unsupported encoding (README, "Input encoding"), and 2
 for an option.
 
 **There are no transactions.** Each command that changes the database is
@@ -61,8 +57,8 @@ A line is a command word followed by arguments, separated by spaces.
 - **Abbreviations.** A command written `o(pen)` in section 4 may be given as
   `o`, `op`, `ope` or `open`: the part before the bracket is the least that
   must be typed. A command shown without brackets must be typed in full. If
-  what is typed fits two commands the line is refused:
-  `ambiguous: in matches i(nsert), in(dex)`.
+  what is typed fits two commands the line is refused with
+  `ambiguous: <word> matches ...`, naming them.
 - **Arguments** are of three kinds, decided by how they are written:
   - an **integer**: an optional sign and digits, within −2147483648 to
     2147483647 (`7`, `007`, `+5`, `-9`);
@@ -127,7 +123,7 @@ database open, and otherwise prints ``no database open — use `open <dir>` ``.
 Failures: `open failed: <reason>`; `no database open` (`close`);
 `set read-only failed: <reason>`; `no such table: <table>` (`desc`, `use`);
 `table already exists: <table>` (`create`, which then stays in the root
-state); `drop failed: <table>`; `pack of "<dir>" failed: <reason>`;
+state); `drop failed: <table>: <reason>`; `pack of "<dir>" failed: <reason>`;
 `unpack of "<file>" failed: <code>`.
 
 `desc` prints one line for the table, one per column and one per index:
@@ -138,13 +134,15 @@ table t: record_size=34, next_id=8, live=6
   col 2 name (char, 8 bytes)
   col 3 x (real, 8 bytes)
   col 4 note (text, 12 bytes)
-  unique index on name (6 entries)
-  index on        id,x (6 entries)
+  unique index on name (6 entries, deleted rows included)
+  index on        id,x (6 entries, deleted rows included)
 ```
 
 `next_id` is the id the next inserted row will get; `live` is the number of
-rows. The `entries` figure of an index also counts rows
-deleted since the last `compact` (section 9). The types are `int`, `real`, `char` and `text`.
+rows. The `entries` figure of an index also counts rows deleted since the
+last `compact`, as it says: `delete` leaves a row's entries in the indexes,
+lookups skip them and `compact` removes them (`update` does remove the old
+entries). The types are `int`, `real`, `char` and `text`.
 
 A table name with a space in it must be quoted: `use "my table"`.
 
@@ -168,13 +166,15 @@ A table name with a space in it must be quoted: `use "my table"`.
 - `col` checks only the type: `unknown type: <word>`, and for `char` a
   missing width (usage) or `char size must be a positive integer`. The names
   and the table as a whole are checked by `done`.
-- At most 64 columns: a 65th `col` prints `too many columns`.
+- At most 256 columns, as `CREATE TABLE` allows: a 257th `col` prints
+  `too many columns`.
 - `done` with no columns prints ``no columns defined — add some with `col`
   or `cancel` `` and stays in the creator state.
 - `done` applies the rules of `CREATE TABLE` (SQL reference, 4.1). If the
   table is refused it prints `create failed: <reason>` and **stays in the
-  creator state with the columns as they were**. A column cannot be removed
-  or changed, so the way out of a bad definition is `cancel`.
+  creator state with the columns as they were**. A pending column cannot be
+  removed or changed: the way out of a bad definition is `cancel`, then
+  `create` again.
 
 ### 4.3 Table state: rows by id
 
@@ -196,51 +196,55 @@ a deleted row is not used again, until `compact` renumbers the rows.
 |---|---|---|
 | int | an integer argument | `col <n>: expected integer` |
 | real | an integer or real argument | `col <n>: expected number` |
-| char | any argument; a number is taken as its text | — |
+| char | any argument no longer than the column; a number is taken as its text | `value too long for column "<name>"` |
 | text | any argument; a number is taken as its text | — |
 | any | `null` | — |
 
 `<n>` is the column's position, from 1. A real argument is not accepted for
 an int column, even `1.0`.
 
-- A char value longer than its column is at present cut to the column's
-  width without a message (section 9, P2). Trailing blanks of a char value
-  are not kept; those of a text value are.
+- A char value longer than its column, in bytes and leaving out trailing
+  blanks, is refused before anything is written. Trailing blanks of a char
+  value are not kept; those of a text value are.
 - The wrong number of values prints `expected <n> values` (`insert`) or
   `usage: update <row_id> followed by <n> values`.
-- A row that breaks a unique index is refused: `insert failed`. For `update`
-  the message is at present `update failed: no such row <id>` whatever the
-  cause (section 9, P4).
-- `get`, `delete` and `update` of an id that is not a live row print
-  `no such row: <id>` (`update`: `update failed: no such row <id>`). An id
-  that is not an integer prints `row_id must be an integer`.
-- `insert` and `update` on a table with text columns are not atomic (section
-  9, P5).
+- A row that breaks a unique index is refused, and the message gives the
+  engine's reason: `insert failed: unique-key violation on index over "id"`,
+  and the same for `update failed: ...`.
+- `get` and `delete` of an id that is not a live row print
+  `no such row: <id>`, and `update` prints `update failed: no such row
+  <id>`. Any other failure is `<command> failed: <reason>`. An id that is not
+  an integer prints `row_id must be an integer`.
+- `insert` and `update` are each one step: the row and its text values are
+  written in one transaction, so a command that fails leaves the table as it
+  was.
+- `select` that cannot finish its scan prints `scan failed: <reason>` after
+  the rows it printed.
 
 ### 4.4 Table state: indexes and keys
 
 | Command | Does | Prints on success |
 |---|---|---|
-| `in(dex) [unique] <col>...` | creates an index on the columns, in that order | `indexed <n> column(s)` |
+| `ind(ex) [unique] <col>...` | creates an index on the columns, in that order | `indexed <n> column(s)` |
 | `dropindex <col>...` | removes the index with exactly that column list | `index dropped` |
 | `f(ind) <col> <v>` | shows one row whose column equals the value | header and the row |
 | `r(ange) <col> <lo> <hi>` | shows the rows with `<lo>` ≤ column ≤ `<hi>` | header and the rows |
 | `getk <col> <v> [<col> <v>]...` | shows the row with that key | header and the row |
 | `delk <col> <v> [<col> <v>]...` | deletes the row with that key | `deleted by key` |
 
-`index` must be typed at least as `ind`: `in` is ambiguous with `insert`
-(section 9).
+`index` must be typed at least as `ind`; `in` is `insert`.
 
 The rules for indexes are those of the SQL reference, 4.4: no text column, no
 repeated column, one index per column list, and a unique index exempts rows
-with NULL in an indexed column. `index` fails with `create_index failed`
-whatever the cause; `dropindex` with `dropindex: no index over those columns`.
+with NULL in an indexed column. `index` fails with `create_index failed:
+<reason>`; `dropindex` with `dropindex: no index over those columns`.
 
-**`find` and `range` need an index on exactly that one column.**
+**`find` and `range` need an index whose first column is that column.**
 
 - `find` shows one matching row; if several match, which one is not
-  specified. With no match it prints `no match`. With no index on the column
-  it also prints `no match` (section 9, P4).
+  specified. With no match it prints `no match`. With no index it prints
+  `no index on that column`. A char value too long for the column is
+  refused as for `insert`.
 - `range` shows the matching rows in ascending order of the column, and rows
   equal in the column in row-id order. Rows with NULL in the column are never
   shown. With `<lo>` greater than `<hi>`, or nothing in the band, it prints
@@ -255,9 +259,10 @@ whatever the cause; `dropindex` with `dropindex: no index over those columns`.
 **`getk` and `delk` need a unique index whose column list is exactly the
 columns given, in the same order.** With an index on `(k1, k2)`,
 `getk k1 1 k2 aa` finds the row and `getk k2 aa k1 1` does not. When there is
-no such index, and when there is no such row, they print
-`no row for that key`. Arguments not in pairs print
-`usage: <col> <value> [<col> <value> ...]`.
+no such index they print `no unique index over those columns`; when there is
+no such row, `no row for that key`. Arguments not in pairs print
+`usage: <col> <value> [<col> <value> ...]`. The values are checked as for
+`insert`, except that `null` is ordinary text here.
 
 ### 4.5 Table state: the table itself
 
@@ -271,7 +276,7 @@ no such index, and when there is no such row, they print
 
 `<type>` is as in 4.2. Failures: `addcolumn failed: <reason>`,
 `dropcolumn failed: <reason>` (an unknown column; the only column of the
-table), `compact failed`, `verify: FAILED — <reason>`.
+table), `compact failed: <reason>`, `verify: FAILED — <reason>`.
 
 Row ids survive `addcolumn` and `dropcolumn`. They do not survive `compact`:
 an id noted before it may name a different row afterwards.
@@ -285,12 +290,13 @@ m(atch) <col> <regex>
 `match` exists only in a shell built with `make sqrsh-regex`; in the ordinary
 build it is `unknown`. It shows every row whose char column matches a Tcl
 advanced regular expression, anywhere in the value, by scanning the table;
-no index is needed or used. With no match it prints the header and
-`(no rows match)`. Failures: `no such column: <col>`,
-`match is only supported on char columns`, `bad regex: <regex>`.
-
-This section is written from the source; `match` was not run for this
-document. Review item X5 concerns it.
+no index is needed or used. A NULL matches nothing, whatever the pattern;
+an empty value is matched like any other. With no match it prints the header
+and `(no rows match)`. Failures: `no such table: <table>` (the table was
+dropped meanwhile), `no such column: <col>`, `match is only supported on char
+columns`, `bad regex: <regex>`, `scan failed: <reason>`. The regex engine
+also writes its own line, `***Syntax error in re: <regex>`, to standard
+output for a bad pattern.
 
 ## 5. How rows are shown
 
@@ -305,7 +311,7 @@ then one line per row:
 
 - `row_id` is right-aligned in 8 columns.
 - Each further column is preceded by two blanks and, except a text column,
-  right-aligned in 16 columns:
+  right-aligned in 16 characters:
   - an int in plain decimal;
   - a real as `d.ddddddddE±dd`, eight decimals, as `sqlsh` shows it: a
     three-digit exponent is written in full (`1.00000000E-300`) and zero
@@ -313,18 +319,19 @@ then one line per row:
   - a char value without its trailing blanks;
   - NULL as the four letters `NULL`.
 - A text value is printed in full, not aligned and not padded.
-- **A column name or a char value longer than 16 bytes is cut to its first
-  16** (section 9, P2). Width is counted in bytes, so non-ASCII values are
-  misaligned.
+- A column name or a char value longer than 16 characters is written in
+  full, and the later fields of that line move right. Width is counted in
+  characters, not display cells: a wide or combining character still
+  misaligns.
 - There is no count line. `select` on an empty table prints the header only.
 
 ## 6. Read-only
 
 After `readonly`, every command that would change the database fails, and it
-cannot be undone except by `close` and `open`. The failure messages are the
-ordinary ones of each command and do not mention the cause: `insert failed`,
-`no such row: <id>` for `delete`, `compact failed`, `create_index failed`,
-`drop failed: <table>` (section 9, P4).
+cannot be undone except by `close` and `open`. Each failure message gives the
+engine's reason, which says the database is read-only: `insert failed:
+<reason>`, `delete failed: <reason>`, `compact failed: <reason>`,
+`create_index failed: <reason>`, `drop failed: <table>: <reason>`.
 
 ## 7. What `sqrsh` cannot do
 
@@ -339,11 +346,11 @@ ordinary ones of each command and do not mention the cause: `insert failed`,
 
 | Limit | Value |
 |---|---|
-| columns in a table made by `create` | 64 (`CREATE TABLE` in `sqlsh` allows 256) |
+| columns in a table made by `create` | 256, as `CREATE TABLE` |
 | name | 32 bytes |
 | `char <N>` | 1 ≤ N ≤ 65536 |
 | int | −2147483648 to 2147483647 |
-| displayed width of a name or char value | 16 bytes |
+| field width of the row display | 16 characters; longer values are shown in full |
 
 ## 9. Open points
 
@@ -354,30 +361,20 @@ writing this document.
 
 | | Present behaviour | Question |
 |---|---|---|
-| P2 | A char value longer than its column is cut on input without a message; names and char values over 16 bytes are cut on display. | Refuse on input, as `sqlsh` does; show values in full. |
-| P3 | Exit status is 0 after failed commands. | A non-zero status, perhaps under an option? |
-| P4 | Messages that name the wrong cause: `no match` for `find` with no index; `update failed: no such row` for a unique violation; `no row for that key` when there is no unique index; the read-only failures of section 6. | Report the cause. |
-| P5 | `insert` and `update` write text columns as a second step, so a failure there leaves the row in place with its text unset; `select` ignores a failed scan. | Make each one step; report the scan. |
-| X5 | Review item on `match`. | See the review. |
-| — | `in`, the stated abbreviation of `index`, is refused as ambiguous with `insert`. | Declare `ind(ex)`. |
-| — | Prompts are written when input is not a terminal, and errors go to standard output. | Prompt only at a terminal, as `sqlsh` does; errors to standard error? |
-| — | The word `null` is NULL even when quoted, so the text cannot be stored. | Quoted `"null"` should be text. |
-| — | A backslash before a double quote inside a quoted text is kept, and the quote does not end the text: `"x \"q\" y"` is stored as `x \"q\" y`. cmdgraph documents no escape. | Decide in cmdgraph. |
-| — | A real with an empty exponent (`1e`) is 1.0 in the ifx build and is not a number in the gfortran build. | Refuse it. |
-| — | `delete` leaves the row's entries in the indexes; lookups skip them and `compact` removes them. `desc` counts them, so `live=3` can stand beside `(4 entries)`. (`update` does remove the old entries.) | By design in the engine; should `desc` show the live count, or say what it counts? |
-| — | A failed `done` cannot be repaired, only cancelled. | A command to remove a pending column? |
-| — | `create` allows 64 columns where SQL allows 256. | One limit. |
+| — | The word `null` is NULL even when quoted, so the text cannot be stored. | Quoted `"null"` should be text. Waits for cmdgraph. |
+| — | A backslash before a double quote inside a quoted text is kept, and the quote does not end the text: `"x \"q\" y"` is stored as `x \"q\" y`. cmdgraph documents no escape. | Decide in cmdgraph. Waits for cmdgraph. |
+| — | A real with an empty exponent (`1e`) is 1.0 in the ifx build and is not a number in the gfortran build. | Refuse it. Waits for cmdgraph. |
 | — | Commands are case-sensitive; SQL keywords are not. | Intended (cmdgraph); stated so it is not taken for a defect. |
 
 ## 10. Notes for writing tests
 
-- Feed commands on standard input and read standard output. Remove the
-  banner line, then remove each prompt (`sqr> `, `cols> `, `row> `) from the
-  start of a line, repeatedly, since two can stand together.
+- Feed commands on standard input; read results from standard output and
+  failures from standard error. Input that is not a terminal gets no banner
+  and no prompts, so there is nothing to strip.
 - A change is durable when its command reports success, so a database may be
   built in one process and examined in another, by `sqrsh` or by `sqlsh`.
   Only one process may have it open at a time.
-- The exit status says nothing about commands.
+- The exit status is 1 when any command in the run failed.
 - Compare reals as numbers parsed from the display, not as text.
 - `sqlt/run_shell.tcl` holds the existing functional tests of both shells.
 - Do not write a test that requires the behaviour listed in section 9.

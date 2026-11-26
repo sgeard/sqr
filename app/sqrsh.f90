@@ -8,12 +8,13 @@
 module sqrsh_state
     use, intrinsic :: iso_fortran_env, only: int32, real64
     use sqr
+    use sql, only: SQL_MAX_COLS
     implicit none
 
     type(db_t), save, target :: db
 
-    ! Pending-table-creation state
-    integer, parameter :: MAX_PENDING_COLS = 64
+    ! Pending-table-creation state: as many columns as CREATE TABLE allows.
+    integer, parameter :: MAX_PENDING_COLS = SQL_MAX_COLS
     type(column_t), save :: pending_cols(MAX_PENDING_COLS)
     integer, save        :: pending_ncols = 0
 
@@ -69,12 +70,6 @@ contains
         end select
     end function
 
-    subroutine require_db_open(ok)
-        logical, intent(out) :: ok
-        ok = db%opened
-        if (.not. ok) write(*,'(a)') 'no database open — use `open <dir>`'
-    end subroutine
-
     pure function lower(s) result(r)
         use :: sqr_consts, only: ASCII_CASE_OFFSET
         character(len=*), intent(in) :: s
@@ -115,10 +110,93 @@ module sqrsh_actions
     use cmdgraph
     use dlist
     use sqr
+    use sql, only: char_count
     use sqrsh_state
     implicit none
 
+    ! Width a field of the row display is right-justified in (wider values
+    ! are written in full).
+    integer, parameter :: FIELD_WIDTH = 16
+
 contains
+
+    ! Report a failure: cmdgraph writes `text` to its error channel (standard
+    ! error) and the command counts as failed.  Every failure and usage
+    ! message of the shell goes through here; none is written to output.
+    subroutine fail(rv, text)
+        type(action_result_t), intent(inout) :: rv
+        character(len=*),      intent(in)    :: text
+        rv%errored = .true.
+        rv%errmsg  = text
+    end subroutine
+
+    ! The engine's message for the last failure, empty when it gave none.
+    function engine_reason() result(why)
+        character(len=:), allocatable :: why
+        call db_last_error(db, msg=why)
+        if (.not. allocated(why)) why = ''
+    end function
+
+    ! `what: why`, or `what` alone when there is no reason to add.
+    pure function with_reason(what, why) result(s)
+        character(len=*), intent(in)  :: what, why
+        character(len=:), allocatable :: s
+        if (len_trim(why) > 0) then
+            s = what // ': ' // trim(why)
+        else
+            s = what
+        end if
+    end function
+
+    ! An integer as text, for messages.
+    pure function int_text(i) result(t)
+        use sqr_consts, only: INT_TEXT_LEN
+        integer, intent(in) :: i
+        character(len=:), allocatable :: t
+        character(len=INT_TEXT_LEN) :: buf
+        write(buf, '(i0)') i
+        t = trim(buf)
+    end function
+
+    ! Index slot of a live index whose first column is `col` (the index find
+    ! and range use), or 0.
+    function leading_index(ti, col) result(j)
+        integer,          intent(in) :: ti
+        character(len=*), intent(in) :: col
+        integer :: j
+        do j = 1, db%tables(ti)%nindices
+            if (.not. idx_live(db%tables(ti)%indices(j))) cycle
+            if (db%tables(ti)%indices(j)%columns(1) == col) return
+        end do
+        j = 0
+    end function
+
+    ! `.true.` when a live unique index has exactly the columns `cols`, in
+    ! that order (the index getk and delk use).
+    function has_unique_index(ti, cols) result(yes)
+        integer,          intent(in) :: ti
+        character(len=*), intent(in) :: cols(:)
+        logical :: yes
+        integer :: j
+        yes = .false.
+        do j = 1, db%tables(ti)%nindices
+            associate (ix => db%tables(ti)%indices(j))
+                if (.not. idx_live(ix)) cycle
+                if (.not. ix%unique .or. ix%ncols /= size(cols)) cycle
+                if (all(ix%columns(1:ix%ncols) == cols)) then
+                    yes = .true.
+                    return
+                end if
+            end associate
+        end do
+    end function
+
+    subroutine require_db_open(ok, rv)
+        logical,               intent(out)   :: ok
+        type(action_result_t), intent(inout) :: rv
+        ok = db%opened
+        if (.not. ok) call fail(rv, 'no database open — use `open <dir>`')
+    end subroutine
 
     ! Resolve the context table, reporting `no such table` (and flagging the
     ! action as errored) when it is gone, rather than the silent no-op the
@@ -130,10 +208,7 @@ contains
         logical :: ok
         ti = db_table_index(db, ctx)
         ok = ti /= 0
-        if (.not. ok) then
-            write(*,'(a)') 'no such table: ' // trim(ctx)
-            rv%errored = .true.
-        end if
+        if (.not. ok) call fail(rv, 'no such table: ' // trim(ctx))
     end function
 
     ! Column ordinal of `name` in table `ti`, or 0 if absent.
@@ -161,7 +236,7 @@ contains
         character(len=SQR_ERRMSG_LEN) :: emsg
         integer :: rs
         if (args%size() /= 1) then
-            write(*,'(a)') 'usage: open <directory>'
+            call fail(rv, 'usage: open <directory>')
             return
         end if
         n = args%get(1); dir = node_as_char(n)
@@ -169,8 +244,7 @@ contains
         emsg = ''
         call db_open(db, dir, rs, emsg)
         if (rs /= SQR_OK) then
-            write(*,'(2a)') 'open failed: ', trim(emsg)
-            rv%errored = .true.
+            call fail(rv, 'open failed: ' // trim(emsg))
             return
         end if
         write(*,'(3a,i0,a)') 'opened ', dir, ' (', db%ntables, ' tables)'
@@ -181,7 +255,7 @@ contains
         character(len=*), intent(in) :: ctx
         type(action_result_t) :: rv
         if (.not. db%opened) then
-            write(*,'(a)') 'no database open'
+            call fail(rv, 'no database open')
             return
         end if
         call db_close(db)
@@ -197,7 +271,7 @@ contains
         character(len=SQR_ERRMSG_LEN) :: emsg
         integer :: rs
         if (args%size() /= 2) then
-            write(*,'(a)') 'usage: pack <dir> <file>'
+            call fail(rv, 'usage: pack <dir> <file>')
             return
         end if
         n = args%get(1); dir  = node_as_char(n)
@@ -205,8 +279,7 @@ contains
         emsg = ''
         call db_pack(dir, file, rs, emsg)
         if (rs /= SQR_OK) then
-            write(*,'(4a)') 'pack of "', dir, '" failed: ', trim(emsg)
-            rv%errored = .true.
+            call fail(rv, 'pack of "' // dir // '" failed: ' // trim(emsg))
             return
         end if
         write(*,'(4a)') 'packed ', dir, ' -> ', file
@@ -220,15 +293,19 @@ contains
         character(len=:), allocatable :: file, dir
         integer :: rs
         if (args%size() /= 2) then
-            write(*,'(a)') 'usage: unpack <file> <dir>'
+            call fail(rv, 'usage: unpack <file> <dir>')
             return
         end if
         n = args%get(1); file = node_as_char(n)
         n = args%get(2); dir  = node_as_char(n)
         call db_unpack(file, dir, rs)
         if (rs /= SQR_OK) then
-            write(*,'(3a,i0)') 'unpack of "', file, '" failed: ', rs
-            rv%errored = .true.
+            block
+                use sqr_consts, only: INT_TEXT_LEN
+                character(len=INT_TEXT_LEN) :: code
+                write(code, '(i0)') rs
+                call fail(rv, 'unpack of "' // file // '" failed: ' // trim(code))
+            end block
             return
         end if
         write(*,'(4a)') 'unpacked ', file, ' -> ', dir
@@ -240,15 +317,12 @@ contains
         type(action_result_t) :: rv
         integer :: rs
         logical :: ok
-        character(len=:), allocatable :: why
-        call require_db_open(ok); if (.not. ok) return
+        call require_db_open(ok, rv); if (.not. ok) return
         call db_set_readonly(db, rs)
         if (rs == SQR_OK) then
             write(*,'(a)') 'database is now read-only (concurrent readers allowed)'
         else
-            call db_last_error(db, msg=why)
-            write(*,'(a)') 'set read-only failed: ' // why
-            rv%errored = .true.
+            call fail(rv, with_reason('set read-only failed', engine_reason()))
         end if
     end function
 
@@ -259,7 +333,7 @@ contains
         character(len=SQR_NAME_LEN), allocatable :: names(:)
         integer :: i
         logical :: ok
-        call require_db_open(ok); if (.not. ok) return
+        call require_db_open(ok, rv); if (.not. ok) return
         call db_list_tables(db, names)
         if (size(names) == 0) then
             write(*,'(a)') '(no tables)'
@@ -281,16 +355,15 @@ contains
         character(len=:), allocatable :: name
         integer :: ti, i
         logical :: ok
-        call require_db_open(ok); if (.not. ok) return
+        call require_db_open(ok, rv); if (.not. ok) return
         if (args%size() /= 1) then
-            write(*,'(a)') 'usage: desc <table>'
+            call fail(rv, 'usage: desc <table>')
             return
         end if
         n = args%get(1); name = node_as_char(n)
         ti = db_table_index(db, name)
         if (ti == 0) then
-            write(*,'(2a)') 'no such table: ', trim(name)
-            rv%errored = .true.
+            call fail(rv, 'no such table: ' // trim(name))
             return
         end if
         associate (t => db%tables(ti))
@@ -314,7 +387,7 @@ contains
                         end do
                         write(*,'(4a,i0,a)') '  ', &
                             merge('unique index on ', 'index on        ', ix%unique), &
-                            cols, ' (', ix%nentries, ' entries)'
+                            cols, ' (', ix%nentries, ' entries, deleted rows included)'
                     end block
                 end associate
             end do
@@ -329,9 +402,9 @@ contains
         character(len=:), allocatable :: name
         integer :: rs
         logical :: ok
-        call require_db_open(ok); if (.not. ok) return
+        call require_db_open(ok, rv); if (.not. ok) return
         if (args%size() /= 1) then
-            write(*,'(a)') 'usage: drop <table>'
+            call fail(rv, 'usage: drop <table>')
             return
         end if
         n = args%get(1); name = node_as_char(n)
@@ -339,8 +412,7 @@ contains
         if (rs == SQR_OK) then
             write(*,'(2a)') 'dropped ', trim(name)
         else
-            write(*,'(2a)') 'drop failed: ', trim(name)
-            rv%errored = .true.
+            call fail(rv, with_reason('drop failed: ' // trim(name), engine_reason()))
         end if
     end function
 
@@ -352,15 +424,14 @@ contains
         class(dlist_node_data_t), allocatable :: n
         character(len=:), allocatable :: name
         logical :: ok
-        call require_db_open(ok); if (.not. ok) return
+        call require_db_open(ok, rv); if (.not. ok) return
         if (args%size() /= 1) then
-            write(*,'(a)') 'usage: create <table>'
+            call fail(rv, 'usage: create <table>')
             return
         end if
         n = args%get(1); name = node_as_char(n)
         if (db_table_index(db, name) > 0) then
-            write(*,'(2a)') 'table already exists: ', trim(name)
-            rv%errored = .true.
+            call fail(rv, 'table already exists: ' // trim(name))
             return
         end if
         pending_ncols = 0
@@ -375,15 +446,14 @@ contains
         class(dlist_node_data_t), allocatable :: n
         character(len=:), allocatable :: name
         logical :: ok
-        call require_db_open(ok); if (.not. ok) return
+        call require_db_open(ok, rv); if (.not. ok) return
         if (args%size() /= 1) then
-            write(*,'(a)') 'usage: use <table>'
+            call fail(rv, 'usage: use <table>')
             return
         end if
         n = args%get(1); name = node_as_char(n)
         if (db_table_index(db, name) == 0) then
-            write(*,'(2a)') 'no such table: ', trim(name)
-            rv%errored = .true.
+            call fail(rv, 'no such table: ' // trim(name))
             return
         end if
         rv%value = name
@@ -393,22 +463,23 @@ contains
 
     ! Parse a `<name> int | real | text | char <N>` column spec from `args`
     ! starting at 1-based position `base`, into `col`. `cmd` names the calling
-    ! command for the usage message. ok=.false. (with a message printed) on a
-    ! malformed type or a missing char width. Shared by `col` (creator) and
+    ! command for the usage message. ok=.false. (with the failure set in rv) on
+    ! a malformed type or a missing char width. Shared by `col` (creator) and
     ! `addcolumn` (table).
-    subroutine parse_col_spec(args, base, cmd, col, ok)
-        type(dlist_t),    intent(in)  :: args
-        integer,          intent(in)  :: base
-        character(len=*), intent(in)  :: cmd
-        type(column_t),   intent(out) :: col
-        logical,          intent(out) :: ok
+    subroutine parse_col_spec(args, base, cmd, col, ok, rv)
+        type(dlist_t),         intent(in)    :: args
+        integer,               intent(in)    :: base
+        character(len=*),      intent(in)    :: cmd
+        type(column_t),        intent(out)   :: col
+        logical,               intent(out)   :: ok
+        type(action_result_t), intent(inout) :: rv
         class(dlist_node_data_t), allocatable :: n
         character(len=:), allocatable :: cname, ctype
         integer :: csize, cn
         logical :: cvt
         ok = .false.
         if (args%size() < base + 1) then
-            write(*,'(a)') 'usage: ' // cmd // ' <name> int | real | text | char <N>'
+            call fail(rv, 'usage: ' // cmd // ' <name> int | real | text | char <N>')
             return
         end if
         n = args%get(base);     cname = node_as_char(n)
@@ -422,17 +493,17 @@ contains
             csize = SQR_TEXT_DESC; cn = DT_TEXT
         case ('char', 'c')
             if (args%size() < base + 2) then
-                write(*,'(a)') 'usage: ' // cmd // ' <name> char <N>'
+                call fail(rv, 'usage: ' // cmd // ' <name> char <N>')
                 return
             end if
             n = args%get(base + 2); csize = node_as_int(n, cvt)
             if (.not. cvt .or. csize < 1) then
-                write(*,'(a)') 'char size must be a positive integer'
+                call fail(rv, 'char size must be a positive integer')
                 return
             end if
             cn = DT_CHAR
         case default
-            write(*,'(2a)') 'unknown type: ', ctype
+            call fail(rv, 'unknown type: ' // ctype)
             return
         end select
         col%name  = cname
@@ -448,11 +519,10 @@ contains
         type(column_t) :: col
         logical :: ok
         if (pending_ncols >= MAX_PENDING_COLS) then
-            write(*,'(a)') 'too many columns'
-            rv%errored = .true.
+            call fail(rv, 'too many columns')
             return
         end if
-        call parse_col_spec(args, 1, 'col', col, ok)
+        call parse_col_spec(args, 1, 'col', col, ok, rv)
         if (.not. ok) return
         pending_ncols = pending_ncols + 1
         pending_cols(pending_ncols) = col
@@ -467,15 +537,13 @@ contains
         integer :: rs
         character(len=SQR_ERRMSG_LEN) :: emsg
         if (pending_ncols == 0) then
-            write(*,'(a)') 'no columns defined — add some with `col` or `cancel`'
-            rv%errored = .true.
+            call fail(rv, 'no columns defined — add some with `col` or `cancel`')
             return
         end if
         emsg = ''
         call db_create_table(db, ctx, pending_cols(1:pending_ncols), rs, emsg)
         if (rs /= SQR_OK) then
-            write(*,'(2a)') 'create failed: ', trim(emsg)
-            rv%errored = .true.
+            call fail(rv, 'create failed: ' // trim(emsg))
             return
         end if
         write(*,'(3a,i0,a)') 'created table ', trim(ctx), ' with ', pending_ncols, ' columns'
@@ -484,155 +552,211 @@ contains
 
     ! ---- table-bound state ----
 
-    function act_insert(args, ctx) result(rv)
-        type(dlist_t),    intent(in) :: args
-        character(len=*), intent(in) :: ctx
-        type(action_result_t) :: rv
-        class(dlist_node_data_t), allocatable :: nd
-        integer :: ti, i, rs
-        integer(int32) :: ival, rid
-        real(real64)   :: rval
-        character(len=:), allocatable :: buf, sval
+    ! A char value must fit its column: longer (trailing blanks aside, as in
+    ! sqlsh) is refused rather than cut.
+    function char_fits(c, val, rv) result(ok)
+        type(column_t),        intent(in)    :: c
+        character(len=*),      intent(in)    :: val
+        type(action_result_t), intent(inout) :: rv
         logical :: ok
-        if (.not. require_ctx_table(ctx, ti, rv)) return
-        if (args%size() /= db%tables(ti)%ncols) then
-            write(*,'(a,i0,a)') 'expected ', db%tables(ti)%ncols, ' values'
-            rv%errored = .true.
-            return
-        end if
-        associate (t => db%tables(ti))
-            call row_alloc(buf, t%record_size)
-            do i = 1, t%ncols
-                nd = args%get(i)
-                associate (c => t%cols(i))
-                    if (tok_is_null(nd)) then
-                        call row_set_null(buf, c)   ! `null` token ⇒ SQL NULL
-                    else
-                        select case (c%dtype)
-                        case (DT_INT)
-                            ival = node_as_int(nd, ok)
-                            if (.not. ok) then
-                                write(*,'(a,i0,a)') 'col ', i, ': expected integer'
-                                rv%errored = .true.
-                                return
-                            end if
-                            call row_set_int(buf, c, ival)
-                        case (DT_REAL)
-                            rval = node_as_real(nd, ok)
-                            if (.not. ok) then
-                                write(*,'(a,i0,a)') 'col ', i, ': expected number'
-                                rv%errored = .true.
-                                return
-                            end if
-                            call row_set_real(buf, c, rval)
-                        case (DT_CHAR)
-                            sval = node_as_char(nd)
-                            call row_set_char(buf, c, sval)
-                        case (DT_TEXT)
-                            continue   ! written after insert via db_set_text
-                        end select
-                    end if
-                end associate
-            end do
-        end associate
-        call db_insert(db, ctx, buf, rid, rs)
-        if (rs /= SQR_OK) then
-            write(*,'(a)') 'insert failed'
-            rv%errored = .true.
-            return
-        end if
-        set_text: do i = 1, db%tables(ti)%ncols
-            if (db%tables(ti)%cols(i)%dtype /= DT_TEXT) cycle set_text
-            nd = args%get(i)
-            if (tok_is_null(nd)) cycle set_text   ! left NULL, no blob write
-            call db_set_text(db, ctx, rid, trim(db%tables(ti)%cols(i)%name), &
-                             node_as_char(nd), rs)
-            if (rs /= SQR_OK) then
-                write(*,'(a)') 'set_text failed'
-                rv%errored = .true.
-                return
-            end if
-        end do set_text
-        write(*,'(a,i0)') 'inserted row ', rid
+        ok = len_trim(val) <= c%csize
+        if (.not. ok) call fail(rv, 'value too long for column "' // trim(c%name) // '"')
     end function
 
-    function act_update(args, ctx) result(rv)
+    ! Set column `c` of `buf` from one argument, the one decoding of a value
+    ! that insert, update and the key commands share.  For a row (`pos` > 0,
+    ! the column's position) `null` is NULL, a bad value is `col <pos>:
+    ! expected ...`, and a text column is left for the caller to write.  For
+    ! a key (`pos` = 0) `null` is ordinary text, a bad value is `value must
+    ! be ...`, and a text column is refused.  A char value must fit.
+    function decode_value(nd, c, pos, buf, rv) result(ok)
+        use sqr_consts, only: INT_TEXT_LEN
+        class(dlist_node_data_t), intent(in)    :: nd
+        type(column_t),           intent(in)    :: c
+        integer,                  intent(in)    :: pos
+        character(len=*),         intent(inout) :: buf
+        type(action_result_t),    intent(inout) :: rv
+        logical :: ok
+        integer(int32) :: ival
+        real(real64)   :: rval
+        character(len=INT_TEXT_LEN) :: where
+        write(where, '(a,i0,a)') 'col ', pos, ': '
+        if (pos > 0) then
+            if (tok_is_null(nd)) then
+                call row_set_null(buf, c)
+                ok = .true.
+                return
+            end if
+        end if
+        select case (c%dtype)
+        case (DT_INT)
+            ival = node_as_int(nd, ok)
+            if (ok) then
+                call row_set_int(buf, c, ival)
+            else if (pos > 0) then
+                call fail(rv, trim(where) // ' expected integer')
+            else
+                call fail(rv, 'value must be an integer')
+            end if
+        case (DT_REAL)
+            rval = node_as_real(nd, ok)
+            if (ok) then
+                call row_set_real(buf, c, rval)
+            else if (pos > 0) then
+                call fail(rv, trim(where) // ' expected number')
+            else
+                call fail(rv, 'value must be a number')
+            end if
+        case (DT_CHAR)
+            ok = char_fits(c, node_as_char(nd), rv)
+            if (ok) call row_set_char(buf, c, node_as_char(nd))
+        case default
+            ok = pos > 0                ! a text column: written by the caller
+            if (.not. ok) call fail(rv, 'key column type not supported')
+        end select
+    end function
+
+    ! Write the text columns of row `rid` from the arguments (the value of
+    ! column i is argument i + `skip`); `null` leaves a column NULL.
+    subroutine write_texts(ti, ctx, rid, args, skip, rs)
+        integer,          intent(in)  :: ti
+        character(len=*), intent(in)  :: ctx
+        integer(int32),   intent(in)  :: rid
+        type(dlist_t),    intent(in)  :: args
+        integer,          intent(in)  :: skip
+        integer,          intent(out) :: rs
+        class(dlist_node_data_t), allocatable :: nd
+        integer :: i
+        rs = SQR_OK
+        texts: do i = 1, db%tables(ti)%ncols
+            if (db%tables(ti)%cols(i)%dtype /= DT_TEXT) cycle texts
+            nd = args%get(i + skip)
+            if (tok_is_null(nd)) cycle texts
+            call db_set_text(db, ctx, rid, trim(db%tables(ti)%cols(i)%name), &
+                             node_as_char(nd), rs)
+            if (rs /= SQR_OK) return
+        end do texts
+    end subroutine
+
+    ! End a failed one-step change: the engine's reason is taken, then the
+    ! transaction rolled back.  The failure reported is `what: <reason>`,
+    ! or the rollback's own failure if it could not finish.
+    subroutine abandon(rv, what)
+        type(action_result_t), intent(inout) :: rv
+        character(len=*),      intent(in)    :: what
+        character(len=:), allocatable :: why
+        integer :: rs
+        why = engine_reason()
+        call db_rollback(db, rs)
+        if (rs /= SQR_OK) then
+            call fail(rv, with_reason('rollback failed', engine_reason()))
+        else
+            call fail(rv, with_reason(what, why))
+        end if
+    end subroutine
+
+    ! insert: the row and its text values are one transaction, so a failure
+    ! at any step leaves no row.
+    function act_insert(args, ctx) result(rv)
+        use sqr_consts, only: INT_TEXT_LEN
         type(dlist_t),    intent(in) :: args
         character(len=*), intent(in) :: ctx
         type(action_result_t) :: rv
         class(dlist_node_data_t), allocatable :: nd
         integer :: ti, i, rs
-        integer(int32) :: ival, rid
-        real(real64)   :: rval
-        character(len=:), allocatable :: buf, sval
+        integer(int32) :: rid
+        character(len=:), allocatable :: buf
+        character(len=INT_TEXT_LEN) :: num
+        if (.not. require_ctx_table(ctx, ti, rv)) return
+        if (args%size() /= db%tables(ti)%ncols) then
+            write(num, '(i0)') db%tables(ti)%ncols
+            call fail(rv, 'expected ' // trim(num) // ' values')
+            return
+        end if
+        call row_alloc(buf, db%tables(ti)%record_size)
+        do i = 1, db%tables(ti)%ncols
+            nd = args%get(i)
+            if (.not. decode_value(nd, db%tables(ti)%cols(i), i, buf, rv)) return
+        end do
+        call db_begin(db, rs)
+        if (rs /= SQR_OK) then
+            call fail(rv, with_reason('insert failed', engine_reason()))
+            return
+        end if
+        one_step: block
+            call db_insert(db, ctx, buf, rid, rs)
+            if (rs /= SQR_OK) exit one_step
+            call write_texts(ti, ctx, rid, args, 0, rs)
+            if (rs /= SQR_OK) exit one_step
+            call db_commit(db, rs)     ! a failed commit has rolled back
+            if (rs /= SQR_OK) then
+                call fail(rv, with_reason('insert failed', engine_reason()))
+                return
+            end if
+            write(*,'(a,i0)') 'inserted row ', rid
+            return
+        end block one_step
+        call abandon(rv, 'insert failed')
+    end function
+
+    ! update: as insert, one transaction.  An id that is not a live row is
+    ! `no such row`; any other failure gives the engine's reason.
+    function act_update(args, ctx) result(rv)
+        use sqr_consts, only: INT_TEXT_LEN
+        type(dlist_t),    intent(in) :: args
+        character(len=*), intent(in) :: ctx
+        type(action_result_t) :: rv
+        class(dlist_node_data_t), allocatable :: nd
+        integer :: ti, i, rs
+        integer(int32) :: rid
+        character(len=:), allocatable :: buf
+        character(len=INT_TEXT_LEN) :: num
         logical :: ok
         if (.not. require_ctx_table(ctx, ti, rv)) return
         if (args%size() /= db%tables(ti)%ncols + 1) then
-            write(*,'(a,i0,a)') 'usage: update <row_id> followed by ', &
-                db%tables(ti)%ncols, ' values'
-            rv%errored = .true.
+            write(num, '(i0)') db%tables(ti)%ncols
+            call fail(rv, 'usage: update <row_id> followed by ' // trim(num) // ' values')
             return
         end if
         nd = args%get(1); rid = node_as_int(nd, ok)
         if (.not. ok) then
-            write(*,'(a)') 'row_id must be an integer'
-            rv%errored = .true.
+            call fail(rv, 'row_id must be an integer')
             return
         end if
-        associate (t => db%tables(ti))
-            call row_alloc(buf, t%record_size)
-            do i = 1, t%ncols
-                nd = args%get(i + 1)
-                associate (c => t%cols(i))
-                    if (tok_is_null(nd)) then
-                        call row_set_null(buf, c)   ! `null` token ⇒ SQL NULL
-                    else
-                        select case (c%dtype)
-                        case (DT_INT)
-                            ival = node_as_int(nd, ok)
-                            if (.not. ok) then
-                                write(*,'(a,i0,a)') 'col ', i, ': expected integer'
-                                rv%errored = .true.
-                                return
-                            end if
-                            call row_set_int(buf, c, ival)
-                        case (DT_REAL)
-                            rval = node_as_real(nd, ok)
-                            if (.not. ok) then
-                                write(*,'(a,i0,a)') 'col ', i, ': expected number'
-                                rv%errored = .true.
-                                return
-                            end if
-                            call row_set_real(buf, c, rval)
-                        case (DT_CHAR)
-                            sval = node_as_char(nd)
-                            call row_set_char(buf, c, sval)
-                        case (DT_TEXT)
-                            continue   ! written after update via db_set_text
-                        end select
-                    end if
-                end associate
-            end do
-        end associate
-        call db_update(db, ctx, rid, buf, rs)
-        if (rs /= SQR_OK) then
-            write(*,'(a,i0)') 'update failed: no such row ', rid
-            rv%errored = .true.
-            return
-        end if
-        set_text: do i = 1, db%tables(ti)%ncols
-            if (db%tables(ti)%cols(i)%dtype /= DT_TEXT) cycle set_text
+        call row_alloc(buf, db%tables(ti)%record_size)
+        do i = 1, db%tables(ti)%ncols
             nd = args%get(i + 1)
-            if (tok_is_null(nd)) cycle set_text   ! left NULL, no blob write
-            call db_set_text(db, ctx, rid, trim(db%tables(ti)%cols(i)%name), &
-                             node_as_char(nd), rs)
-            if (rs /= SQR_OK) then
-                write(*,'(a)') 'set_text failed'
-                rv%errored = .true.
+            if (.not. decode_value(nd, db%tables(ti)%cols(i), i, buf, rv)) return
+        end do
+        write(num, '(i0)') rid
+        call db_begin(db, rs)
+        if (rs /= SQR_OK) then
+            call fail(rv, with_reason('update failed', engine_reason()))
+            return
+        end if
+        one_step: block
+            call db_update(db, ctx, rid, buf, rs)
+            if (rs == SQR_NOT_FOUND) then
+                call db_rollback(db, rs)
+                if (rs /= SQR_OK) then
+                    call fail(rv, with_reason('rollback failed', engine_reason()))
+                else
+                    call fail(rv, 'update failed: no such row ' // trim(num))
+                end if
                 return
             end if
-        end do set_text
-        write(*,'(a,i0)') 'updated row ', rid
+            if (rs /= SQR_OK) exit one_step
+            call write_texts(ti, ctx, rid, args, 1, rs)
+            if (rs /= SQR_OK) exit one_step
+            call db_commit(db, rs)     ! a failed commit has rolled back
+            if (rs /= SQR_OK) then
+                call fail(rv, with_reason('update failed', engine_reason()))
+                return
+            end if
+            write(*,'(a,i0)') 'updated row ', rid
+            return
+        end block one_step
+        call abandon(rv, 'update failed')
     end function
 
     ! db_scan callback for `select`: prints each live row. The table index
@@ -658,6 +782,7 @@ contains
         if (.not. require_ctx_table(ctx, ti, rv)) return
         call print_header(ti)
         call db_scan(db, ctx, select_emit_cb, ti, rs)
+        if (rs /= SQR_OK) call fail(rv, with_reason('scan failed', engine_reason()))
     end function
 
     function act_get(args, ctx) result(rv)
@@ -671,20 +796,21 @@ contains
         logical :: ok
         if (.not. require_ctx_table(ctx, ti, rv)) return
         if (args%size() /= 1) then
-            write(*,'(a)') 'usage: get <row_id>'
+            call fail(rv, 'usage: get <row_id>')
             return
         end if
         n = args%get(1); rid = node_as_int(n, ok)
         if (.not. ok) then
-            write(*,'(a)') 'row_id must be an integer'
-            rv%errored = .true.
+            call fail(rv, 'row_id must be an integer')
             return
         end if
         call row_alloc(buf, db%tables(ti)%record_size)
         call db_get(db, ctx, rid, buf, rs)
-        if (rs /= SQR_OK) then
-            write(*,'(a,i0)') 'no such row: ', rid
-            rv%errored = .true.
+        if (rs == SQR_NOT_FOUND) then
+            call fail(rv, 'no such row: ' // int_text(rid))
+            return
+        else if (rs /= SQR_OK) then
+            call fail(rv, with_reason('get failed', engine_reason()))
             return
         end if
         call print_header(ti)
@@ -701,19 +827,20 @@ contains
         logical :: ok
         if (.not. require_ctx_table(ctx, ti, rv)) return
         if (args%size() /= 1) then
-            write(*,'(a)') 'usage: delete <row_id>'
+            call fail(rv, 'usage: delete <row_id>')
             return
         end if
         n = args%get(1); rid = node_as_int(n, ok)
         if (.not. ok) then
-            write(*,'(a)') 'row_id must be an integer'
-            rv%errored = .true.
+            call fail(rv, 'row_id must be an integer')
             return
         end if
         call db_delete(db, ctx, rid, rs)
-        if (rs /= SQR_OK) then
-            write(*,'(a,i0)') 'no such row: ', rid
-            rv%errored = .true.
+        if (rs == SQR_NOT_FOUND) then
+            call fail(rv, 'no such row: ' // int_text(rid))
+            return
+        else if (rs /= SQR_OK) then
+            call fail(rv, with_reason('delete failed', engine_reason()))
             return
         end if
         write(*,'(a,i0)') 'deleted row ', rid
@@ -726,13 +853,12 @@ contains
         integer :: ti, rs
         if (.not. require_ctx_table(ctx, ti, rv)) return
         if (args%size() /= 0) then
-            write(*,'(a)') 'usage: compact'
+            call fail(rv, 'usage: compact')
             return
         end if
         call db_compact(db, ctx, rs)
         if (rs /= SQR_OK) then
-            write(*,'(a)') 'compact failed'
-            rv%errored = .true.
+            call fail(rv, with_reason('compact failed', engine_reason()))
             return
         end if
         write(*,'(a,i0,a)') 'compacted ', db%tables(ti)%live_count, ' live rows'
@@ -746,7 +872,7 @@ contains
         character(len=SQR_ERRMSG_LEN) :: emsg
         if (.not. require_ctx_table(ctx, ti, rv)) return
         if (args%size() /= 0) then
-            write(*,'(a)') 'usage: verify'
+            call fail(rv, 'usage: verify')
             return
         end if
         emsg = ''
@@ -754,8 +880,7 @@ contains
         if (rs == SQR_OK) then
             write(*,'(a)') 'verify: OK'
         else
-            write(*,'(a)') 'verify: FAILED — ' // trim(emsg)
-            rv%errored = .true.
+            call fail(rv, 'verify: FAILED — ' // trim(emsg))
         end if
     end function
 
@@ -769,7 +894,7 @@ contains
         if (.not. require_ctx_table(ctx, ti, rv)) return
         nargs = args%size()
         if (nargs < 1) then
-            write(*,'(a)') 'usage: dropindex <col> [<col> ...]'
+            call fail(rv, 'usage: dropindex <col> [<col> ...]')
             return
         end if
         allocate(cols(nargs))
@@ -779,8 +904,7 @@ contains
         end do
         call db_drop_index(db, ctx, cols, rs)
         if (rs /= SQR_OK) then
-            write(*,'(a)') 'dropindex: no index over those columns'
-            rv%errored = .true.
+            call fail(rv, 'dropindex: no index over those columns')
             return
         end if
         write(*,'(a)') 'index dropped'
@@ -797,16 +921,12 @@ contains
         character(len=SQR_ERRMSG_LEN) :: emsg
         logical :: ok
         if (.not. require_ctx_table(ctx, ti, rv)) return
-        call parse_col_spec(args, 1, 'addcolumn', col, ok)
-        if (.not. ok) then
-            rv%errored = .true.
-            return
-        end if
+        call parse_col_spec(args, 1, 'addcolumn', col, ok, rv)
+        if (.not. ok) return
         emsg = ''
         call db_add_column(db, ctx, col, rs, emsg)
         if (rs /= SQR_OK) then
-            write(*,'(2a)') 'addcolumn failed: ', trim(emsg)
-            rv%errored = .true.
+            call fail(rv, 'addcolumn failed: ' // trim(emsg))
             return
         end if
         write(*,'(5a)') 'added column ', trim(col%name), &
@@ -825,15 +945,14 @@ contains
         character(len=SQR_ERRMSG_LEN) :: emsg
         if (.not. require_ctx_table(ctx, ti, rv)) return
         if (args%size() /= 1) then
-            write(*,'(a)') 'usage: dropcolumn <name>'
+            call fail(rv, 'usage: dropcolumn <name>')
             return
         end if
         n = args%get(1); cname = node_as_char(n)
         emsg = ''
         call db_drop_column(db, ctx, cname, rs, emsg)
         if (rs /= SQR_OK) then
-            write(*,'(2a)') 'dropcolumn failed: ', trim(emsg)
-            rv%errored = .true.
+            call fail(rv, 'dropcolumn failed: ' // trim(emsg))
             return
         end if
         write(*,'(2a)') 'dropped column ', trim(cname)
@@ -849,14 +968,14 @@ contains
         logical :: uniq
         nargs = args%size()
         if (nargs < 1) then
-            write(*,'(a)') 'usage: index [unique] <col> [<col> ...]'
+            call fail(rv, 'usage: index [unique] <col> [<col> ...]')
             return
         end if
         n = args%get(1)
         uniq  = trim(node_as_char(n)) == 'unique'
         first = merge(2, 1, uniq)
         if (nargs < first) then
-            write(*,'(a)') 'usage: index [unique] <col> [<col> ...]'
+            call fail(rv, 'usage: index [unique] <col> [<col> ...]')
             return
         end if
         allocate(cols(nargs - first + 1))
@@ -866,8 +985,7 @@ contains
         end do
         call db_create_index(db, ctx, cols, rs, unique=uniq)
         if (rs /= SQR_OK) then
-            write(*,'(a)') 'create_index failed'
-            rv%errored = .true.
+            call fail(rv, with_reason('create_index failed', engine_reason()))
             return
         end if
         write(*,'(a,i0,a)') 'indexed ', size(cols), ' column(s)'
@@ -875,63 +993,40 @@ contains
 
     ! Build a row-shaped buffer with just the key columns set, plus the
     ! ordered member-name array, from `col v` pairs. ti must be valid.
-    subroutine parse_key_pairs(ti, args, buf, cols, ok)
-        integer,                                  intent(in)  :: ti
-        type(dlist_t),                            intent(in)  :: args
-        character(len=:),            allocatable, intent(out) :: buf
-        character(len=SQR_NAME_LEN), allocatable, intent(out) :: cols(:)
-        logical,                                  intent(out) :: ok
+    subroutine parse_key_pairs(ti, args, buf, cols, ok, rv)
+        integer,                                  intent(in)    :: ti
+        type(dlist_t),                            intent(in)    :: args
+        character(len=:),            allocatable, intent(out)   :: buf
+        character(len=SQR_NAME_LEN), allocatable, intent(out)   :: cols(:)
+        logical,                                  intent(out)   :: ok
+        type(action_result_t),                    intent(inout) :: rv
         class(dlist_node_data_t), allocatable :: nc, nv
         integer :: np, p, ci
-        integer(int32) :: ival
-        real(real64)   :: rval
-        logical :: cvt
         ok = .false.
         if (mod(args%size(), 2) /= 0 .or. args%size() < 2) then
-            write(*,'(a)') 'usage: <col> <value> [<col> <value> ...]'
+            call fail(rv, 'usage: <col> <value> [<col> <value> ...]')
             return
         end if
         np = args%size() / 2
         allocate(cols(np))
-        associate (t => db%tables(ti))
-            call row_alloc(buf, t%record_size)
-            do p = 1, np
-                nc = args%get(2*p - 1)
-                nv = args%get(2*p)
-                cols(p) = node_as_char(nc)
-                ci = shell_col_index(ti, cols(p))
-                if (ci == 0) then
-                    write(*,'(2a)') 'no such column: ', trim(cols(p))
-                    return
-                end if
-                associate (c => t%cols(ci))
-                    select case (c%dtype)
-                    case (DT_INT)
-                        ival = node_as_int(nv, cvt)
-                        if (.not. cvt) then
-                            write(*,'(a)') 'value must be an integer'
-                            return
-                        end if
-                        call row_set_int(buf, c, ival)
-                    case (DT_REAL)
-                        rval = node_as_real(nv, cvt)
-                        if (.not. cvt) then
-                            write(*,'(a)') 'value must be a number'
-                            return
-                        end if
-                        call row_set_real(buf, c, rval)
-                    case (DT_CHAR)
-                        call row_set_char(buf, c, node_as_char(nv))
-                    case default
-                        write(*,'(a)') 'key column type not supported'
-                        return
-                    end select
-                end associate
-            end do
-        end associate
+        call row_alloc(buf, db%tables(ti)%record_size)
+        do p = 1, np
+            nc = args%get(2*p - 1)
+            nv = args%get(2*p)
+            cols(p) = node_as_char(nc)
+            ci = shell_col_index(ti, cols(p))
+            if (ci == 0) then
+                call fail(rv, 'no such column: ' // trim(cols(p)))
+                return
+            end if
+            if (.not. decode_value(nv, db%tables(ti)%cols(ci), 0, buf, rv)) return
+        end do
         ok = .true.
     end subroutine
 
+    ! getk and delk: the key must be that of a unique index over exactly
+    ! those columns; it is tested first, since the engine's status for "no
+    ! such index" and "no such row" can be the same.
     function act_getk(args, ctx) result(rv)
         type(dlist_t),    intent(in) :: args
         character(len=*), intent(in) :: ctx
@@ -942,16 +1037,19 @@ contains
         integer(int32) :: rid
         logical :: ok
         if (.not. require_ctx_table(ctx, ti, rv)) return
-        call parse_key_pairs(ti, args, keyrow, cols, ok)
-        if (.not. ok) then
-            rv%errored = .true.
+        call parse_key_pairs(ti, args, keyrow, cols, ok, rv)
+        if (.not. ok) return
+        if (.not. has_unique_index(ti, cols)) then
+            call fail(rv, 'no unique index over those columns')
             return
         end if
         call row_alloc(buf, db%tables(ti)%record_size)
         call db_get_by_key(db, ctx, cols, keyrow, buf, rs, row_id=rid)
-        if (rs /= SQR_OK) then
-            write(*,'(a)') 'no row for that key'
-            rv%errored = .true.
+        if (rs == SQR_NOT_FOUND) then
+            call fail(rv, 'no row for that key')
+            return
+        else if (rs /= SQR_OK) then
+            call fail(rv, with_reason('getk failed', engine_reason()))
             return
         end if
         call print_header(ti)
@@ -967,20 +1065,25 @@ contains
         integer :: ti, rs
         logical :: ok
         if (.not. require_ctx_table(ctx, ti, rv)) return
-        call parse_key_pairs(ti, args, keyrow, cols, ok)
-        if (.not. ok) then
-            rv%errored = .true.
+        call parse_key_pairs(ti, args, keyrow, cols, ok, rv)
+        if (.not. ok) return
+        if (.not. has_unique_index(ti, cols)) then
+            call fail(rv, 'no unique index over those columns')
             return
         end if
         call db_delete_by_key(db, ctx, cols, keyrow, rs)
-        if (rs /= SQR_OK) then
-            write(*,'(a)') 'no row for that key'
-            rv%errored = .true.
+        if (rs == SQR_NOT_FOUND) then
+            call fail(rv, 'no row for that key')
+            return
+        else if (rs /= SQR_OK) then
+            call fail(rv, with_reason('delk failed', engine_reason()))
             return
         end if
         write(*,'(a)') 'deleted by key'
     end function
 
+    ! find: the value is checked against the column, then the column must
+    ! lead an index (as for range), then `no match` means just that.
     function act_find(args, ctx) result(rv)
         type(dlist_t),    intent(in) :: args
         character(len=*), intent(in) :: ctx
@@ -993,49 +1096,54 @@ contains
         logical :: ok
         if (.not. require_ctx_table(ctx, ti, rv)) return
         if (args%size() /= 2) then
-            write(*,'(a)') 'usage: find <col> <value>'
+            call fail(rv, 'usage: find <col> <value>')
             return
         end if
         nc = args%get(1); col = node_as_char(nc)
         ci = shell_col_index(ti, col)
         if (ci == 0) then
-            write(*,'(2a)') 'no such column: ', trim(col)
-            rv%errored = .true.
+            call fail(rv, 'no such column: ' // trim(col))
             return
         end if
         nv = args%get(2)
-        select case (db%tables(ti)%cols(ci)%dtype)
-        case (DT_INT)
-            ival = node_as_int(nv, ok)
-            if (.not. ok) then
-                write(*,'(a)') 'value must be an integer'
-                rv%errored = .true.
+        associate (c => db%tables(ti)%cols(ci))
+            select case (c%dtype)
+            case (DT_INT)
+                ival = node_as_int(nv, ok)
+                if (.not. ok) call fail(rv, 'value must be an integer')
+            case (DT_REAL)
+                rval = node_as_real(nv, ok)
+                if (.not. ok) call fail(rv, 'value must be a number')
+            case (DT_CHAR)
+                ok = char_fits(c, node_as_char(nv), rv)
+            case default
+                ok = .false.
+                call fail(rv, 'find on this column type not supported')
+            end select
+            if (.not. ok) return
+            if (leading_index(ti, col) == 0) then
+                call fail(rv, 'no index on that column')
                 return
             end if
-            call db_find_by_int(db, ctx, col, ival, rid, rs)
-        case (DT_REAL)
-            rval = node_as_real(nv, ok)
-            if (.not. ok) then
-                write(*,'(a)') 'value must be a number'
-                rv%errored = .true.
-                return
-            end if
-            call db_find_by_real(db, ctx, col, rval, rid, rs)
-        case (DT_CHAR)
-            call db_find_by_char(db, ctx, col, node_as_char(nv), rid, rs)
-        case default
-            write(*,'(a)') 'find on this column type not supported'
-            rv%errored = .true.
+            select case (c%dtype)
+            case (DT_INT);  call db_find_by_int(db, ctx, col, ival, rid, rs)
+            case (DT_REAL); call db_find_by_real(db, ctx, col, rval, rid, rs)
+            case default;   call db_find_by_char(db, ctx, col, node_as_char(nv), rid, rs)
+            end select
+        end associate
+        if (rs == SQR_NOT_FOUND) then
+            call fail(rv, 'no match')
             return
-        end select
-        if (rs /= SQR_OK) then
-            write(*,'(a)') 'no match'
-            rv%errored = .true.
+        else if (rs /= SQR_OK) then
+            call fail(rv, with_reason('find failed', engine_reason()))
             return
         end if
         call row_alloc(buf, db%tables(ti)%record_size)
         call db_get(db, ctx, rid, buf, rs)
-        if (rs /= SQR_OK) return          ! found id but row unreadable
+        if (rs /= SQR_OK) then
+            call fail(rv, with_reason('find failed', engine_reason()))
+            return
+        end if
         call print_header(ti)
         call print_row(ti, rid, buf)
     end function
@@ -1056,14 +1164,13 @@ contains
         type(db_cursor_t) :: cur
         if (.not. require_ctx_table(ctx, ti, rv)) return
         if (args%size() /= 3) then
-            write(*,'(a)') 'usage: range <col> <lo> <hi>'
+            call fail(rv, 'usage: range <col> <lo> <hi>')
             return
         end if
         nc = args%get(1); col = node_as_char(nc)
         ci = shell_col_index(ti, col)
         if (ci == 0) then
-            write(*,'(2a)') 'no such column: ', trim(col)
-            rv%errored = .true.
+            call fail(rv, 'no such column: ' // trim(col))
             return
         end if
         nlo = args%get(2); nhi = args%get(3)
@@ -1071,29 +1178,25 @@ contains
         case (DT_INT)
             ilo = node_as_int(nlo, oklo); ihi = node_as_int(nhi, okhi)
             if (.not. (oklo .and. okhi)) then
-                write(*,'(a)') 'bounds must be integers'
-                rv%errored = .true.
+                call fail(rv, 'bounds must be integers')
                 return
             end if
             call db_find_range(db, ctx, col, ilo, ihi, cur, rs)
         case (DT_REAL)
             rlo = node_as_real(nlo, oklo); rhi = node_as_real(nhi, okhi)
             if (.not. (oklo .and. okhi)) then
-                write(*,'(a)') 'bounds must be numbers'
-                rv%errored = .true.
+                call fail(rv, 'bounds must be numbers')
                 return
             end if
             call db_find_range(db, ctx, col, rlo, rhi, cur, rs)
         case (DT_CHAR)
             call db_find_range(db, ctx, col, node_as_char(nlo), node_as_char(nhi), cur, rs)
         case default
-            write(*,'(a)') 'range on this column type not supported'
-            rv%errored = .true.
+            call fail(rv, 'range on this column type not supported')
             return
         end select
         if (rs /= SQR_OK) then
-            write(*,'(a)') 'no index on that column'
-            rv%errored = .true.
+            call fail(rv, 'no index on that column')
             return
         end if
         call row_alloc(buf, db%tables(ti)%record_size)
@@ -1102,8 +1205,7 @@ contains
         pull: do
             call db_cursor_next(db, cur, rid, buf, ok, rs)
             if (rs /= SQR_OK) then          ! I/O error / invalidated cursor
-                write(*,'(a)') 'error reading range'
-                rv%errored = .true.
+                call fail(rv, with_reason('error reading range', engine_reason()))
                 return
             end if
             if (.not. ok) exit pull
@@ -1115,13 +1217,22 @@ contains
 
     ! ---- row printing ----
 
+    ! One field of the row display: two blanks, then the text right-justified
+    ! in FIELD_WIDTH characters; a longer text is written in full and the
+    ! rest of the line moves right.
+    subroutine put_field(text)
+        character(len=*), intent(in) :: text
+        write(*,'(a)', advance='no') '  ' // &
+            repeat(' ', max(0, FIELD_WIDTH - char_count(text))) // text
+    end subroutine
+
     subroutine print_header(ti)
         integer, intent(in) :: ti
         integer :: i
         write(*,'(a8)', advance='no') 'row_id'
         do i = 1, db%tables(ti)%ncols
             associate (c => db%tables(ti)%cols(i))
-                write(*,'(2x,a16)', advance='no') trim(c%name)
+                call put_field(trim(c%name))
             end associate
         end do
         write(*,*)
@@ -1136,16 +1247,16 @@ contains
         do i = 1, db%tables(ti)%ncols
             associate (c => db%tables(ti)%cols(i))
                 if (row_is_null(buf, c)) then
-                    write(*,'(2x,a16)', advance='no') 'NULL'
+                    call put_field('NULL')
                     cycle
                 end if
                 select case (c%dtype)
                 case (DT_INT)
                     write(*,'(2x,i16)', advance='no') row_get_int(buf, c)
                 case (DT_REAL)
-                    write(*,'(2x,a16)', advance='no') real_text(row_get_real(buf, c))
+                    call put_field(real_text(row_get_real(buf, c)))
                 case (DT_CHAR)
-                    write(*,'(2x,a16)', advance='no') trim(row_get_char(buf, c))
+                    call put_field(trim(row_get_char(buf, c)))
                 case (DT_TEXT)
                     get_text: block
                         character(len=:), allocatable :: tv
@@ -1163,21 +1274,27 @@ end module sqrsh_actions
 
 
 program sqrsh
-    use, intrinsic :: iso_fortran_env, only: error_unit
+    use, intrinsic :: iso_fortran_env, only: output_unit, error_unit, iostat_end
     use cmdgraph
     use sqr
     use sqrsh_state
     use sqrsh_actions
     use sqrsh_extras, only: add_extra_commands
-    use :: clib_wrap, only: c_exit
+    use :: clib_wrap, only: c_exit, c_isatty_stdin
     implicit none
+
+    ! The prompt of each state, written only when input is a terminal.
+    character(len=*), parameter :: PROMPT_ROOT    = 'sqr> '
+    character(len=*), parameter :: PROMPT_CREATOR = 'cols> '
+    character(len=*), parameter :: PROMPT_TABLE   = 'row> '
 
     type(engine_t) :: ui
     character(len=SQR_MAX_DIR) :: arg
-    integer :: run_stat
+    logical :: interactive
+    logical :: any_failed = .false.   ! a command, the start-up open or the encoding failed: status 1
 
     ! root state — database-level commands
-    call ui%add_state("root", prompt="sqr> ")
+    call ui%add_state("root", prompt=PROMPT_ROOT)
     call ui%add_command("root", "o(pen)",   EDGE_ACTION, proc=act_open,   help="open <directory>")
     call ui%add_command("root", "cl(ose)",  EDGE_ACTION, proc=act_close,  help="close database")
     call ui%add_command("root", "readonly", EDGE_ACTION, proc=act_readonly, &
@@ -1194,7 +1311,7 @@ program sqrsh
     call ui%add_command("root", "q(uit)",   EDGE_QUIT,                    help="exit")
 
     ! creator state — defining a new table's columns
-    call ui%add_state("creator", prompt="cols> ")
+    call ui%add_state("creator", prompt=PROMPT_CREATOR)
     call ui%add_command("creator", "col",     EDGE_ACTION,  proc=act_col,  &
                         help="col <name> int | real | text | char <N>")
     call ui%add_command("creator", "done",    EDGE_DO_POP,  proc=act_done, &
@@ -1203,7 +1320,7 @@ program sqrsh
     call ui%add_command("creator", "q(uit)",  EDGE_QUIT,                   help="exit")
 
     ! table-bound state — operations on a selected table (name in ctx)
-    call ui%add_state("table", prompt="row> ")
+    call ui%add_state("table", prompt=PROMPT_TABLE)
     call ui%add_command("table", "i(nsert)", EDGE_ACTION, proc=act_insert, &
                         help="insert <v1> <v2> ... (one per column)")
     call ui%add_command("table", "u(pdate)", EDGE_ACTION, proc=act_update, &
@@ -1217,7 +1334,7 @@ program sqrsh
          help="addcolumn <name> int | real | text | char <N>")
     call ui%add_command("table", "dropcolumn", EDGE_ACTION, proc=act_dropcolumn, &
          help="dropcolumn <name> (CASCADEs dependent indices)")
-    call ui%add_command("table", "in(dex)",  EDGE_ACTION, proc=act_index, &
+    call ui%add_command("table", "ind(ex)",  EDGE_ACTION, proc=act_index, &
          help="index [unique] <col> [<col> ...]")
     call ui%add_command("table", "dropindex", EDGE_ACTION, proc=act_dropindex, &
          help="dropindex <col> [<col> ...] (remove a secondary index)")
@@ -1250,19 +1367,88 @@ program sqrsh
         call open_initial(trim(arg))
     end if
 
-    write(*,'(a)') 'sqr shell — type `help` for commands'
-    call ui%run(stat=run_stat)
+    interactive = c_isatty_stdin()
+    if (interactive) write(output_unit,'(a)') 'sqr shell — type `help` for commands'
+    call read_loop()
 
     if (db%opened) call db_close(db)
-
-    ! Input in an encoding cmdgraph does not read (it has said which, on
-    ! stderr): end with status 1 so a script runner can tell.
-    if (run_stat == RUN_BAD_ENCODING) then
-        flush(error_unit)
-        call c_exit(1)
-    end if
+    call quit(merge(1, 0, any_failed))
 
 contains
+
+    !! Read and dispatch lines until `quit` or the end of the input, as
+    !! cmdgraph's own `run` does but with whole lines, prompts only at a
+    !! terminal, and every failed command remembered for the exit status.
+    !! The first line loses a UTF-8 byte-order mark and is screened for
+    !! another encoding's signature; every line is screened for NUL bytes
+    !! (a wide encoding without a mark).  A refused encoding ends the loop.
+    subroutine read_loop()
+        character(len=:), allocatable :: line
+        logical :: first
+        integer :: enc, rc
+        first = .true.
+        lines: do while (ui%is_running())
+            if (interactive) then
+                write(output_unit,'(a)', advance='no') prompt_now()
+                flush(output_unit)
+            end if
+            call read_line(line)
+            if (.not. allocated(line)) exit lines
+            if (first) then
+                call strip_bom(line, enc)
+            else
+                enc = merge(ENC_WIDE_NO_BOM, ENC_PLAIN, index(line, achar(0)) > 0)
+            end if
+            first = .false.
+            if (.not. encoding_supported(enc)) then
+                write(error_unit,'(a)') 'unsupported encoding (' // encoding_name(enc) // &
+                                        '); expected ASCII or UTF-8'
+                any_failed = .true.
+                exit lines
+            end if
+            rc = ui%dispatch(trim(line))
+            if (rc == RC_UNKNOWN .or. rc == RC_AMBIGUOUS .or. rc == RC_ERROR) any_failed = .true.
+        end do lines
+    end subroutine
+
+    !! The prompt of the current state.
+    function prompt_now() result(p)
+        character(len=:), allocatable :: p
+        select case (ui%current_state())
+        case ('creator'); p = PROMPT_CREATOR
+        case ('table');   p = PROMPT_TABLE
+        case default;     p = PROMPT_ROOT
+        end select
+    end function
+
+    !! Read one line of any length from standard input into `line`; leaves
+    !! it unallocated at the end of the input.
+    subroutine read_line(line)
+        character(len=:), allocatable, intent(out) :: line
+        integer, parameter :: CHUNK_LEN = 512   ! bytes read per non-advancing read
+        character(len=CHUNK_LEN) :: chunk
+        integer :: ios, n
+        line = ''
+        do
+            read(*, '(a)', advance='no', size=n, iostat=ios) chunk
+            if (n > 0) line = line // chunk(1:n)
+            if (ios == iostat_end) then
+                if (len(line) == 0) deallocate(line)   ! true end, nothing buffered
+                return
+            end if
+            if (is_iostat_eor(ios)) return             ! end of record: done
+            if (ios /= 0) return                       ! other error: take what we have
+        end do
+    end subroutine
+
+    !! End the process with `code`, both streams flushed first (c_exit is the
+    !! C library's exit, which knows nothing of Fortran's buffers).
+    subroutine quit(code)
+        integer, intent(in) :: code
+        flush(output_unit)
+        flush(error_unit)
+        call c_exit(code)
+    end subroutine
 
     subroutine open_initial(dir)
         character(len=*), intent(in) :: dir
@@ -1271,9 +1457,10 @@ contains
         emsg = ''
         call db_open(db, dir, rs, emsg)
         if (rs /= SQR_OK) then
-            write(*,'(4a)') 'open ', dir, ' failed: ', trim(emsg)
+            write(error_unit,'(a)') 'open ' // dir // ' failed: ' // trim(emsg)
+            any_failed = .true.
         else
-            write(*,'(3a,i0,a)') 'opened ', dir, ' (', db%ntables, ' tables)'
+            write(output_unit,'(3a,i0,a)') 'opened ', dir, ' (', db%ntables, ' tables)'
         end if
     end subroutine
 

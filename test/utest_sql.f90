@@ -53,6 +53,7 @@ program utest_sql
     call test_errmsg_content()
     call test_render()
     call test_render_display()
+    call test_char_count()
     call test_functional_example()
     call test_strip_bom()
     call test_encodings()
@@ -2004,6 +2005,16 @@ contains
         call check(all(at == at(1)) .and. at(1) > 0, &
                    'display: second column starts at the same character on every line')
         call db_close(db)
+    end subroutine
+
+    ! char_count, public for sqrsh's row display (R20): characters, not bytes
+    ! and not display cells.
+    subroutine test_char_count()
+        call check(char_count('') == 0,         'char_count: empty')
+        call check(char_count('abc') == 3,      'char_count: ASCII')
+        call check(char_count('é') == 1 .and. len('é') == 2, 'char_count: two-byte character counts one')
+        call check(char_count('a€b') == 3,      'char_count: three-byte character counts one')
+        call check(char_count('日本') == 2,      'char_count: wide characters count one each')
     end subroutine
 
     ! The characters in UTF-8 text: its bytes that are not continuation bytes.

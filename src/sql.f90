@@ -273,6 +273,7 @@ module sql
     public :: sql_exec     !! statement AST -> result (drives the engine)
     public :: sql_run      !! source line  -> result (lex + parse + exec)
     public :: sql_render   !! result        -> printed to a unit (the REPL renderer)
+    public :: char_count   !! UTF-8 text    -> its number of characters (display width)
 
     interface
         !! Classify the start of an input stream by its leading bytes and
@@ -401,6 +402,15 @@ module sql
             character(len=*),  intent(inout), optional :: errmsg  !! Failure detail
             logical,           intent(in),   optional  :: binary_cells  !! Native-byte INT/REAL cells (default text)
         end subroutine
+
+        !! The number of characters in UTF-8 text: its bytes that are not
+        !! continuation bytes (`10xxxxxx`).  A wide or combining character
+        !! still counts one.  The row display of `sql_render` and of `sqrsh`
+        !! pads by it.
+        pure module function char_count(s) result(n)
+            character(len=*), intent(in) :: s  !! UTF-8 text
+            integer :: n  !! Characters in it
+        end function
 
         !! Render a result to a formatted unit: an aligned table for a SELECT,
         !! a `"N row(s)"` line for DML, or the message for DDL.  Columns are
