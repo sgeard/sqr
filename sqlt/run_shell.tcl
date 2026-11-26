@@ -172,6 +172,24 @@ namespace eval shelltest {
         check {[regexp {10\s+12\s} $out] && ![regexp -line {^(2|3|11) *$} $out]} "txn fail: final rows are 10 and 12"
     }
 
+    # LIKE on a value near the widest CHAR column: the answer comes back and
+    # the shell is still running afterwards (it once ran out of stack).
+    proc t_like_long {} {
+        set db [fresh_db likelong]
+        set sql ".open $db\nCREATE TABLE w(id INTEGER, c CHAR(65000))\n"
+        append sql "INSERT INTO w VALUES(11,'[string repeat a 60000]')\n"
+        append sql "INSERT INTO w VALUES(22,'[string repeat a 59999]b')\n"
+        append sql "SELECT id FROM w WHERE c LIKE '%a'\n"
+        append sql "SELECT id FROM w WHERE c LIKE '%a%a%a%a%a%b'\n"
+        append sql "SELECT COUNT(*) FROM w\n.quit\n"
+        set r [run [utf8 $sql]]
+        set out [dict get $r out]
+        check {[dict get $r status] == 0}                     "like long: exit status 0"
+        check {[regexp -all -line {^11 *$} $out] == 1}        "like long: % then a literal finds one row, once"
+        check {[regexp -all -line {^22 *$} $out] == 1}        "like long: several % find the other row, once"
+        check {[regexp {(?w)^11 *$.*^22 *$.*^2 *$} $out]}     "like long: in that order, and the shell answers the next statement"
+    }
+
     # A table name beginning with '_' is the engine's: CREATE TABLE _journal
     # is refused, and the database is still there on the next start.
     proc t_reserved_name {} {
@@ -411,6 +429,7 @@ namespace eval shelltest {
             t_txn_fail
             t_reserved_name
             t_table_names
+            t_like_long
             t_readonly_counters
             t_pack_too_large
             t_utf8_bom

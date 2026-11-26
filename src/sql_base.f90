@@ -131,62 +131,73 @@ contains
         character(len=1), intent(in), optional :: esc
         logical                                :: yes
         if (present(esc)) then
-            yes = like_from(s, pattern, 1, 1, 0, 0, esc, .true.)
+            yes = like_match(s, pattern, esc, .true.)
         else
-            yes = like_from(s, pattern, 1, 1, 0, 0, ' ', .false.)
+            yes = like_match(s, pattern, ' ', .false.)
         end if
     end function
 
-    ! Match s(i:) against p(j:).  (bi, bj) is the restart point left by the
-    ! last `%`: the pattern position after it and the string position it
-    ! has consumed up to (bj = 0: no `%` seen yet).  A mismatch lets that
-    ! `%` take one more character and tries again, so every call is a tail
-    ! call and nothing is allocated.
-    pure recursive function like_from(s, p, i, j, bi, bj, esc, has_esc) result(yes)
+    ! Match all of s against all of p.  (i, j) is the position in the
+    ! string and the pattern; (bi, bj) is the restart point left by the last
+    ! `%`: the string position it has consumed up to and the pattern
+    ! position after it (bj = 0: no `%` seen yet).  A mismatch lets that `%`
+    ! take one more character and tries again.  It is a loop, not a
+    ! recursion, so the depth of the stack does not depend on the length of
+    ! the value; nothing is allocated.
+    pure function like_match(s, p, esc, has_esc) result(yes)
         character(len=*), intent(in) :: s, p
-        integer,          intent(in) :: i, j, bi, bj
         character(len=1), intent(in) :: esc
         logical,          intent(in) :: has_esc
         logical :: yes
-        integer :: nb
+        integer :: i, j, bi, bj
 
-        if (j > len(p)) then
-            if (i > len(s)) then
-                yes = .true.
-                return
-            end if
-        else if (has_esc .and. p(j:j) == esc .and. j < len(p)) then
-            ! escaped: the next pattern byte is literal
-            if (i <= len(s)) then
-                if (s(i:i) == p(j+1:j+1)) then
-                    yes = like_from(s, p, i + 1, j + 2, bi, bj, esc, has_esc)
-                    return
+        i = 1
+        j = 1
+        bi = 0
+        bj = 0
+        yes = .false.
+        walk: do
+            step: if (j > len(p)) then
+                if (i > len(s)) then
+                    yes = .true.
+                    exit walk
                 end if
-            end if
-        else if (p(j:j) == '%') then
-            if (j == len(p)) then
-                yes = .true.             ! a trailing % takes the rest
-            else
-                yes = like_from(s, p, i, j + 1, i, j + 1, esc, has_esc)
-            end if
-            return
-        else if (i <= len(s)) then
-            if (p(j:j) == '_') then
-                yes = like_from(s, p, i + utf8_width(s, i), j + 1, bi, bj, esc, has_esc)
-                return
-            else if (s(i:i) == p(j:j)) then
-                yes = like_from(s, p, i + 1, j + 1, bi, bj, esc, has_esc)
-                return
-            end if
-        end if
+            else if (has_esc .and. p(j:j) == esc .and. j < len(p)) then
+                ! escaped: the next pattern byte is literal
+                if (i <= len(s)) then
+                    if (s(i:i) == p(j+1:j+1)) then
+                        i = i + 1
+                        j = j + 2
+                        cycle walk
+                    end if
+                end if
+            else if (p(j:j) == '%') then
+                if (j == len(p)) then
+                    yes = .true.         ! a trailing % takes the rest
+                    exit walk
+                end if
+                j = j + 1
+                bi = i
+                bj = j
+                cycle walk
+            else if (i <= len(s)) then
+                if (p(j:j) == '_') then
+                    i = i + utf8_width(s, i)
+                    j = j + 1
+                    cycle walk
+                else if (s(i:i) == p(j:j)) then
+                    i = i + 1
+                    j = j + 1
+                    cycle walk
+                end if
+            end if step
 
-        ! Mismatch: give the last % one more character, if there is one.
-        if (bj == 0 .or. bi > len(s)) then
-            yes = .false.
-        else
-            nb = bi + utf8_width(s, bi)
-            yes = like_from(s, p, nb, bj, nb, bj, esc, has_esc)
-        end if
+            ! Mismatch: give the last % one more character, if there is one.
+            if (bj == 0 .or. bi > len(s)) exit walk
+            bi = bi + utf8_width(s, bi)
+            i = bi
+            j = bj
+        end do walk
     end function
 
     ! Bytes in the UTF-8 character that starts at s(i:i): a lead byte and

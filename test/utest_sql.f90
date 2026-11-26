@@ -772,6 +772,33 @@ contains
         call check(sql_like('a_b', 'a!_b', '!') .and. .not. sql_like('axb', 'a!_b', '!'), 'like: escaped _')
         call check(sql_like('a!b', 'a!!b', '!') .and. sql_like('100%!', '%!%!!', '!'), 'like: escaped escape')
         call check(sql_like('a!b', 'a!b') .and. sql_like('a\b', 'a\b'), 'like: no escape unless asked')
+
+        ! Long values: the matcher must not use stack in proportion to them.
+        long: block
+            integer, parameter :: N(2) = [60000, 1000000]
+            character(len=:), allocatable :: v
+            character(len=7) :: tag
+            integer :: k
+            do k = 1, size(N)
+                v = repeat('a', N(k))
+                write (tag, '(i0)') N(k)
+                call check(sql_like(v, '%a') .and. sql_like(v, 'a%') .and. sql_like(v, '%a%'), &
+                           'like long ' // trim(tag) // ': % at start, end, both')
+                call check(.not. sql_like(v, '%b') .and. .not. sql_like(v, 'b%'), &
+                           'like long ' // trim(tag) // ': no match')
+                call check(.not. sql_like(v, '%a%a%a%a%a%b') .and. sql_like(v // 'b', '%a%a%a%a%a%b'), &
+                           'like long ' // trim(tag) // ': several %')
+                call check(sql_like(v, repeat('_', N(k))) .and. .not. sql_like(v, repeat('_', N(k) - 1)) &
+                           .and. .not. sql_like(v, repeat('_', N(k) + 1)), &
+                           'like long ' // trim(tag) // ': one _ per character')
+                call check(sql_like(v // '%', '%a!%', '!') .and. .not. sql_like(v, '%a!%', '!'), &
+                           'like long ' // trim(tag) // ': escaped % at the end')
+            end do
+            v = repeat(EURO, 20000)
+            call check(sql_like(v, repeat('_', 20000)) .and. .not. sql_like(v, repeat('_', 19999)) &
+                       .and. sql_like(v, '%' // EURO) .and. sql_like(v, '_%_') .and. .not. sql_like(v, '%x'), &
+                       'like long: multi-byte characters')
+        end block long
     end subroutine
 
     subroutine test_like()
@@ -810,6 +837,18 @@ contains
         call check(rs == SQR_OK .and. res%count == 1, 'like sql: UPDATE ... WHERE LIKE')
         call run(db, "DELETE FROM t WHERE name LIKE 'a%'", res, rs)
         call check(rs == SQR_OK .and. res%count == 2, 'like sql: DELETE ... WHERE LIKE')
+
+        ! A value near the widest CHAR column, through the SQL layer.
+        call run(db, "CREATE TABLE w (id INTEGER, c CHAR(65000))", res, rs)
+        call run(db, "INSERT INTO w VALUES (1,'" // repeat('a', 60000) // "'),(2,'" // repeat('a', 59999) // "b')", &
+                 res, rs)
+        call check(rs == SQR_OK .and. res%count == 2, 'like sql: 60,000-byte values stored')
+        call run(db, "SELECT id FROM w WHERE c LIKE '%a'", res, rs)
+        call check(rs == SQR_OK .and. res%nrows == 1 .and. cell(res,1,1) == '1', 'like sql: long value, % then a literal')
+        call run(db, "SELECT id FROM w WHERE c LIKE '%a%a%a%a%a%b'", res, rs)
+        call check(rs == SQR_OK .and. res%nrows == 1 .and. cell(res,1,1) == '2', 'like sql: long value, several %')
+        call run(db, "SELECT id FROM w WHERE c NOT LIKE 'a%b' ", res, rs)
+        call check(rs == SQR_OK .and. res%nrows == 1 .and. cell(res,1,1) == '1', 'like sql: long value, NOT LIKE')
 
         call run(db, "SELECT id FROM t WHERE id LIKE '1%'", res, rs, em)
         call check(rs == SQR_INVALID .and. index(em, 'character column') > 0, 'like sql err: numeric column')
