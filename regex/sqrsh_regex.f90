@@ -94,7 +94,7 @@ contains
         call mctx%rx%compile(pat)
         if (.not. mctx%rx%is_compiled()) then
             call mctx%rx%delete()          ! release what the failed compile holds
-            call fail(rv, 'bad regex: ' // trim(pat))
+            call fail(rv, 'bad regex: ' // trim(pat) // ' (' // mctx%rx%error_text() // ')')
             return
         end if
         mctx%col = db%tables(ti)%cols(ci)

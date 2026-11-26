@@ -56,7 +56,7 @@ program sqlsh
         end if
     end do repl
 
-    if (db%opened) call db_close(db)
+    call close_db()
     call quit(merge(1, 0, any_failed))
 
 contains
@@ -140,7 +140,7 @@ contains
             write(error_unit,'(a)') '       Re-save the script as UTF-8 (Windows PowerShell 5.1: ' // &
                                     'Out-File -Encoding utf8 instead of ">").'
         end if
-        if (db%opened) call db_close(db)
+        call close_db()
         flush(error_unit)
         call c_exit(1)
     end subroutine
@@ -183,7 +183,7 @@ contains
     !! of file, and end with status 1 rather than reading again for ever.
     subroutine input_failed()
         write(error_unit,'(a)') 'error: cannot read standard input'
-        if (db%opened) call db_close(db)
+        call close_db()
         call quit(1)
     end subroutine
 
@@ -262,7 +262,7 @@ contains
             call report('usage: .open <dir>')
             return
         end if
-        if (db%opened) call db_close(db)
+        call close_db()
         emsg = ''
         call db_open(db, trim(dir), rs, emsg)
         if (rs /= SQR_OK) then
@@ -277,7 +277,7 @@ contains
             call report('no database open')
             return
         end if
-        call db_close(db)
+        call close_db()
     end subroutine
 
     subroutine meta_tables()
@@ -457,6 +457,20 @@ contains
         character(len=*), intent(in) :: msg
         write(error_unit,'(a)') msg
         any_failed = .true.
+    end subroutine
+
+    !! Close the database if one is open.  A close writes the row counters
+    !! and performs the last flush of every file, so it can fail: that is
+    !! reported like any other failure and counts for the exit status.
+    subroutine close_db()
+        integer :: rs
+        character(len=SQR_ERRMSG_LEN) :: emsg
+        if (.not. db%opened) return
+        emsg = ''
+        call db_close(db, rs, emsg)
+        if (rs == SQR_OK) return
+        if (len_trim(emsg) == 0) emsg = sqr_errstr(rs)
+        call report('error: cannot close the database: ' // trim(emsg))
     end subroutine
 
     function require_open() result(ok)

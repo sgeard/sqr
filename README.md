@@ -68,7 +68,7 @@ The primary build is `make` with `ifx` (load the Intel environment first):
 ```sh
 make all            # build + run unit, B+-tree and fault tests
 make utest          # unit tests + B+-tree tests
-make faulttest      # fault-injection sweep (FAULT=on, debug build)
+make faulttest      # fault-injection sweep (FAULT=on, debug build in its own obj_*_fault)
 make destruct       # destruction/fuzz corpora against a -check all build
 make bench          # micro-benchmarks
 make docs           # FORD API docs -> ford_docs/

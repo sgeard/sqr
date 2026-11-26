@@ -312,9 +312,7 @@ no index is needed or used. A NULL matches nothing, whatever the pattern;
 an empty value is matched like any other. With no match it prints the header
 and `(no rows match)`. Failures: `no such table: <table>` (the table was
 dropped meanwhile), `no such column: <col>`, `match is only supported on char
-columns`, `bad regex: <regex>`, `scan failed: <reason>`. The regex engine
-also writes its own line, `***Syntax error in re: <regex>`, to standard
-output for a bad pattern.
+columns`, `bad regex: <regex> (<reason>)`, `scan failed: <reason>`.
 
 ## 5. How rows are shown
 

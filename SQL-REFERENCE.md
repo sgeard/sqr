@@ -538,7 +538,9 @@ the notices of meta-commands go to standard error. An error is one line,
 by an error.
 
 **Exit status** is 0 when nothing failed. It is 1 when any statement or
-meta-command failed (the script still runs to its end), the input is in an
+meta-command failed (the script still runs to its end), a database could
+not be closed cleanly (`error: cannot close the database: <reason>`, at
+`.close`, at an `.open` that replaces it, or at the end), the input is in an
 unsupported encoding, or the Fortran runtime reports that standard input
 cannot be read (`error: cannot read standard input`; `sqlsh` ends at once, a
 partial line unread), and 2 for a bad command line. Some runtimes report such
@@ -605,8 +607,8 @@ CREATE INDEX ON "t" ("name", "id");
 ```
 
 A failure of a meta-command (a database that cannot be opened, `no such
-table`, `unknown command`, a usage message, a failed pack or unpack, `no
-database open`) is reported on standard error and counts as a failure for
+table`, `unknown command`, a usage message, a failed pack or unpack, a
+failed close, `no database open`) is reported on standard error and counts as a failure for
 the exit status.
 
 ## 11. Limits

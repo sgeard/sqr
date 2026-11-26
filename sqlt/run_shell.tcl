@@ -393,6 +393,27 @@ namespace eval shelltest {
         check {[dict get $r status] == 1} "status: no database open ends with 1"
     }
 
+    # A close writes the row counters to the table's schema, through a
+    # temporary file beside it.  A directory of that name makes the write
+    # fail: sqlsh says so and ends with 1, at .close and at the end of input.
+    proc t_close_failure {} {
+        set db [fresh_db closefail]
+        run [utf8 ".open $db\nCREATE TABLE t(a INTEGER)\n.quit\n"]
+        file mkdir [file join $db t.schema.tmp]
+        set r [run [utf8 ".open $db\nINSERT INTO t VALUES(1)\n"]]
+        check {[dict get $r status] == 1 &&
+               [regexp -line {^error: cannot close the database: } [dict get $r err]]} \
+            "close: a failed close at the end of input is reported, status 1"
+        set r [run [utf8 ".open $db\nINSERT INTO t VALUES(2)\n.close\n.quit\n"]]
+        check {[dict get $r status] == 1 &&
+               [regexp -line {^error: cannot close the database: } [dict get $r err]]} \
+            "close: a failed .close is reported, status 1"
+        file delete [file join $db t.schema.tmp]
+        set r [run [utf8 ".open $db\nSELECT a FROM t ORDER BY a\n.quit\n"]]
+        check {[dict get $r status] == 0 && [regexp {1\s+2\s} [dict get $r out]]} \
+            "close: with the obstacle gone the rows are there and the close is clean"
+    }
+
     # P1: standard input that cannot be read (a directory) ends the shell
     # at once with status 1 and a message, rather than reading again for
     # ever.  `timeout` turns a spin into status 124, a failed check.  A
@@ -563,8 +584,11 @@ namespace eval shelltest {
         set rows [regexp -all -line {^ +[0-9]+ +[0-9]+ } [dict get $r out]]
         check {$rows == 1 && [regexp -line {^       2                 2 *$} [dict get $r out]]} \
             "sqrsh match: ^\$ lists the empty value, not the NULL"
-        check {[regexp -line {^bad regex: \($} [dict get $r err]] && [regexp -line {^no such column: nope$} [dict get $r err]]} \
-            "sqrsh match: failures on stderr"
+        check {[regexp -line {^bad regex: \( \(syntax error in the regular expression\)$} [dict get $r err]]
+               && [regexp -line {^no such column: nope$} [dict get $r err]]} \
+            "sqrsh match: failures on stderr, a bad pattern with its reason"
+        check {![regexp -nocase {syntax error} [dict get $r out]]} \
+            "sqrsh match: the regex engine writes nothing of its own to stdout"
     }
 
     proc t_utf8_bom {} {
@@ -746,6 +770,7 @@ namespace eval shelltest {
             t_schema
             t_exit_status
             t_unreadable_stdin
+            t_close_failure
             t_like_long
             t_add_text_column
             t_readonly_counters

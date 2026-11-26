@@ -41,12 +41,22 @@ $(OPTIONS_FNAME): generate_fopts.tcl
 
 -include $(OPTIONS_FNAME)
 
+# The fault-injection variant builds into a directory of its own, so that
+# nothing (objects, archive, test binaries) is shared with the FAULT=off
+# build of the same compiler and mode. The sibling has no such variant:
+# it is always found under the plain name.
+SIB_ODIR := $(ODIR)
+ifeq ($(FAULT),on)
+  MOD_OPTS := $(subst $(SIB_ODIR),$(SIB_ODIR)_fault,$(MOD_OPTS))
+  ODIR     := $(SIB_ODIR)_fault
+endif
+
 # Sibling tcl_re (opt-in regex search only: sqrsh-regex, test-regex). Its
 # self-contained static engine, libtclInterface.a, bundles the regex engine
 # (no libtcl). tcl_re shares the standardised build, so its ODIR matches
-# $(ODIR). Built on demand if missing.
+# $(SIB_ODIR). Built on demand if missing.
 TCLRE_DIR  ?= ../tcl_re
-TCLRE_ODIR ?= $(TCLRE_DIR)/$(ODIR)
+TCLRE_ODIR ?= $(TCLRE_DIR)/$(SIB_ODIR)
 TCLRE_LIB  ?= $(TCLRE_ODIR)/libtclInterface.a
 TF_EXT_tcl_frx := $(TCLRE_ODIR)/tcl_frx.mod
 
@@ -162,10 +172,9 @@ $(ODIR)/osshim.o: $(SRC_DIR)/osshim.c | $(ODIR)
 # fb_monitor (progress feedback for long loops) lives in $(BENCH_DIR) with its
 # only consumer, so it is neither archived into libsqr nor globbed by fpm.
 
-# Library archive. Rebuilt from scratch (not `ar r` onto a stale archive):
-# the FAULT=off and FAULT=on fault submodules have distinct object names, so
-# adding to an existing archive could leave BOTH in it and let the linker
-# resolve io_check from the wrong one (silently disabling fault injection).
+# Library archive. Rebuilt from scratch (not `ar r` onto a stale archive),
+# so it holds exactly $(LIB_OBJ). FAULT=off and FAULT=on never meet here:
+# each has its own $(ODIR).
 $(LIB): $(LIB_OBJ) | $(ODIR)
 	@rm -f $@
 	$(AR) rcs $@ $(LIB_OBJ)
@@ -273,8 +282,8 @@ install-calc:
 	@echo "Installed tclcalc.py + sqr_calc.tcl to $(LO_SCRIPTS)"
 
 # Fault-injection sweep. Built only here (and by coverage), always with
-# FAULT=on, into a debug ODIR so the production release archive is never
-# overwritten with the on submodule.
+# FAULT=on, which has its own debug ODIR ($(SIB_ODIR)_fault): no other
+# build's archive or binaries are touched.
 $(FAULT_TEST_BIN): $(ODIR)/utest_fault.o $(LIB)
 	$(F) $(F_OPTS) -o $@ $< $(LIB) $(LFLAGS)
 
@@ -359,13 +368,13 @@ run-destruct: $(DESTRUCT_BINS) $(ODIR)/sqlsh$(EXT)
 coverage: coverage-gcov
 
 coverage-gcov:
-	@rm -vf *.gcov obj_gfortran_debug/*.gcda obj_gfortran_debug/*.gcno obj_gfortran_debug/*.o obj_gfortran_debug/*.mod obj_gfortran_debug/*.smod obj_gfortran_debug/libsqr.a obj_gfortran_debug/utest_*_d
+	@rm -vf *.gcov obj_gfortran_debug_fault/*.gcda obj_gfortran_debug_fault/*.gcno obj_gfortran_debug_fault/*.o obj_gfortran_debug_fault/*.mod obj_gfortran_debug_fault/*.smod obj_gfortran_debug_fault/libsqr.a obj_gfortran_debug_fault/utest_*_d
 	$(MAKE) F=gfortran debug=1 FAULT=on F_EXTRA_GF='$(F_EXTRA_GF) --coverage' F_LOPTS_GF='$(F_LOPTS_GF) --coverage' utest run-faulttest
 	@rm -vf *.gcov
-	gcov -b -c -o obj_gfortran_debug $(addprefix $(SRC_DIR)/,$(LIB_SRC)) $(FAULT_DIR)/sqr_fault_on_sm.f90
+	gcov -b -c -o obj_gfortran_debug_fault $(addprefix $(SRC_DIR)/,$(LIB_SRC)) $(FAULT_DIR)/sqr_fault_on_sm.f90
 
 coverage-clean:
-	@rm -vf *.gcov obj_gfortran_debug/*.gcda obj_gfortran_debug/*.gcno
+	@rm -vf *.gcov obj_gfortran_debug_fault/*.gcda obj_gfortran_debug_fault/*.gcno
 
 # --- Documentation (FORD) -------------------------------------------------
 # Render the API docs from the sources + ford.md into ford_docs/ (output_dir

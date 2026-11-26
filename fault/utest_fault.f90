@@ -109,6 +109,7 @@ program utest_fault
     call compact_wedge()
     call compact_nondurable()
     call drop_table_faults()
+    call create_table_faults()
 
     ! H1: a faulted undo replay must leave the journal hot, never voided.
     call recover_fault()
@@ -1764,6 +1765,99 @@ contains
         call check(kept > 0, 'drop_table: some failures leave the table usable in the session')
         call check(bad == 0, 'drop_table: every failure leaves the table intact (with any later row) or wholly gone')
     end subroutine drop_table_faults
+
+    ! A failure at each I/O point of db_create_table, in a database that
+    ! already holds a table.  The contract is "no trace left": the call
+    ! fails, the new table is not in the handle, and its name is free -
+    ! db_create_table refuses a name whose schema, data or blob file exists,
+    ! so a second create that succeeds shows none was left behind.  Each
+    ! fault is run twice: the second create in the same session (then the
+    ! new table takes a row and both tables verify after a reopen), and the
+    ! second create only after close and reopen.  The new table has a TEXT
+    ! column, so the blob file's creation is swept too.
+    subroutine create_table_faults()
+        character(len=160) :: em
+        integer :: rs, nops, n, bad
+        logical :: later
+        call fault_disarm()
+        call prep_indexed()
+        call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
+        call fault_arm(BIG)
+        call db_create_table(gdb, 'extra', people_cols(), rs)
+        nops = fault_count()
+        call fault_disarm()
+        call close_g()
+        call check(rs == SQR_OK .and. nops > 0, 'create_table: the clean create does I/O')
+        bad = 0
+        sweep_loop: do n = 1, 2*nops
+            later = n > nops                  ! second pass: retry after a reopen
+            call prep_indexed()
+            call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
+            call fault_arm(merge(n - nops, n, later))
+            call db_create_table(gdb, 'extra', people_cols(), rs)
+            call fault_disarm()
+            if (rs == SQR_OK .or. db_table_index(gdb, 'extra') > 0) then
+                print '(a,i0,a,i0)', '  create_table fault ', n, &
+                    ': reported success or kept the table, status ', rs
+                bad = bad + 1
+            end if
+            if (later) then
+                call close_g()
+                em = ''
+                call db_open(gdb, DBDIR, rs, em); gopen = rs == SQR_OK
+                if (rs /= SQR_OK .or. db_table_index(gdb, 'extra') > 0) then
+                    print '(a,i0,a,i0,2a)', '  create_table fault ', n, &
+                        ': reopen failed or found the table, status ', rs, ' ', trim(em)
+                    bad = bad + 1
+                    call close_g()
+                    cycle sweep_loop
+                end if
+            end if
+            em = ''
+            call db_create_table(gdb, 'extra', people_cols(), rs, em)
+            if (rs /= SQR_OK) then
+                print '(a,i0,a,i0,2a)', '  create_table fault ', n, ': name not free ', rs, ' ', trim(em)
+                bad = bad + 1
+                call close_g()
+                cycle sweep_loop
+            end if
+            if (.not. extra_takes_a_row()) then
+                print '(a,i0,a)', '  create_table fault ', n, &
+                    ': the table made afterwards, or the one already there, is not sound'
+                bad = bad + 1
+            end if
+        end do sweep_loop
+        call check(bad == 0, 'create_table: every failure leaves no trace and the name free')
+    end subroutine create_table_faults
+
+    ! gdb is open and holds people (3 rows) and an empty extra.  Insert one
+    ! row into extra, close, reopen: both tables verify with their rows.
+    logical function extra_takes_a_row() result(ok)
+        character(len=:), allocatable :: buf
+        character(len=128) :: em
+        integer(int32) :: rid
+        integer :: rs, st, ti
+        ok = .false.
+        ti = db_table_index(gdb, 'extra')
+        call row_alloc(buf, gdb%tables(ti)%record_size)
+        call row_set_int (buf, gdb%tables(ti)%cols(1), 7_int32)
+        call row_set_int (buf, gdb%tables(ti)%cols(2), 70_int32)
+        call row_set_char(buf, gdb%tables(ti)%cols(3), 'Eve')
+        call db_insert(gdb, 'extra', buf, rid, rs)
+        call close_g()
+        if (rs /= SQR_OK) return
+        call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
+        if (rs /= SQR_OK) return
+        em = ''; st = SQR_ERR
+        if (db_table_index(gdb, 'extra') > 0) call db_verify(gdb, 'extra', st, em)
+        ok = st == SQR_OK
+        if (ok) ok = db_row_count(gdb, 'extra') == 1
+        if (ok) then
+            call db_verify(gdb, 'people', st, em)
+            ok = st == SQR_OK .and. db_row_count(gdb, 'people') == 3
+        end if
+        call close_g()
+    end function extra_takes_a_row
 
     logical function no_zoe_and_sound() result(ok)
         integer :: st
