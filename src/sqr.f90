@@ -751,10 +751,13 @@ module sqr
         !! `SQR_NOT_FOUND` (no such table), `SQR_INVALID` (bad column
         !! definition, or a name already in the table), or `SQR_READONLY`.
         !!
-        !! On-disk consistency is build-then-swap as in `db_compact`: the
-        !! rewritten data file is renamed in and the schema rewritten back to
-        !! back; a hard crash strictly between those two steps is the
-        !! documented pre-journal residual window.
+        !! On-disk consistency is stage, commit, swap: the rewritten data
+        !! file, the new schema and (for a first `DT_TEXT` column) the empty
+        !! blob file are written beside the originals and made durable, a
+        !! marker commits them, and renames put them in place.  A crash before
+        !! the marker leaves the old table; a crash after it is rolled forward
+        !! by the next read-write `db_open`, so the table is never seen in a
+        !! mixture of the two layouts.
         module subroutine db_add_column(db, table_name, col, stat, errmsg)
             class(db_t),      intent(inout)           :: db  !! Database handle
             character(len=*), intent(in)              :: table_name  !! Target table

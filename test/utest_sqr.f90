@@ -83,6 +83,7 @@ program utest_sqr
     call test_alter_column()
     call test_reshape_table()
     call test_alter_recovery()
+    call test_alter_first_text()
     call test_oo_bindings()
     call test_coverage_paths()
     call test_clib_wrappers()
@@ -4851,6 +4852,97 @@ contains
         end do
         ios = c_rmtree(ODIR);  ios = c_rmtree(TDIR)
     end subroutine test_alter_recovery
+
+    ! The first TEXT column's blob file is part of the staged set.  (1) A
+    ! change interrupted after its commit marker - (a) nothing renamed, (b) the
+    ! blob file already renamed, (c) nothing renamed and an orphan blob file
+    ! in the way - is finished by the next open with the blob file in place.
+    ! (2) The change itself, made over an orphan blob file, starts the TEXT
+    ! column from an empty blob file and survives a reopen.
+    subroutine test_alter_first_text()
+        character(len=*), parameter :: ODIR = 'utest_sqr_alttext_db', TDIR = 'utest_sqr_alttext_twin'
+        character(len=*), parameter :: STAGES(3) = [character(len=24) :: 'nothing renamed', &
+            'blob file renamed', 'orphan blob file present']
+        type(db_t) :: db
+        type(column_t) :: bio
+        integer :: rs, ios, ti, k
+        character(len=:), allocatable :: txt, tag
+        character(len=128) :: emsg
+        logical :: okc
+        bio%name = 'bio' ; bio%dtype = DT_TEXT ; bio%csize = SQR_TEXT_DESC
+        recover: do k = 1, 3
+            tag = 'alttext (' // trim(STAGES(k)) // ')'
+            ios = c_rmtree(ODIR);  ios = c_rmtree(TDIR)
+            call altrec_people(ODIR)
+            call altrec_people(TDIR)
+            call db_open(db, TDIR, rs, emsg)
+            call db_add_column(db, 'people', bio, rs, emsg)
+            call db_close(db)
+            call copy_file(TDIR // '/people.dat',    ODIR // '/people.dat.alter', okc)
+            call copy_file(TDIR // '/people.schema', ODIR // '/people.schema.alter', okc)
+            call copy_file(TDIR // '/people.schema', ODIR // '/people.altering', okc)
+            select case (k)
+            case (1);  call put_bytes(ODIR // '/people.blob.alter', '')
+            case (2);  call put_bytes(ODIR // '/people.blob', '')
+            case (3);  call put_bytes(ODIR // '/people.blob.alter', '')
+                       call put_bytes(ODIR // '/people.blob', 'orphaned bytes from an earlier table')
+            end select
+
+            call db_open(db, ODIR, rs, emsg)
+            call check(rs == SQR_OK, tag // ': read-write open recovers')
+            if (rs /= SQR_OK) cycle recover
+            ti = db_table_index(db, 'people')
+            call check(db%tables(ti)%ncols == 4 .and. db%tables(ti)%blob_next == 1_int64, &
+                       tag // ': four columns over an empty blob file')
+            call db_set_text(db, 'people', 2_int32, 'bio', 'written after recovery', rs)
+            call check(rs == SQR_OK, tag // ': the TEXT column takes a value')
+            call db_verify(db, 'people', rs, emsg)
+            call check(rs == SQR_OK, tag // ': db_verify passes')
+            call db_close(db)
+            call check(.not. c_path_exists(ODIR // '/people.altering') .and. &
+                       .not. c_path_exists(ODIR // '/people.blob.alter') .and. &
+                       c_path_exists(ODIR // '/people.blob'), &
+                       tag // ': marker and staged blob gone, blob file in place')
+            call db_open(db, ODIR, rs, emsg)
+            txt = ''
+            if (rs == SQR_OK) call db_get_text(db, 'people', 2_int32, 'bio', txt, rs)
+            call check(rs == SQR_OK .and. txt == 'written after recovery', &
+                       tag // ': the value reads back after a reopen')
+            call db_close(db)
+        end do recover
+
+        ios = c_rmtree(ODIR)
+        call altrec_people(ODIR)
+        call put_bytes(ODIR // '/people.blob', 'orphaned bytes from an earlier table')
+        call db_open(db, ODIR, rs, emsg)
+        call db_add_column(db, 'people', bio, rs, emsg)
+        ti = db_table_index(db, 'people')
+        call check(rs == SQR_OK .and. db%tables(ti)%blob_next == 1_int64, &
+                   'alttext: first TEXT column added over an orphan blob file starts empty')
+        call check(.not. c_path_exists(ODIR // '/people.blob.alter') .and. &
+                   c_path_exists(ODIR // '/people.blob'), &
+                   'alttext: the staged blob file became the blob file')
+        call db_set_text(db, 'people', 1_int32, 'bio', 'first text', rs)
+        call check(rs == SQR_OK, 'alttext: the new column takes a value')
+        call db_close(db)
+        call db_open(db, ODIR, rs, emsg)
+        txt = ''
+        if (rs == SQR_OK) call db_get_text(db, 'people', 1_int32, 'bio', txt, rs)
+        call check(rs == SQR_OK .and. txt == 'first text', 'alttext: and it reads back after a reopen')
+        call db_verify(db, 'people', rs, emsg)
+        call check(rs == SQR_OK, 'alttext: db_verify passes after the reopen')
+        call db_close(db)
+        ios = c_rmtree(ODIR);  ios = c_rmtree(TDIR)
+    end subroutine test_alter_first_text
+
+    ! Write `bytes` (possibly none) as the whole of `path`.
+    subroutine put_bytes(path, bytes)
+        character(len=*), intent(in) :: path, bytes
+        integer :: u
+        open(newunit=u, file=path, access='stream', form='unformatted', status='replace', action='write')
+        if (len(bytes) > 0) write(u) bytes
+        close(u)
+    end subroutine put_bytes
 
     ! A two-row people(pid, age, name) table with a name index (altrec fixture).
     subroutine altrec_people(dir)

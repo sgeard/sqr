@@ -190,6 +190,28 @@ namespace eval shelltest {
         check {[regexp {(?w)^11 *$.*^22 *$.*^2 *$} $out]}     "like long: in that order, and the shell answers the next statement"
     }
 
+    # ALTER TABLE ... ADD COLUMN giving a table its first TEXT column: the
+    # column is usable at once, and by a second sqlsh run on the same database.
+    proc t_add_text_column {} {
+        set db [fresh_db addtext]
+        set sql ".open $db\nCREATE TABLE n(id INTEGER, tag CHAR(8))\n"
+        append sql "INSERT INTO n VALUES(1,'one')\nINSERT INTO n VALUES(2,'two')\n"
+        append sql "ALTER TABLE n ADD COLUMN body TEXT\n"
+        append sql "UPDATE n SET body = 'the long story' WHERE id = 2\n"
+        append sql "SELECT body FROM n WHERE id = 2\n.quit\n"
+        set r [run [utf8 $sql]]
+        check {[dict get $r status] == 0}                                  "add text column: exit status 0"
+        check {[dict get $r err] eq ""}                                    "add text column: nothing on stderr"
+        check {[regexp -line {^the long story *$} [dict get $r out]]}      "add text column: the new column holds a value"
+        check {[file exists [file join $db n.blob]] && ![file exists [file join $db n.blob.alter]]} \
+                                                                           "add text column: its blob file is in place"
+        set r [run [utf8 ".open $db\nSELECT tag FROM n WHERE body IS NOT NULL\nSELECT body FROM n WHERE id = 2\n.quit\n"]]
+        check {![regexp {error|cannot open} [dict get $r err]]}            "add text column: the database opens on the next start"
+        check {[regexp -line {^the long story *$} [dict get $r out]]}      "add text column: and the value is still there"
+        check {[regexp -all -line {^(one|two) *$} [dict get $r out]] == 1 && [regexp -line {^two *$} [dict get $r out]]} \
+                                                                           "add text column: on the one row that was given it"
+    }
+
     # A table name beginning with '_' is the engine's: CREATE TABLE _journal
     # is refused, and the database is still there on the next start.
     proc t_reserved_name {} {
@@ -430,6 +452,7 @@ namespace eval shelltest {
             t_reserved_name
             t_table_names
             t_like_long
+            t_add_text_column
             t_readonly_counters
             t_pack_too_large
             t_utf8_bom

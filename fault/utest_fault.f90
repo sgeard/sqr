@@ -47,6 +47,8 @@ program utest_fault
     call sweep('compact',      prep_compactable, op_compact, .false.)
     call sweep('reshape',      prep_indexed,     op_reshape, .false.)
     call reshape_atomicity()
+    call sweep('add_text',     prep_plain,       op_addtext, .false.)
+    call addtext_atomicity()
     call sweep('set_text',     prep_textrow,     op_settext, .false.)
     call sweep('get_text',     prep_textset,     op_gettext, .false., expect=SQR_ERR)
     ! Every sweep closes its handle after each faulted run: an error path that
@@ -469,6 +471,84 @@ contains
         end do sweep_loop
         call check(bad == 0, 'reshape: every failed reshape reopens wholly old or wholly new, verified')
     end subroutine reshape_atomicity
+
+    ! `people` without its TEXT column: (pid, age, name), two rows, no blob file.
+    subroutine prep_plain()
+        type(db_t) :: db
+        type(column_t) :: c(4)
+        integer :: rs, ios
+        ios = c_rmtree(DBDIR)
+        c = people_cols()
+        call db_open(db, DBDIR, rs)
+        call db_create_table(db, 'people', c(1:3), rs)
+        call insert_row(db, 1_int32, 33_int32, 'Alice')
+        call insert_row(db, 2_int32, 45_int32, 'Bob')
+        call db_close(db)
+    end subroutine prep_plain
+
+    ! Give `people` its first TEXT column.
+    subroutine op_addtext(rs)
+        integer, intent(out) :: rs
+        type(column_t) :: c(4)
+        c = people_cols()
+        call db_add_column(gdb, 'people', c(4), rs)
+    end subroutine op_addtext
+
+    ! Adding the first TEXT column creates the blob file.  A failure at any
+    ! I/O point leaves a database that reopens as EITHER the old table (three
+    ! columns) OR the new one (four, and the TEXT column usable: its blob file
+    ! is there) - never a schema naming a TEXT column with no blob file.
+    subroutine addtext_atomicity()
+        type(db_t) :: db
+        integer :: nops, n, rs, bad, ti
+        character(len=:), allocatable :: txt
+        character(len=128) :: em
+        logical :: old_ok, new_ok
+        call fault_disarm()
+        call prep_plain()
+        call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
+        call fault_arm(BIG)
+        call op_addtext(rs)
+        nops = fault_count()
+        call fault_disarm()
+        call close_g()
+        call check(rs == SQR_OK .and. nops > 0, 'add_text: the unfaulted change succeeds')
+        bad = 0
+        sweep_loop: do n = 1, nops
+            call prep_plain()
+            call db_open(gdb, DBDIR, rs); gopen = rs == SQR_OK
+            call fault_arm(n)
+            call op_addtext(rs)
+            call fault_disarm()
+            call close_g()
+            if (rs == SQR_OK) cycle sweep_loop
+            call db_open(db, DBDIR, rs)
+            if (rs /= SQR_OK) then
+                print '(a,i0,a,i0)', '  add_text fault ', n, ': reopen failed ', rs
+                bad = bad + 1
+                cycle sweep_loop
+            end if
+            ti = db_table_index(db, 'people')
+            old_ok = db%tables(ti)%ncols == 3
+            new_ok = .false.
+            if (db%tables(ti)%ncols == 4) then
+                call db_set_text(db, 'people', 2_int32, 'bio', 'after the fault', rs)
+                if (rs == SQR_OK) then
+                    call db_get_text(db, 'people', 2_int32, 'bio', txt, rs)
+                    if (rs == SQR_OK) new_ok = txt == 'after the fault'
+                end if
+            end if
+            em = ''
+            call db_verify(db, 'people', rs, em)
+            if (.not. (old_ok .or. new_ok) .or. rs /= SQR_OK) then
+                print '(a,i0,a,l1,l1,a,i0,1x,a)', '  add_text fault ', n, ': old/new ', old_ok, new_ok, &
+                    ' verify ', rs, trim(em)
+                bad = bad + 1
+            end if
+            call db_close(db)
+        end do sweep_loop
+        call check(bad == 0, 'add_text: every failed change reopens old, or new with a usable TEXT column')
+    end subroutine addtext_atomicity
 
     subroutine op_compact(rs)
         integer, intent(out) :: rs

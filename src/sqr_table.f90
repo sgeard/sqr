@@ -1440,9 +1440,10 @@ contains
     !
     ! Atomicity, the db_compact pattern:
     !   1. STAGE - every fallible write happens beside the originals: the
-    !      rewritten data file (`<t>.dat.alter`) and the new schema
-    !      (`<t>.schema.alter`), each made durable.  A failure here deletes the
-    !      temps; the table is untouched.
+    !      rewritten data file (`<t>.dat.alter`), the new schema
+    !      (`<t>.schema.alter`) and, when the change gives the table its first
+    !      DT_TEXT column, an empty blob file (`<t>.blob.alter`), each made
+    !      durable.  A failure here deletes the temps; the table is untouched.
     !   2. COMMIT - a durable marker (`<t>.altering`).  From here the staged
     !      files are the truth.
     !   3. SWAP - renames only, then the marker is cleared.  An interruption
@@ -1461,7 +1462,7 @@ contains
         integer :: ud, ios, rs, j, m, k, old_rs
         integer(int32) :: rid
         logical :: had_text, has_text_new
-        character(len=:), allocatable :: rbuf, nbuf, dpath, dtmp, spath, stmp
+        character(len=:), allocatable :: rbuf, nbuf, dpath, dtmp, spath, stmp, btmp
         type(column_t), allocatable :: oldcols(:)
         type(table_t) :: nt
 
@@ -1475,6 +1476,8 @@ contains
             dtmp  = dpath // '.alter'
             spath = schema_path(db, t%name)
             stmp  = spath // '.alter'
+            btmp  = blob_path(db, t%name) // '.alter'
+            has_text_new = any(newcols%dtype == DT_TEXT)
 
             ! ---- 1. STAGE: the rewritten data file beside the original.  The
             ! original data unit stays open and untouched, so any failure here
@@ -1482,6 +1485,7 @@ contains
             build: block
                 call remove_file(dtmp)   ! stale temps from an abandoned attempt
                 call remove_file(stmp)
+                call remove_file(btmp)
                 open(newunit=ud, file=dtmp, access='direct', form='unformatted', &
                      recl=new_rs, status='replace', action='readwrite', iostat=ios)
                 if (ios /= 0) then
@@ -1523,6 +1527,19 @@ contains
                 return
             end if
 
+            ! ...the blob file of a table gaining its first DT_TEXT column.
+            ! Staged like the rest, so the swap (and an open that finishes an
+            ! interrupted one) puts it in place with the schema that needs it.
+            if (has_text_new .and. .not. had_text) then
+                call stage_empty_file(db, btmp, rs)
+                if (rs /= SQR_OK) then
+                    call remove_file(dtmp)
+                    call remove_file(btmp)
+                    stat = rs
+                    return
+                end if
+            end if
+
             ! ...and the schema describing it: a copy of the table in the new
             ! layout with the cascaded slots tombstoned, staged durably.
             nt = t
@@ -1541,6 +1558,7 @@ contains
             if (rs /= SQR_OK) then
                 call remove_file(dtmp)
                 call remove_file(stmp)
+                call remove_file(btmp)
                 stat = rs
                 return
             end if
@@ -1551,6 +1569,7 @@ contains
                 call remove_file(alter_marker_path(db, t%name))
                 call remove_file(dtmp)
                 call remove_file(stmp)
+                call remove_file(btmp)
                 stat = rs
                 return
             end if
@@ -1589,10 +1608,10 @@ contains
                 return
             end if
 
-            has_text_new = table_has_text(t)
             if (has_text_new .and. t%blob_unit == -1) then
-                ! First DT_TEXT column on a previously text-less table.
-                call open_blob(db, t, 'replace', rs)
+                ! First DT_TEXT column on a previously text-less table: the
+                ! swap has just moved its staged blob file into place.
+                call open_blob(db, t, 'old', rs)
                 if (rs /= SQR_OK) then
                     stat = rs
                     return
@@ -1646,6 +1665,26 @@ contains
         stat = merge(SQR_ERR, SQR_OK, ios /= 0)
     end subroutine
 
+    ! Create `path` empty, replacing anything already there, and make its
+    ! contents durable.  The caller syncs the directory.
+    subroutine stage_empty_file(db, path, stat)
+        type(db_t),       intent(in)  :: db
+        character(len=*), intent(in)  :: path
+        integer,          intent(out) :: stat
+        integer :: u, ios
+        open(newunit=u, file=path, access='stream', form='unformatted', &
+             status='replace', action='write', iostat=ios)
+        if (ios /= 0) then
+            stat = SQR_ERR
+            return
+        end if
+        close(u, iostat=ios)
+        call io_check(ios)
+        if (ios == 0 .and. db%durable) ios = c_fsync_path(path)
+        call io_check(ios)
+        stat = merge(SQR_ERR, SQR_OK, ios /= 0)
+    end subroutine
+
     ! Roll a committed layout change forward: move each staged file still
     ! present over its target, then clear the marker.  Idempotent - every step
     ! is a rename or a removal of something that may already be gone - so it
@@ -1656,11 +1695,17 @@ contains
         character(len=*), intent(in)  :: name
         integer,          intent(out) :: stat
         integer :: ios
-        character(len=:), allocatable :: dpath, spath
+        character(len=:), allocatable :: dpath, spath, bpath
         ios = 0
         dpath = data_path(db, name)
         spath = schema_path(db, name)
-        if (c_path_exists(dpath // '.alter')) ios = c_rename(dpath // '.alter', dpath)
+        bpath = blob_path(db, name)
+        ! The blob file first: once the schema names a DT_TEXT column the file
+        ! it needs is already there.
+        if (c_path_exists(bpath // '.alter')) ios = c_rename(bpath // '.alter', bpath)
+        if (ios == 0) then
+            if (c_path_exists(dpath // '.alter')) ios = c_rename(dpath // '.alter', dpath)
+        end if
         if (ios == 0 .and. c_path_exists(spath // '.alter')) &
             ios = c_rename(spath // '.alter', spath)
         if (ios /= 0) then
