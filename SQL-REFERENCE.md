@@ -19,8 +19,10 @@ points to section 13; a test should not fix such behaviour in place.
 
 ## 1. Statements and lines
 
-- One statement is one line of text. A statement cannot continue onto a second
-  line, and a line cannot hold two statements.
+- In `sqlsh` one statement is one line of text: a statement cannot continue
+  onto a second line, and a line cannot hold two statements. A statement
+  given to the `sql` module (`sql_run`) or to the server may contain line
+  breaks, which are white space (section 2).
 - A statement may end with one `;`. Nothing may follow it.
 - A blank line, and a line holding only `;`, do nothing and report nothing.
 - There are no comments: `--` and `/* */` are errors.
@@ -32,8 +34,9 @@ points to section 13; a test should not fix such behaviour in place.
 and column positions in error messages count bytes, not characters. Other
 encodings are refused before any statement is read (README, "Input encoding").
 
-**White space** is the space and the tab. It separates tokens and is otherwise
-ignored. It is required only where two tokens would otherwise run together.
+**White space** is the space, the tab, CR and LF. It separates tokens and is
+otherwise ignored. It is required only where two tokens would otherwise run
+together. Inside a string literal a line break is part of the string.
 
 **Words** begin with an ASCII letter or `_` and continue with ASCII letters,
 digits and `_`. A word is a keyword or a name according to where it stands.
@@ -74,7 +77,9 @@ tab. Double quotes never make a string: `"Alice"` is a name.
 
 **Real literals** begin with a digit and carry a fraction, an exponent or
 both: `1.5`, `1.`, `1e3`, `1.5E-3`, `1.e2`. A leading point (`.5`) is not a
-number. A value too large for a 64-bit IEEE double (`1e999`) is refused.
+number. An exponent must have a digit: `1e`, `1e+` and `1.5E-` are
+`malformed real literal`. A value too large for a 64-bit IEEE double
+(`1e999`) is refused.
 
 **Signs.** A literal value may be preceded by one `+` or `-`, with or without
 white space between: `-6`, `- 6`, `+5`. Two signs (`--6`) are an error, and so
@@ -123,8 +128,11 @@ else is converted.
 - Comparison and ordering are by byte value, so they are case-sensitive and
   put `'AB'` before `'ab'`, and every ASCII character before any non-ASCII
   one. No collation is applied.
-- A character value containing control characters compares inconsistently
-  (section 13, Q3).
+- Values are compared without their trailing blanks, byte by byte; a value
+  that is the beginning of the other is the lesser. So `'a'` comes before
+  `'a<TAB>b'`, which comes before `'a b'`. A scan and an index give the same
+  order, and this order is used by every comparison, `IN`, `ORDER BY`, `MIN`
+  and `MAX`.
 
 ### 3.3 Text values
 
@@ -241,8 +249,8 @@ Sets the named columns in every row that satisfies the condition; in every
 row of the table if there is no `WHERE`. `<n>` is the number of rows matched,
 whether or not their values changed. There is no `ORDER BY` or `LIMIT`.
 
-A column named twice in `SET` is at present accepted and the later value wins
-(section 13, Q5).
+A column named twice in `SET` is refused (`duplicate column: <c>`), and
+nothing is changed.
 
 ### 5.3 DELETE
 
@@ -358,8 +366,8 @@ are accepted (`BEGIN TRANSACTION` is an error).
     `SELECT`, and the transaction is *doomed*: every later `INSERT`, `UPDATE`
     and `DELETE` is refused, `SELECT` still works, and `COMMIT` reports an
     error and rolls everything back. `ROLLBACK` is the way out.
-- `BEGIN`, `COMMIT` and `ROLLBACK` are at present accepted with no database
-  open (section 13, Q4).
+- `BEGIN`, `COMMIT` and `ROLLBACK` need an open database, as every other
+  statement does except a `SELECT` of literals (`no database open`).
 
 A database serves one connection at a time. A second process that opens it is
 refused (`database is locked by another connection`).
@@ -443,12 +451,12 @@ These messages are stable:
 | `expected <keyword>` | keyword in lower case: `expected from`, `expected into` |
 | `expected "<p>"` | punctuation: `expected ")"` |
 | `expected table name` / `column name` / `alias` | |
-| `<what> too long (max 32)` | a name over 32 bytes |
+| `table name too long (max 32)` / `column name` / `alias` | a name over 32 bytes, wherever it stands |
 | `expected a literal value` | |
 | `expected a comparison operator` | |
 | `expected between, like or in after not` | |
 | `integer literal out of range` | |
-| `malformed real literal` | |
+| `malformed real literal` | an exponent with no digit (`1e`), or a value out of range |
 | `sign not allowed before a string literal` / `before NULL` | |
 | `unknown column type "<word>"` | |
 | `CHAR width must be a positive integer` / `must be positive` | |
@@ -471,7 +479,7 @@ Errors found when the statement is run carry no position. These are stable:
 | `no database open` | |
 | `no such table: <t>` | `INSERT`, `UPDATE`, `DELETE`, `SELECT` |
 | `no such column: <c>` | in a list, `SET`, `WHERE` or `ORDER BY` |
-| `duplicate column: <c>` | `INSERT` column list |
+| `duplicate column: <c>` | `INSERT` column list, `UPDATE` `SET` list |
 | `expected <n> values per row, got <m>` | `INSERT` without a column list |
 | `column "<c>" needs an integer` / `a number` / `a string` | 3.1 |
 | `value too long for column "<c>"` | 3.1 |
@@ -495,17 +503,24 @@ Errors found when the statement is run carry no position. These are stable:
 | `no such column: "<c>"`, `cannot drop the only column of "<t>"` | `DROP COLUMN` |
 | `refused: a transaction is in flight` | a table statement inside `BEGIN` (some carry a prefix) |
 
-**Messages that say too little.** These fixed texts stand in for several
-causes, and are to be replaced by the real cause (section 13, Q6). A test
-should require that the statement fails, not that it fails with this text:
+**Failures inside the engine.** These are the statement's words, then `: `
+and the engine's reason when it gave one:
 
 | Message | Given for |
 |---|---|
-| `create index failed` | every failure of `CREATE INDEX` |
-| `operation failed` | every failure of `DROP TABLE` and `DROP INDEX` |
-| `transaction control failed` | every failure of `BEGIN`, `COMMIT`, `ROLLBACK` |
-| `insert failed (duplicate key or I/O error)` | a unique-index violation, among others |
-| `update failed`, `delete failed`, `scan failed`, `commit failed` | likewise |
+| `create index failed: <reason>` | a failure of `CREATE INDEX` |
+| `operation failed: <reason>` | a failure of `DROP TABLE` or `DROP INDEX` |
+| `transaction control failed: <reason>` | a failure of `BEGIN`, `COMMIT`, `ROLLBACK` |
+| `insert failed: <reason>` | for example `insert failed: unique-key violation on index over "id"` |
+| `update failed: <reason>`, `delete failed: <reason>`, `commit failed: <reason>`, `cannot begin transaction: <reason>` | likewise |
+| `failed to write text value: <reason>` | a `TEXT` value of `INSERT` or `UPDATE` |
+| `cannot read text value: <reason>` | a `TEXT` value of a `SELECT` that could not be read; the statement fails |
+
+The words before the colon are stable; the reasons are the engine's
+(`db_last_error`), among them `unique-key violation on index over "<c>"`,
+`refused: a transaction is in flight` and `write attempted on a read-only
+open`. A test may require a reason's words but should not require more of
+the message than that.
 
 ## 10. `sqlsh`
 
@@ -652,18 +667,11 @@ writing this document.
 
 | | Present behaviour | Question |
 |---|---|---|
-| Q3 | A `CHAR` value with a control character in it compares differently in a scan and through an index. | Which order is right; or should such values be refused? |
-| Q4 | `BEGIN`, `COMMIT` and `ROLLBACK` succeed with no database open. | Should be `no database open`. |
-| Q5 | `UPDATE t SET x = 1, x = 2` is accepted; the later value wins. | Refuse, as `INSERT` refuses a repeated column? |
-| Q6 | Fixed messages hide the cause (9.1, last table). | Report the cause. |
-| W5 | A statement cannot span lines. | Allow a statement to continue until `;`? |
 | P3 | `sqlsh` exits 0 after errors. | A non-zero status, perhaps under an option? |
-| — | A real literal with an empty exponent (`1e`) is 1.0 in the ifx build and `malformed real literal` in the gfortran build. | Refuse it in the lexer. |
 | — | A real with a three-digit exponent is displayed without its `E`: `1.00000000-300`. | Use a form that always has it. |
 | — | `-0.0` is displayed `0.00000000E+00` by the ifx build and `-0.00000000E+00` by the gfortran build. | Decide and make the builds agree. |
 | — | `.schema` output is not SQL: no parentheses, names unquoted. | Print a statement that could be read back. |
 | — | Columns of the row display are padded by bytes, so non-ASCII values misalign, and the last column carries trailing blanks. | Pad by characters; do not pad the last column. |
-| — | A name over 32 bytes in a select list is reported as `projection columns too long`. | `column name too long`. |
 | — | `CREATE TABLE` refuses a name differing only in case, but lookup is case-sensitive. | Intended (file systems that fold case); stated here so it is not taken for a defect. |
 
 ## 14. Notes for writing tests

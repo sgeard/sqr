@@ -39,8 +39,9 @@ contains
         scan: do while (i <= n)
             ch = text(i:i)
 
-            ! whitespace
-            if (ch == ' ' .or. ch == CH_TAB) then
+            ! white space: blank, tab and the line breaks (a statement may
+            ! span lines; inside a quoted token a line break is kept)
+            if (ch == ' ' .or. ch == CH_TAB .or. ch == CH_LF .or. ch == CH_CR) then
                 i = i + 1
                 cycle scan
             end if
@@ -59,6 +60,7 @@ contains
             ! number
             if (is_digit(ch)) then
                 call lex_number(text, n, i, start)
+                if (i < 0) return   ! lex_number flagged an error
                 cycle scan
             end if
 
@@ -117,6 +119,8 @@ contains
 
         ! Lex a number starting at i: integer unless it carries a '.' or an
         ! exponent, in which case it is real.  Advances i past the number.
+        ! An exponent with no digit (`1e`, `1e+`) is an error, set here and
+        ! signalled by i = -1, so that no compiler's read decides it.
         subroutine lex_number(s, slen, i, start)
             character(len=*), intent(in)    :: s
             integer,          intent(in)    :: slen
@@ -146,6 +150,15 @@ contains
                     if (i <= slen) then
                         if (s(i:i) == '+' .or. s(i:i) == '-') i = i + 1
                     end if
+                    exp_digit: block
+                        if (i <= slen) then
+                            if (is_digit(s(i:i))) exit exp_digit
+                        end if
+                        call set_err(stat, errmsg, SQR_INVALID, &
+                            'col ' // itoa(start) // ': malformed real literal')
+                        i = -1
+                        return
+                    end block exp_digit
                     do while (i <= slen)
                         if (.not. is_digit(s(i:i))) exit
                         i = i + 1
@@ -554,7 +567,7 @@ contains
                     return
                 end if
                 nout = nout + 1
-                call take_name(out(nout), what)
+                call take_name(out(nout), 'column name')   ! `what` names the list
                 if (had_err) return
                 if (.not. is_punct(tk(), ',')) exit
                 call adv()
@@ -837,7 +850,7 @@ contains
                 call parse_aggregate(item)
                 if (had_err) return
             else
-                call take_name(item%col, 'projection columns')
+                call take_name(item%col, 'column name')
                 if (had_err) return
                 item%kind  = PROJ_COL
                 item%label = item%col

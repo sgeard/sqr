@@ -10,7 +10,7 @@
 !! exactly `sql_lex`'s signature.  Co-locating caller and callee sidesteps it.
 
 submodule (sql) sql_base
-    use :: sqr_consts, only: I32_BYTES, R64_BYTES, CH_NUL, CH_TAB, CH_HIGH, ASCII_CASE_OFFSET, &
+    use :: sqr_consts, only: I32_BYTES, R64_BYTES, CH_NUL, CH_TAB, CH_LF, CH_CR, CH_HIGH, ASCII_CASE_OFFSET, &
                              INT_TEXT_LEN, NUM_TEXT_LEN
     implicit none
 

@@ -40,3 +40,25 @@ SELECT a FROM t3 WHERE a REGEXP '2'
 # everything as an error).
 statement ok
 SELECT a FROM t3 WHERE a = 1
+
+# A column named twice in SET is refused, as in an INSERT column list.
+statement error
+UPDATE t3 SET a = 5, a = 6
+
+query I nosort
+SELECT a FROM t3
+----
+1
+
+# An exponent needs a digit: refused by every compiler.
+statement error
+SELECT 1e
+
+statement error
+SELECT 1e+
+
+statement error
+SELECT 1.5E-
+
+statement ok
+SELECT 1e5, 1E+5, 1.e2

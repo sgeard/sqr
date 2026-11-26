@@ -56,6 +56,13 @@ program utest_sql
     call test_strip_bom()
     call test_encodings()
     call test_limits()
+    call test_char_order()
+    call test_txn_needs_db()
+    call test_update_dup_column()
+    call test_engine_reason()
+    call test_line_breaks()
+    call test_bad_exponent()
+    call test_long_select_name()
 
     call cleanup_dir()
 
@@ -74,6 +81,230 @@ contains
             fail = fail + 1
             print '(a,a)', '  FAIL ', label
         end if
+    end subroutine
+
+    ! ===================== LOWS-DESIGN section 9 =====================
+
+    ! The ids of the rows of t (ordered by id) that `cond` selects, as text:
+    ! '1 3 4'.  An error gives 'ERR'.
+    function ids_where(db, cond) result(s)
+        type(db_t),       intent(inout), target :: db
+        character(len=*), intent(in) :: cond
+        character(len=:), allocatable :: s
+        type(sql_result_t) :: res
+        integer :: rs, i
+        call run(db, "SELECT id FROM t WHERE " // cond // " ORDER BY id", res, rs)
+        if (rs /= SQR_OK) then
+            s = 'ERR'
+            return
+        end if
+        s = ''
+        do i = 1, res%nrows
+            s = s // ' ' // cell(res, i, 1)
+        end do
+    end function
+
+    ! The single cell of a one-row, one-column SELECT ('ERR' on failure).
+    function one_cell(db, text) result(s)
+        type(db_t),       intent(inout), target :: db
+        character(len=*), intent(in) :: text
+        character(len=:), allocatable :: s
+        type(sql_result_t) :: res
+        integer :: rs, i
+        call run(db, text, res, rs)
+        s = 'ERR'
+        if (rs /= SQR_OK) return
+        s = ''
+        do i = 1, res%nrows
+            s = s // ' ' // cell(res, i, 1)
+        end do
+    end function
+
+    ! R8: a CHAR value orders the same through a scan as through an index -
+    ! trailing blanks ignored, then byte order, a prefix first.  Each
+    ! condition, ORDER BY, MIN and MAX is run without an index and again
+    ! after CREATE INDEX, and the answers must agree.
+    subroutine test_char_order()
+        character(len=*), parameter :: TB = achar(9)
+        integer, parameter :: NC = 12
+        type(db_t), target :: db
+        type(sql_result_t) :: res
+        integer :: rs, k
+        character(len=40) :: conds(NC)
+        character(len=:), allocatable :: before(:), after(:)
+        character(len=80) :: tmp
+        call fresh_db(db)
+        call run(db, "CREATE TABLE t (id INTEGER, c CHAR(8))", res, rs)
+        call run(db, "INSERT INTO t VALUES (1, 'a'), (2, 'a" // TB // "b'), (3, 'a b'), " // &
+                     "(4, 'ab'), (5, 'b   ')", res, rs)
+        call check(rs == SQR_OK, 'char order: rows inserted')
+        conds( 1) = "c = 'a'"
+        conds( 2) = "c < 'a b'"
+        conds( 3) = "c <= 'a'"
+        conds( 4) = "c > 'a'"
+        conds( 5) = "c >= 'a" // TB // "b'"
+        conds( 6) = "c BETWEEN 'a' AND 'a b'"
+        conds( 7) = "c IN ('a', 'b')"
+        conds( 8) = "c = 'b'"
+        conds( 9) = "c NOT BETWEEN 'a' AND 'a b'"
+        conds(10) = "c <> 'a'"
+        conds(11) = "c < 'a'"
+        conds(12) = "c > 'ab'"
+        allocate(character(len=80) :: before(NC + 3), after(NC + 3))
+        do k = 1, NC
+            before(k) = ids_where(db, trim(conds(k)))
+        end do
+        before(NC + 1) = one_cell(db, "SELECT id FROM t ORDER BY c")
+        tmp = one_cell(db, "SELECT MIN(c) FROM t");  before(NC + 2) = tmp
+        tmp = one_cell(db, "SELECT MAX(c) FROM t");  before(NC + 3) = tmp
+        call run(db, "CREATE INDEX ON t (c)", res, rs)
+        call check(rs == SQR_OK, 'char order: index created')
+        do k = 1, NC
+            after(k) = ids_where(db, trim(conds(k)))
+        end do
+        after(NC + 1) = one_cell(db, "SELECT id FROM t ORDER BY c")
+        tmp = one_cell(db, "SELECT MIN(c) FROM t");  after(NC + 2) = tmp
+        tmp = one_cell(db, "SELECT MAX(c) FROM t");  after(NC + 3) = tmp
+        do k = 1, NC
+            call check(before(k) == after(k), 'char order: scan = index for ' // &
+                       trim(conds(k)) // ' (' // trim(before(k)) // ' / ' // trim(after(k)) // ')')
+        end do
+        call check(before(NC + 1) == ' 1 2 3 4 5' .and. after(NC + 1) == before(NC + 1), &
+                   'char order: ORDER BY puts a prefix first, then byte order')
+        call check(before(NC + 2) == ' a' .and. after(NC + 2) == before(NC + 2), 'char order: MIN')
+        call check(before(NC + 3) == ' b' .and. after(NC + 3) == before(NC + 3), 'char order: MAX')
+        call check(before(3) == ' 1', "char order: c <= 'a' does not take 'a<TAB>b'")
+        call check(before(8) == ' 5', 'char order: trailing blanks ignored')
+        call db_close(db)
+
+        ! The review's case.
+        call fresh_db(db)
+        call run(db, "CREATE TABLE t (id INTEGER, c CHAR(8))", res, rs)
+        call run(db, "INSERT INTO t VALUES (1, 'a" // TB // "b'), (2, 'a')", res, rs)
+        tmp = one_cell(db, "SELECT COUNT(*) FROM t WHERE c <= 'a'")
+        call run(db, "CREATE INDEX ON t (c)", res, rs)
+        call check(tmp == ' 1' .and. one_cell(db, "SELECT COUNT(*) FROM t WHERE c <= 'a'") == ' 1', &
+                   'char order: COUNT(*) WHERE c <= ''a'' is 1 with and without the index')
+        call db_close(db)
+    end subroutine
+
+    ! R9: BEGIN, COMMIT and ROLLBACK need an open database.
+    subroutine test_txn_needs_db()
+        type(db_t), target :: db
+        type(sql_result_t) :: res
+        integer :: rs, k
+        character(len=200) :: em
+        character(len=8), parameter :: ST(3) = [character(len=8) :: 'BEGIN', 'COMMIT', 'ROLLBACK']
+        do k = 1, 3
+            call run(db, trim(ST(k)), res, rs, em)
+            call check(rs == SQR_INVALID .and. trim(em) == 'no database open', &
+                       'txn needs db: ' // trim(ST(k)) // ' on a closed handle')
+        end do
+        call run(db, "SELECT 1", res, rs)
+        call check(rs == SQR_OK, 'txn needs db: SELECT of a literal still runs')
+    end subroutine
+
+    ! R10: a column twice in SET is refused and the row is unchanged.
+    subroutine test_update_dup_column()
+        type(db_t), target :: db
+        type(sql_result_t) :: res
+        integer :: rs
+        character(len=200) :: em
+        call fresh_db(db)
+        call run(db, "CREATE TABLE t (id INTEGER, a INTEGER)", res, rs)
+        call run(db, "INSERT INTO t VALUES (1, 7)", res, rs)
+        call run(db, "UPDATE t SET a = 1, a = 2", res, rs, em)
+        call check(rs == SQR_INVALID .and. trim(em) == 'duplicate column: a', &
+                   'update dup column: refused with the INSERT wording')
+        call check(one_cell(db, "SELECT a FROM t") == ' 7', 'update dup column: row unchanged')
+        call db_close(db)
+    end subroutine
+
+    ! R11: the engine's reason follows the statement's own words.
+    subroutine test_engine_reason()
+        type(db_t), target :: db
+        type(sql_result_t) :: res
+        integer :: rs
+        character(len=200) :: em
+        call fresh_db(db)
+        call run(db, "CREATE TABLE t (id INTEGER, a INTEGER)", res, rs)
+        call run(db, "CREATE UNIQUE INDEX ON t (id)", res, rs)
+        call run(db, "INSERT INTO t VALUES (1, 1), (2, 2)", res, rs)
+        call run(db, "INSERT INTO t VALUES (1, 3)", res, rs, em)
+        call check(rs == SQR_DUP .and. index(em, 'insert failed: unique-key violation') == 1, &
+                   'engine reason: INSERT names the unique violation (' // trim(em) // ')')
+        call run(db, "UPDATE t SET id = 1 WHERE id = 2", res, rs, em)
+        call check(rs == SQR_DUP .and. index(em, 'update failed: unique-key violation') == 1, &
+                   'engine reason: UPDATE names the unique violation (' // trim(em) // ')')
+        call run(db, "BEGIN", res, rs)
+        call run(db, "CREATE INDEX ON t (a)", res, rs, em)
+        call check(rs /= SQR_OK .and. trim(em) == 'create index failed: refused: a transaction is in flight', &
+                   'engine reason: DDL in a transaction says so (' // trim(em) // ')')
+        call run(db, "ROLLBACK", res, rs)
+        call db_set_readonly(db, rs)
+        call run(db, "INSERT INTO t VALUES (9, 9)", res, rs, em)
+        call check(rs == SQR_READONLY .and. index(em, 'read-only') > 0, &
+                   'engine reason: a write on a read-only database says so (' // trim(em) // ')')
+        call run(db, "DROP TABLE t", res, rs, em)
+        call check(rs == SQR_READONLY .and. index(em, 'operation failed: ') == 1 .and. &
+                   index(em, 'read-only') > 0, 'engine reason: DROP TABLE on read-only (' // trim(em) // ')')
+        call db_close(db)
+    end subroutine
+
+    ! R12: CR and LF separate tokens; inside a string they are kept.
+    subroutine test_line_breaks()
+        character(len=*), parameter :: LF = achar(10), CRLF = achar(13) // achar(10)
+        type(db_t), target :: db
+        type(sql_result_t) :: res
+        integer :: rs
+        call fresh_db(db)
+        call run(db, "CREATE TABLE t" // LF // "(id INTEGER," // CRLF // " c CHAR(8))", res, rs)
+        call check(rs == SQR_OK, 'line breaks: CREATE over three lines')
+        call run(db, "INSERT INTO t VALUES (1, 'x" // LF // "y')", res, rs)
+        call run(db, "SELECT c" // CRLF // "FROM t" // LF // "WHERE id" // CRLF // "= 1", res, rs)
+        call check(rs == SQR_OK .and. res%nrows == 1, 'line breaks: SELECT over four lines')
+        if (rs == SQR_OK .and. res%nrows == 1) &
+            call check(cell(res, 1, 1) == 'x' // LF // 'y', 'line breaks: kept inside a string')
+        call db_close(db)
+    end subroutine
+
+    ! R14: an exponent needs a digit, under every compiler.
+    subroutine test_bad_exponent()
+        type(db_t), target :: db
+        type(sql_result_t) :: res
+        integer :: rs, k
+        character(len=200) :: em
+        character(len=12), parameter :: BAD(3) = [character(len=12) :: 'SELECT 1e', 'SELECT 1e+', 'SELECT 1.5E-']
+        character(len=12), parameter :: GOOD(3) = [character(len=12) :: 'SELECT 1e5', 'SELECT 1E+5', 'SELECT 1.e2']
+        character(len=14), parameter :: GOT(3) = &
+            [character(len=14) :: '1.00000000E+05', '1.00000000E+05', '1.00000000E+02']
+        do k = 1, 3
+            call run(db, trim(BAD(k)), res, rs, em)
+            call check(rs == SQR_INVALID .and. trim(em) == 'col 8: malformed real literal', &
+                       'exponent: ' // trim(BAD(k)) // ' refused (' // trim(em) // ')')
+        end do
+        do k = 1, 3
+            call run(db, trim(GOOD(k)), res, rs)
+            call check(rs == SQR_OK, 'exponent: ' // trim(GOOD(k)) // ' accepted')
+            if (rs == SQR_OK) call check(cell(res, 1, 1) == GOT(k), 'exponent: ' // trim(GOOD(k)) // ' value')
+        end do
+    end subroutine
+
+    ! R19: an over-long name in a select list.
+    subroutine test_long_select_name()
+        type(db_t), target :: db
+        type(sql_result_t) :: res
+        integer :: rs
+        character(len=200) :: em
+        call fresh_db(db)
+        call run(db, "CREATE TABLE t (id INTEGER)", res, rs)
+        call run(db, "SELECT " // repeat('x', SQR_NAME_LEN + 1) // " FROM t", res, rs, em)
+        call check(rs == SQR_INVALID .and. index(em, 'column name too long') > 0, &
+                   'long select name: column name too long (' // trim(em) // ')')
+        call run(db, "CREATE INDEX ON t (" // repeat('x', SQR_NAME_LEN + 1) // ")", res, rs, em)
+        call check(rs == SQR_INVALID .and. index(em, 'column name too long') > 0, &
+                   'long index column name: column name too long (' // trim(em) // ')')
+        call db_close(db)
     end subroutine
 
     ! The SQL layer's column-list limits: exactly the limit is accepted, one

@@ -32,6 +32,8 @@ submodule (sql:sql_base) sql_executor
         'an earlier statement in this transaction failed part-way; ROLLBACK is required'
     character(len=*), parameter :: DOOMED_COMMIT = &
         'not committed: a statement in this transaction failed part-way; it has been rolled back'
+    ! A column named twice in an INSERT column list or a SET list.
+    character(len=*), parameter :: DUP_COLUMN = 'duplicate column: '
 
     !! Gathering context for a `db_scan` (and reused by the cursor path): the
     !! table's column metadata (a `db_describe` snapshot — valid for the
@@ -88,14 +90,8 @@ contains
         if (present(binary_cells)) bmode = binary_cells
         if (present(stat)) stat = SQR_OK
 
-        ! Transaction control statements need no open table.
-        select case (stmt%kind)
-        case (ST_BEGIN, ST_COMMIT, ST_ROLLBACK)
-            call exec_txn(db, stmt, res, stat, errmsg)
-            return
-        end select
-
-        ! Nor does a SELECT of literals with no table.
+        ! A SELECT of literals with no table is the one statement that needs
+        ! no open database.
         if (stmt%kind == ST_SELECT .and. .not. stmt%has_from) then
             call select_const(stmt, res, bmode, stat, errmsg)
             return
@@ -107,6 +103,8 @@ contains
         end if
 
         select case (stmt%kind)
+        case (ST_BEGIN, ST_COMMIT, ST_ROLLBACK)
+            call exec_txn(db, stmt, res, stat, errmsg)
         case (ST_CREATE_TABLE); call exec_create_table(db, stmt, res, stat, errmsg)
         case (ST_DROP_TABLE);   call exec_simple_ddl(db, stmt, res, stat, errmsg)
         case (ST_CREATE_INDEX); call exec_create_index(db, stmt, res, stat, errmsg)
@@ -151,7 +149,7 @@ contains
         integer :: rs
         call db_create_index(db, trim(stmt%table), stmt%names, rs, unique=stmt%unique)
         if (rs /= SQR_OK) then
-            call set_err(stat, errmsg, rs, 'create index failed')
+            call set_engine_err(db, stat, errmsg, rs, 'create index failed')
             return
         end if
         call msg_result(res, merge('unique index created', 'index created       ', stmt%unique))
@@ -201,7 +199,7 @@ contains
             if (len_trim(em) > 0) then
                 call set_err(stat, errmsg, rs, trim(em))
             else
-                call set_err(stat, errmsg, rs, 'operation failed')
+                call set_engine_err(db, stat, errmsg, rs, 'operation failed')
             end if
         end if
     end subroutine
@@ -232,7 +230,7 @@ contains
             call db_rollback(db, rs)
             if (rs == SQR_OK) call msg_result(res, 'rolled back')
         end select
-        if (rs /= SQR_OK) call set_err(stat, errmsg, rs, 'transaction control failed')
+        if (rs /= SQR_OK) call set_engine_err(db, stat, errmsg, rs, 'transaction control failed')
     end subroutine
 
     ! ===================== INSERT =====================
@@ -252,6 +250,7 @@ contains
         logical :: own
         integer(int64) :: mark
         character(len=SQR_ERRMSG_LEN) :: em
+        character(len=:), allocatable :: why
 
         ti = require_table(db, stmt%table, stat, errmsg)
         if (ti == 0) return
@@ -271,7 +270,7 @@ contains
                 ! A column named twice would silently take the later
                 ! value — reject rather than guess intent.
                 if (any(target(1:c-1) == ci)) then
-                    call set_err(stat, errmsg, SQR_INVALID, 'duplicate column: ' // trim(stmt%names(c)))
+                    call set_err(stat, errmsg, SQR_INVALID, DUP_COLUMN // trim(stmt%names(c)))
                     return
                 end if
                 target(c) = ci
@@ -291,7 +290,7 @@ contains
         if (own) then
             call db_begin(db, rs)
             if (rs /= SQR_OK) then
-                call set_err(stat, errmsg, rs, 'cannot begin transaction')
+                call set_engine_err(db, stat, errmsg, rs, 'cannot begin transaction')
                 return
             end if
         end if
@@ -314,8 +313,9 @@ contains
             end do
             call db_insert(db, trim(stmt%table), buf, rid, rs)
             if (rs /= SQR_OK) then
+                why = engine_reason(db)          ! before the rollback replaces it
                 call fail_txn(db, own, mark)
-                call set_err(stat, errmsg, rs, 'insert failed (duplicate key or I/O error)')
+                call set_err(stat, errmsg, rs, with_reason('insert failed', why))
                 return
             end if
             ! Write any TEXT column values now that the row exists.
@@ -325,8 +325,9 @@ contains
                 call db_set_text(db, trim(stmt%table), rid, &
                     trim(cols(target(c))%name), stmt%values(r, c)%sval, rs)
                 if (rs /= SQR_OK) then
+                    why = engine_reason(db)
                     call fail_txn(db, own, mark)
-                    call set_err(stat, errmsg, rs, 'failed to write text value')
+                    call set_err(stat, errmsg, rs, with_reason('failed to write text value', why))
                     return
                 end if
             end do
@@ -335,7 +336,7 @@ contains
         if (own) then
             call db_commit(db, rs)
             if (rs /= SQR_OK) then
-                call set_err(stat, errmsg, rs, 'commit failed')
+                call set_engine_err(db, stat, errmsg, rs, 'commit failed')
                 return
             end if
         end if
@@ -355,6 +356,7 @@ contains
         type(column_t), allocatable :: cols(:)
         logical :: own
         integer(int64) :: mark
+        character(len=:), allocatable :: why
         ti = require_table(db, stmt%table, stat, errmsg)
         if (ti == 0) return
         call db_describe(db, trim(stmt%table), cols)
@@ -369,19 +371,20 @@ contains
         mark = db_txn_mark(db)
         if (own) then
             call db_begin(db, rs)
-            if (rs /= SQR_OK) then; call set_err(stat, errmsg, rs, 'cannot begin transaction'); return; end if
+            if (rs /= SQR_OK) then; call set_engine_err(db, stat, errmsg, rs, 'cannot begin transaction'); return; end if
         end if
         do k = 1, g%n
             call db_delete(db, trim(stmt%table), g%rids(k), rs)
             if (rs /= SQR_OK) then
+                why = engine_reason(db)
                 call fail_txn(db, own, mark)
-                call set_err(stat, errmsg, rs, 'delete failed')
+                call set_err(stat, errmsg, rs, with_reason('delete failed', why))
                 return
             end if
         end do
         if (own) then
             call db_commit(db, rs)
-            if (rs /= SQR_OK) then; call set_err(stat, errmsg, rs, 'commit failed'); return; end if
+            if (rs /= SQR_OK) then; call set_engine_err(db, stat, errmsg, rs, 'commit failed'); return; end if
         end if
         call count_result(res, g%n)
     end subroutine
@@ -402,6 +405,7 @@ contains
         logical :: own
         integer(int64) :: mark
         character(len=SQR_ERRMSG_LEN) :: em
+        character(len=:), allocatable :: why
 
         ti = require_table(db, stmt%table, stat, errmsg)
         if (ti == 0) return
@@ -416,6 +420,12 @@ contains
                 call set_err(stat, errmsg, SQR_INVALID, 'no such column: ' // trim(stmt%set_cols(s)))
                 return
             end if
+            ! A column set twice would silently take the later value, as
+            ! with INSERT; refused before anything is read or begun.
+            if (any(setcol(1:s-1) == ci)) then
+                call set_err(stat, errmsg, SQR_INVALID, DUP_COLUMN // trim(stmt%set_cols(s)))
+                return
+            end if
             setcol(s) = ci
         end do
 
@@ -427,7 +437,7 @@ contains
         mark = db_txn_mark(db)
         if (own) then
             call db_begin(db, rs)
-            if (rs /= SQR_OK) then; call set_err(stat, errmsg, rs, 'cannot begin transaction'); return; end if
+            if (rs /= SQR_OK) then; call set_engine_err(db, stat, errmsg, rs, 'cannot begin transaction'); return; end if
         end if
         ! One record buffer for the whole loop: gather already holds each
         ! row's image in g%bufs, so reuse it (same length every iteration —
@@ -447,11 +457,12 @@ contains
             if (rs /= SQR_OK) then
                 ! db_update re-validates liveness, so a row that vanished
                 ! between gather and here surfaces as SQR_NOT_FOUND.
+                why = engine_reason(db)
                 call fail_txn(db, own, mark)
                 if (rs == SQR_NOT_FOUND) then
                     call set_err(stat, errmsg, rs, 'update: row vanished')
                 else
-                    call set_err(stat, errmsg, rs, 'update failed')
+                    call set_err(stat, errmsg, rs, with_reason('update failed', why))
                 end if
                 return
             end if
@@ -462,13 +473,16 @@ contains
                 call db_set_text(db, trim(stmt%table), g%rids(k), &
                     trim(cols(setcol(s))%name), stmt%set_vals(s)%sval, rs)
                 if (rs /= SQR_OK) then
-                    call fail_txn(db, own, mark); call set_err(stat, errmsg, rs, 'failed to write text value'); return
+                    why = engine_reason(db)
+                    call fail_txn(db, own, mark)
+                    call set_err(stat, errmsg, rs, with_reason('failed to write text value', why))
+                    return
                 end if
             end do
         end do rows
         if (own) then
             call db_commit(db, rs)
-            if (rs /= SQR_OK) then; call set_err(stat, errmsg, rs, 'commit failed'); return; end if
+            if (rs /= SQR_OK) then; call set_engine_err(db, stat, errmsg, rs, 'commit failed'); return; end if
         end if
         call count_result(res, g%n)
     end subroutine
@@ -524,12 +538,13 @@ contains
         if (has_agg) then
             call select_aggregate(stmt, g, items, ords, binary, res, stat, errmsg)
         else
-            call select_rows(db, stmt, g, items, ords, ocs, binary, res)
+            call select_rows(db, stmt, g, items, ords, ocs, binary, res, stat, errmsg)
         end if
     end subroutine
 
     ! One output row per gathered row, ordered and limited.
-    subroutine select_rows(db, stmt, g, items, ords, ocs, binary, res)
+    ! A TEXT value that cannot be read fails the statement.
+    subroutine select_rows(db, stmt, g, items, ords, ocs, binary, res, stat, errmsg)
         type(db_t),            intent(inout), target :: db
         type(sql_stmt_t),      intent(in)    :: stmt
         type(row_match_ctx_t), intent(in)    :: g
@@ -538,8 +553,10 @@ contains
         integer,               intent(in)    :: ocs(:)      ! ORDER BY columns, in key order
         logical,               intent(in)    :: binary
         type(sql_result_t),    intent(inout) :: res
+        integer,               intent(out),  optional :: stat
+        character(len=*),      intent(inout), optional :: errmsg
         integer, allocatable :: perm(:)
-        integer :: i, j, nout
+        integer :: i, j, nout, rs
 
         allocate(perm(g%n))
         perm = [(i, i = 1, g%n)]
@@ -550,16 +567,20 @@ contains
 
         res%nrows = nout
         allocate(res%cells(nout, res%ncols))
-        do i = 1, nout
+        rows: do i = 1, nout
             do j = 1, res%ncols
                 if (items(j)%kind == PROJ_LIT) then
                     call cell_lit(items(j)%lit, binary, res%cells(i, j))
                 else
                     call render_cell(db, trim(stmt%table), g%cols(ords(j)), &
-                                     g%rids(perm(i)), g%bufs(perm(i)), binary, res%cells(i, j))
+                                     g%rids(perm(i)), g%bufs(perm(i)), binary, res%cells(i, j), rs)
+                    if (rs /= SQR_OK) then
+                        call set_engine_err(db, stat, errmsg, rs, 'cannot read text value')
+                        return
+                    end if
                 end if
             end do
-        end do
+        end do rows
     end subroutine
 
     ! One row of aggregates (and literals) folded over the gathered rows.
@@ -1050,15 +1071,16 @@ contains
                 clen = char_cell(buf, col)
                 associate (s => buf(col%offset : col%offset + clen - 1))
                     select case (c%op)
-                    case (OP_EQ);      yes = s == c%lit%sval
-                    case (OP_NE);      yes = s /= c%lit%sval
-                    case (OP_LT);      yes = s <  c%lit%sval
-                    case (OP_LE);      yes = s <= c%lit%sval
-                    case (OP_GT);      yes = s >  c%lit%sval
-                    case (OP_GE);      yes = s >= c%lit%sval
-                    case (OP_BETWEEN); yes = s >= c%lit%sval .and. s <= c%lit2%sval
+                    case (OP_EQ);      yes = char_order(s, c%lit%sval) == 0
+                    case (OP_NE);      yes = char_order(s, c%lit%sval) /= 0
+                    case (OP_LT);      yes = char_order(s, c%lit%sval) <  0
+                    case (OP_LE);      yes = char_order(s, c%lit%sval) <= 0
+                    case (OP_GT);      yes = char_order(s, c%lit%sval) >  0
+                    case (OP_GE);      yes = char_order(s, c%lit%sval) >= 0
+                    case (OP_BETWEEN)
+                        yes = char_order(s, c%lit%sval) >= 0 .and. char_order(s, c%lit2%sval) <= 0
                     case (OP_NOTBETWEEN)
-                        yes = .not. (s >= c%lit%sval .and. s <= c%lit2%sval)
+                        yes = .not. (char_order(s, c%lit%sval) >= 0 .and. char_order(s, c%lit2%sval) <= 0)
                     case (OP_LIKE);    yes = like_cond(s, c)
                     case (OP_NOTLIKE); yes = .not. like_cond(s, c)
                     case (OP_IN);      yes = in_strings(s, c%lits)
@@ -1067,6 +1089,32 @@ contains
                 end associate
             end select
         end associate
+    end function
+
+    ! The one order of CHAR values, the index's (`key_cmp` over keys that are
+    ! the value with its trailing blanks removed, NUL-padded): trailing
+    ! blanks are ignored, then bytes compare in order and a value that is a
+    ! prefix of the other is the lesser.  Fortran's own comparison pads the
+    ! shorter operand with blanks instead, so a byte below a blank after a
+    ! common prefix would order differently in a scan and through an index.
+    ! Returns -1, 0 or 1.
+    pure function char_order(a, b) result(r)
+        character(len=*), intent(in) :: a, b
+        integer :: r, la, lb, m
+        la = len_trim(a)
+        lb = len_trim(b)
+        m  = min(la, lb)
+        if (a(1:m) < b(1:m)) then
+            r = -1
+        else if (a(1:m) > b(1:m)) then
+            r = 1
+        else if (la < lb) then
+            r = -1
+        else if (la > lb) then
+            r = 1
+        else
+            r = 0
+        end if
     end function
 
     ! LIKE for one condition: the pattern in c%lit, with its escape if any.
@@ -1081,8 +1129,8 @@ contains
         end if
     end function
 
-    ! Is `s` equal to one of the string literals?  (Fortran's comparison
-    ! ignores trailing blanks, as `=` on a CHAR column does.)
+    ! Is `s` equal to one of the string literals?  (Equal in `char_order`,
+    ! which ignores trailing blanks, as `=` on a CHAR column does.)
     pure function in_strings(s, lits) result(yes)
         character(len=*), intent(in) :: s
         type(sql_lit_t),  intent(in) :: lits(:)
@@ -1090,7 +1138,7 @@ contains
         integer :: k
         yes = .false.
         do k = 1, size(lits)
-            if (s == lits(k)%sval) then
+            if (char_order(s, lits(k)%sval) == 0) then
                 yes = .true.
                 return
             end if
@@ -1365,7 +1413,8 @@ contains
     ! Render one column of a row into an output cell.  Text mode formats
     ! INT/REAL for display; binary mode carries the value's native bytes
     ! (exact — for wire clients).  CHAR/TEXT are identical in both modes.
-    subroutine render_cell(db, tname, col, rid, buf, binary, cell)
+    ! rs is the status of the TEXT read; any other column is SQR_OK.
+    subroutine render_cell(db, tname, col, rid, buf, binary, cell, rs)
         type(db_t),       intent(inout) :: db
         character(len=*), intent(in)    :: tname
         type(column_t),   intent(in)    :: col
@@ -1373,7 +1422,8 @@ contains
         character(len=*), intent(in)    :: buf
         logical,          intent(in)    :: binary
         type(sql_cell_t), intent(out)   :: cell
-        integer :: rs
+        integer,          intent(out)   :: rs
+        rs = SQR_OK
         if (row_is_null(buf, col)) then
             call cell_null(binary, cell)
             return
@@ -1387,7 +1437,7 @@ contains
             cell%text = trim(row_get_char(buf, col))
         case (DT_TEXT)
             call db_get_text(db, tname, rid, trim(col%name), cell%text, rs)
-            if (rs /= SQR_OK .or. .not. allocated(cell%text)) cell%text = ''
+            if (rs == SQR_OK .and. .not. allocated(cell%text)) cell%text = ''
         end select
     end subroutine
 
@@ -1550,7 +1600,7 @@ contains
                 cb = char_cell(g%bufs(b), col)
                 associate (sa => g%bufs(a)(col%offset : col%offset + ca - 1), &
                            sb => g%bufs(b)(col%offset : col%offset + cb - 1))
-                    if (sa < sb) then; cmp = -1; else if (sa > sb) then; cmp = 1; else; cmp = 0; end if
+                    cmp = char_order(sa, sb)
                 end associate
             case default
                 cmp = 0
@@ -1588,6 +1638,37 @@ contains
         if (own) return
         blocked = db_txn_doomed(db)
         if (blocked) call set_err(stat, errmsg, SQR_INVALID, DOOMED_STMT)
+    end function
+
+    ! A failure reported with the engine's reason: `what: reason`, or `what`
+    ! alone when the engine recorded none.  Called straight after the
+    ! failing engine call, before anything else on the handle (a rollback
+    ! replaces the reason); a caller that must roll back first takes the
+    ! reason with `engine_reason` and reports through `with_reason`.
+    subroutine set_engine_err(db, stat, errmsg, rs, what)
+        type(db_t),       intent(in)              :: db
+        integer,          intent(out),   optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
+        integer,          intent(in)              :: rs
+        character(len=*), intent(in)              :: what
+        call set_err(stat, errmsg, rs, with_reason(what, engine_reason(db)))
+    end subroutine
+
+    ! The engine's message for the last failure on the handle ('' if none).
+    function engine_reason(db) result(why)
+        type(db_t), intent(in) :: db
+        character(len=:), allocatable :: why
+        call db_last_error(db, msg=why)
+    end function
+
+    pure function with_reason(what, why) result(s)
+        character(len=*), intent(in) :: what, why
+        character(len=:), allocatable :: s
+        if (len_trim(why) > 0) then
+            s = what // ': ' // trim(why)
+        else
+            s = what
+        end if
     end function
 
     subroutine msg_result(res, text)

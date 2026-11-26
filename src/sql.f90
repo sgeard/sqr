@@ -344,9 +344,11 @@ module sql
             logical                                :: yes
         end function
 
-        !! Tokenise one source line.  Always succeeds for well-formed tokens;
+        !! Tokenise one statement's text.  CR and LF are white space, so the
+        !! text may span lines.  Always succeeds for well-formed tokens;
         !! reports `SQR_INVALID` with `errmsg` (carrying the offending column)
-        !! for an unterminated string or a stray character.  `toks(1:ntok)` are
+        !! for an unterminated string, a stray character or an exponent with
+        !! no digit (`malformed real literal`).  `toks(1:ntok)` are
         !! the tokens; a trailing `TK_EOF` is **not** appended (callers use
         !! `ntok`).
         module subroutine sql_lex(text, toks, ntok, stat, errmsg)
@@ -369,7 +371,10 @@ module sql
 
         !! Execute one parsed statement against an open database, choosing an
         !! index-driven or scan-driven plan as appropriate, and fill `res`.
-        !! Engine errors propagate through `stat`/`errmsg`.  `db` is `target`
+        !! Only a SELECT of literals runs with no database open.  Engine
+        !! errors propagate through `stat`/`errmsg` as the statement's words
+        !! followed by the engine's reason (`db_last_error`); a TEXT value
+        !! that cannot be read fails a SELECT.  `db` is `target`
         !! because the transaction façade the executor calls needs it.
         !! With `binary_cells` true a SELECT fills INT/REAL cells with the
         !! value's native bytes (`transfer`: 4 B int32 / 8 B IEEE double —

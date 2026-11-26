@@ -309,6 +309,23 @@ namespace eval shelltest {
                                                                        "pack/unpack: a target with a trailing separator unpacks, leaving no temporary"
     }
 
+    # Transaction statements need an open database (sqlsh started with no
+    # directory), and a failure carries the engine's reason.
+    proc t_sql_reasons {} {
+        set r [run [utf8 "BEGIN\nCOMMIT\nROLLBACK\nSELECT 1\n.quit\n"]]
+        check {[regexp -all -line {^error: no database open$} [dict get $r err]] == 3} \
+            "no database: BEGIN, COMMIT and ROLLBACK are refused"
+        check {[regexp -line {^1 *$} [dict get $r out]]} "no database: a SELECT of a literal still runs"
+        set db [fresh_db reasons]
+        set sql ".open $db\nCREATE TABLE t(a INTEGER)\nCREATE UNIQUE INDEX ON t (a)\nINSERT INTO t VALUES(1)\n"
+        append sql "INSERT INTO t VALUES(1)\nUPDATE t SET a = 2, a = 3\n.quit\n"
+        set r [run [utf8 $sql]]
+        check {[regexp -line {^error: insert failed: unique-key violation on index over "a"} [dict get $r err]]} \
+            "engine reason: a unique violation is named"
+        check {[regexp -line {^error: duplicate column: a$} [dict get $r err]]} \
+            "engine reason: a column twice in SET is refused"
+    }
+
     proc t_utf8_bom {} {
         variable BOM_UTF8
         set db [fresh_db utf8bom]
@@ -483,6 +500,7 @@ namespace eval shelltest {
             t_txn_fail
             t_reserved_name
             t_table_names
+            t_sql_reasons
             t_like_long
             t_add_text_column
             t_readonly_counters

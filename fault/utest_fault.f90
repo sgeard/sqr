@@ -13,6 +13,7 @@ program utest_fault
     use, intrinsic :: iso_fortran_env, only: int32, int64
     use sqr
     use sqr_fault, only: fault_arm, fault_disarm, fault_count
+    use sql, only: sql_run, sql_result_t
     use clib_wrap, only: c_rmtree, c_path_exists, c_remove
     implicit none
 
@@ -55,6 +56,7 @@ program utest_fault
     call pack_faults()
     call sweep('set_text',     prep_textrow,     op_settext, .false.)
     call sweep('get_text',     prep_textset,     op_gettext, .false., expect=SQR_ERR)
+    call sql_text_fault()
     ! Every sweep closes its handle after each faulted run: an error path that
     ! strands a connected unit (presize once did, on the journal) goes unseen
     ! on a compiler that allows a file on two units, and breaks every later
@@ -683,6 +685,41 @@ contains
         character(len=:), allocatable :: txt
         call db_get_text(gdb, 'people', 1_int32, 'bio', txt, rs)
     end subroutine op_gettext
+
+    ! A SELECT whose TEXT value cannot be read fails (it once gave an empty
+    ! cell): every fault in the statement is a failure, and a fault in the
+    ! TEXT read says so.
+    subroutine sql_text_fault()
+        character(len=*), parameter :: Q = "SELECT name, bio FROM people"
+        type(sql_result_t) :: res
+        character(len=256) :: em
+        integer :: rs, n, nops, bad, ntext
+        call fault_disarm()
+        call prep_textset()
+        call db_open(gdb, DBDIR, rs)
+        gopen = rs == SQR_OK
+        call fault_arm(BIG)
+        call sql_run(gdb, Q, res, rs, em)
+        nops = fault_count()
+        call fault_disarm()
+        call close_g()
+        call check(rs == SQR_OK .and. nops > 0, 'sql_text: clean run succeeds with I/O')
+        bad = 0; ntext = 0
+        faults: do n = 1, nops
+            call prep_textset()
+            call db_open(gdb, DBDIR, rs)
+            gopen = rs == SQR_OK
+            em = ''
+            call fault_arm(n)
+            call sql_run(gdb, Q, res, rs, em)
+            call fault_disarm()
+            call close_g()
+            if (rs == SQR_OK) bad = bad + 1
+            if (index(em, 'cannot read text value') == 1) ntext = ntext + 1
+        end do faults
+        call check(bad == 0, 'sql_text: every fault fails the SELECT')
+        call check(ntext > 0, 'sql_text: a failed TEXT read is reported as such')
+    end subroutine sql_text_fault
 
     ! db_compact is build-then-swap: a failure mid-compact must leave the
     ! original data fully intact. Sweep every injection point and, after
