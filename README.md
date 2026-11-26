@@ -189,6 +189,13 @@ call db_redo(db, st, label)    ! ...and back
   history**, as do the structural operations (`db_compact`, `db_create_index`,
   column changes, ...). An application that offers Undo makes every write a
   gesture.
+- **A row id is never reused.** Undoing a gesture that inserted rows leaves
+  them in the data file as tombstones and does not lower the table's next
+  row id, so an insert after an undo gets a new id and an id the caller still
+  holds reads as `SQR_NOT_FOUND`, never as some other row. Redo brings the
+  same rows back at the same ids. `db_compact` reclaims the tombstones (and
+  renumbers, as it always has). A rolled-back transaction is different: its
+  rows were never committed, and their ids are handed out again.
 - A gesture enters the history only when its `db_commit` succeeds. A commit
   that fails is rolled back and leaves both the undo and the redo steps as
   they were.

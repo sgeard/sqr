@@ -88,7 +88,7 @@ module sqr
     !! Release of the library and its programs, as `sqlsh --version` prints
     !! it.  Kept level with `version` in fpm.toml (the shell tests compare
     !! the two).
-    character(len=*), parameter, public :: SQR_RELEASE = '2.0.0'
+    character(len=*), parameter, public :: SQR_RELEASE = '2.0.1'
 
     ! --- On-disk format version ---
     !! Current on-disk format version: composite index records (ncols,
@@ -276,8 +276,10 @@ module sqr
     !! BOTH images: `undo_bytes` is what the region held before the gesture,
     !! `redo_bytes` what it holds after.  A grown file contributes one tail range
     !! at `offset = undo_len+1` whose `undo_bytes` is empty (the bytes did not
-    !! exist) and whose `redo_bytes` are the appended bytes — so undo truncates
-    !! them away and redo re-appends them.  Module-private.
+    !! exist) and whose `redo_bytes` are the appended bytes — so undo removes
+    !! them and redo writes them back.  In a table's data file "removes" means
+    !! the appended rows are overwritten with tombstones, never cut off: a row
+    !! id is never reused.  Module-private.
     type :: byterange_t
         integer(int64)                :: offset = 0  !! 1-based byte offset
         character(len=:), allocatable :: undo_bytes  !! Pre-gesture image ('' for a pure tail)

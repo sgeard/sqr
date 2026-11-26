@@ -1971,7 +1971,8 @@ contains
 
     ! Complete one delta: read the current length and the post-gesture image of
     ! every in-place range, then capture the grown tail (bytes that did not exist
-    ! before the gesture; undo truncates them away, redo re-appends them).
+    ! before the gesture; undo removes them — retired in place in a data file,
+    ! truncated away elsewhere — and redo writes them back).
     subroutine finish_delta(db, d, stat)
         class(db_t),        intent(in)    :: db
         type(path_delta_t), intent(inout) :: d
@@ -2007,15 +2008,25 @@ contains
     ! Apply one history step in the chosen direction, as a journalled
     ! transaction of its own:
     !
-    !   1. lower any schema whose row counter the step is about to take below
-    !      what the schema file holds (lower_schemas);
+    !   1. lower any schema whose row counter is ahead of the step's, so a
+    !      reopen recounts the live rows (lower_schemas);
     !   2. stage the current bytes of everything the step will change, and arm
     !      the journal once;
-    !   3. write the step's images, truncate what an undo removes;
+    !   3. write the step's images; an undo then removes what the gesture
+    !      appended — rows a table's data file gained are overwritten with
+    !      tombstones (retire_rows), every other file is truncated;
     !   4. restore the matching counters and resync the open units and index
     !      trees from the bytes just written — the coherence sequence
     !      apply_rollback runs;
     !   5. commit: sync the files, void the journal.
+    !
+    ! ROW IDS ARE NEVER REUSED.  A row id is the record's position in the data
+    ! file, so cutting an undone append off the file would hand the same id to
+    ! the next insert, and a caller still holding the id would silently address
+    ! a different row.  A data file therefore never shrinks here and a table's
+    ! `next_id` is never lowered: the undone rows stay as tombstones (reclaimed
+    ! by `db_compact`, like any deleted row) and redo writes the same rows back
+    ! over them, at the same ids.
     !
     ! A failure anywhere after 2 rolls the whole step back, and a crash leaves
     ! a hot journal the next open replays, so the files hold the step wholly or
@@ -2086,7 +2097,9 @@ contains
 
     ! Stage the current state of everything the step will change in one file:
     ! the bytes under each image (as far as the file reaches), the file's
-    ! length where an image runs past its end, and the tail an undo cuts off.
+    ! length where an image runs past its end, and the tail an undo removes —
+    ! as a region where the rows are retired in place (a data file), as a tail
+    ! where the file is cut back (any other).
     subroutine stage_delta(db, d, redo, st)
         class(db_t),        intent(inout) :: db
         type(path_delta_t), intent(in)    :: d
@@ -2104,16 +2117,25 @@ contains
                 if (off + n - 1_int64 > cur) call stage_extend(db, d%path, st)
             end associate
         end do ranges
-        if (.not. redo .and. d%redo_len > d%undo_len) &
-            call stage_tail(db, d%path, d%undo_len, st)
+        if (.not. redo .and. d%redo_len > d%undo_len) then
+            if (data_recsize(db, d%path) > 0) then
+                call stage_region(db, d%path, d%undo_len + 1_int64, &
+                                  min(d%redo_len, cur) - d%undo_len, st)
+                if (d%redo_len > cur) call stage_extend(db, d%path, st)
+            else
+                call stage_tail(db, d%path, d%undo_len, st)
+            end if
+        end if
     end subroutine
 
     ! Write one file's images.  Redo writes them in capture order: every
     ! post-image was read from the same final state, so overlaps agree.  Undo
     ! writes them in REVERSE capture order, as apply_rollback does: where two
     ! captures overlap, the later one saw the earlier one's change already
-    ! made, so the earliest capture must land last.  Undo then cuts the file
-    ! back to its pre-gesture length.
+    ! made, so the earliest capture must land last.  Undo then removes what
+    ! the gesture appended: a table's data file keeps its length and has the
+    ! appended rows retired in place (row ids are never reused — see
+    ! apply_step); any other file is cut back to its pre-gesture length.
     subroutine write_delta(db, d, redo, st)
         class(db_t),        intent(in)    :: db
         type(path_delta_t), intent(in)    :: d
@@ -2121,7 +2143,7 @@ contains
         integer,            intent(inout) :: st
         character(len=:), allocatable :: full
         integer(int64) :: n
-        integer :: k, ios
+        integer :: k, ios, recsize
         if (st /= SQR_OK) return
         full = pathjoin(db%dir, d%path)
         if (redo) then
@@ -2146,7 +2168,11 @@ contains
                     return
                 end if
             end do backward
-            if (d%redo_len > d%undo_len .and. file_len(full) > d%undo_len) then
+            if (d%redo_len <= d%undo_len) return
+            recsize = data_recsize(db, d%path)
+            if (recsize > 0) then
+                call retire_rows(db, d, recsize, st)
+            else if (file_len(full) > d%undo_len) then
                 ios = c_truncate(full, d%undo_len)
                 call io_check(ios)
                 if (ios /= 0) st = SQR_ERR
@@ -2154,16 +2180,59 @@ contains
         end if
     end subroutine
 
-    ! open_data takes a table's row counter from the data file's size and
-    ! refuses a schema that claims MORE rows than the file holds.  A step that
-    ! shortens a data file below what the schema file last recorded (an undo,
-    ! after something wrote the schema: db_pack_live, a quiesce) would
-    ! therefore leave a database that cannot be opened if the process ended
-    ! before the next schema write.  So the schema is written with the step's
-    ! counters BEFORE the step: a schema that is too low is the ordinary
-    ! crash-stale case, which open_data repairs from the file — whichever way
-    ! the step then goes.  The in-memory counters are left as they are; the
-    ! step sets them when it lands.
+    ! Record size of the open table whose data file is `rel` (a path relative
+    ! to the db directory, as the journal records it), or 0 when `rel` is not
+    ! a table's data file (an index, a blob file).
+    pure integer function data_recsize(db, rel) result(recsize)
+        class(db_t),      intent(in) :: db
+        character(len=*), intent(in) :: rel
+        integer :: ti
+        recsize = 0
+        do ti = 1, db%ntables
+            if (data_relpath(db%tables(ti)%name) == rel) then
+                recsize = db%tables(ti)%record_size
+                return
+            end if
+        end do
+    end function
+
+    ! Undo of a gesture that appended rows to a data file: overwrite the
+    ! appended records [undo_len+1, redo_len] with empty tombstones instead of
+    ! cutting them off, so their ids stay spent.  The records carry nothing
+    ! but the status byte: the blob bytes and index entries the rows owned
+    ! are removed by this same undo, and a tombstone must not point at them.
+    subroutine retire_rows(db, d, recsize, st)
+        class(db_t),        intent(in)    :: db
+        type(path_delta_t), intent(in)    :: d
+        integer,            intent(in)    :: recsize
+        integer,            intent(inout) :: st
+        character(len=:), allocatable :: rec, dead
+        integer(int64) :: nrows
+        integer :: ios
+        if (st /= SQR_OK) return
+        nrows = (d%redo_len - d%undo_len) / int(recsize, int64)
+        if (nrows <= 0_int64) return
+        call row_alloc(rec, recsize)
+        call row_set_status(rec, ROW_TOMBSTONE)
+        dead = repeat(rec, int(nrows))
+        call write_region(db, d%path, d%undo_len + 1_int64, dead, ios)
+        call io_check(ios)
+        if (ios /= 0) st = SQR_ERR
+    end subroutine
+
+    ! A table's row counters reach the schema file only now and then
+    ! (db_close, db_pack_live, a quiesce); between those, open_data repairs a
+    ! stale schema from the data file — but only when the schema's next_id is
+    ! BELOW the file's high-water, which is what makes it recount the live
+    ! rows.  A step that takes rows away without shortening the file (an undo
+    ! retires them in place) after the schema was written would leave a schema
+    ! that agrees with the file on next_id and is wrong on live_count, and a
+    ! process that ended before the next schema write would reopen with the
+    ! wrong count.  So the schema is written with the step's lower counters
+    ! BEFORE the step: a schema that is too low is the ordinary crash-stale
+    ! case, repaired from the file whichever way the step then goes.  The
+    ! in-memory counters are left as they are; the step sets them when it
+    ! lands.
     subroutine lower_schemas(db, snaps, st)
         class(db_t),      intent(inout) :: db
         type(tbl_snap_t), intent(in)    :: snaps(:)
@@ -2225,14 +2294,16 @@ contains
     end function
 
     ! Restore each table's counters from a stored snapshot (history analogue of
-    ! restore_counters, which reads the live txn snapshot instead).
+    ! restore_counters, which reads the live txn snapshot instead).  `next_id`
+    ! is the exception: it only ever rises, because a history step leaves the
+    ! data file its full length (see apply_step) and row ids are never reused.
     subroutine restore_counters_from(db, snaps)
         class(db_t),      intent(inout) :: db
         type(tbl_snap_t), intent(in)    :: snaps(:)
         integer :: ti
         do ti = 1, min(db%ntables, size(snaps))
             associate (t => db%tables(ti))
-                t%next_id    = snaps(ti)%next_id
+                t%next_id    = max(t%next_id, snaps(ti)%next_id)
                 t%live_count = snaps(ti)%live_count
                 t%blob_next  = snaps(ti)%blob_next
             end associate

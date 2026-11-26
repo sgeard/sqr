@@ -31,6 +31,7 @@ program utest_history
     call test_refused_inside_txn()
     call test_overlapping_captures()
     call test_apply_is_journalled()
+    call test_ids_not_reused()
 
     print '(a,i0,a,i0,a)', 'sqr history tests: ', pass, ' passed, ', fail, ' failed'
     if (fail > 0) error stop 1
@@ -174,8 +175,10 @@ contains
         ios = c_rmtree('utest_hist_cascade')
     end subroutine
 
-    ! A gesture that inserts a row grows the data file; undo must truncate the
-    ! append away (and revert next_id/live_count), redo must re-grow it.
+    ! A gesture that inserts a row grows the data file; undo must remove the
+    ! row (and revert live_count) WITHOUT freeing its id — the record stays as
+    ! a tombstone and next_id is not lowered — and redo must bring the same
+    ! row back at the same id.
     subroutine test_insert_extend_roundtrip()
         type(db_t), target :: db
         integer :: r4, rs, ios, ti
@@ -192,12 +195,14 @@ contains
         call db_undo(db, rs)
         call check(getv(db, r4) == -huge(0),     'extend: undo removes the inserted row')
         call check(findv(db, 44) == 0,           'extend: index no longer finds it')
-        call check(db%tables(ti)%next_id == r4,  'extend: undo reverted next_id')
+        call check(db%tables(ti)%next_id == r4 + 1, 'extend: undo keeps next_id (the id stays spent)')
+        call check(db%tables(ti)%live_count == 1,   'extend: undo reverted live_count')
 
         call db_redo(db, rs)
         call check(getv(db, r4) == 44,             'extend: redo re-inserts the row')
         call check(findv(db, 44) == r4,            'extend: index sees the redone row')
-        call check(db%tables(ti)%next_id == r4 + 1, 'extend: redo restored next_id')
+        call check(db%tables(ti)%next_id == r4 + 1, 'extend: next_id unchanged by redo')
+        call check(db%tables(ti)%live_count == 2,   'extend: redo restored live_count')
         call db_close(db)
         ios = c_rmtree('utest_hist_extend')
     end subroutine
@@ -503,9 +508,9 @@ contains
     end subroutine
 
     ! C4 / D2: an undo or redo is a transaction of its own — the journal is
-    ! voided when it returns — and an undo that shortens a data file first
-    ! lowers a schema file that records more rows than will remain, so the
-    ! database opens whether or not the process reaches db_close.
+    ! voided when it returns — and an undo that takes rows away first lowers
+    ! a schema file that counts them, so a process that never reaches db_close
+    ! reopens with the live rows recounted from the data file.
     subroutine test_apply_is_journalled()
         type(db_t), target :: db
         integer :: r1, r2, r3, rs, ios, ti
@@ -526,7 +531,11 @@ contains
         call check(.not. db_in_txn(db), 'apply: no transaction left open by undo')
         call check(db%tables(ti)%disk_next_id <= db%tables(ti)%next_id, &
                    'apply: schema file no longer ahead of the data file')
-        call check(db%tables(ti)%next_id == r2, 'apply: next_id back to the pre-gesture value')
+        call check(db%tables(ti)%next_id == r3 + 1, 'apply: next_id kept (ids stay spent)')
+        call check(getv(db, r2) == -huge(0) .and. getv(db, r3) == -huge(0), &
+                   'apply: the undone rows are gone')
+        call db_verify(db, 't', rs)
+        call check(rs == SQR_OK,        'apply: db_verify clean after undo')
         call db_redo(db, rs)
         call check(rs == SQR_OK .and. .not. jrnl_hot(db), 'apply: redo succeeds, journal not hot')
         call check(getv(db, r3) == 3 .and. findv(db, 3) == r3, 'apply: redo restored the rows')
@@ -534,6 +543,61 @@ contains
         call db_close(db)
         ios = c_remove(PK)
         ios = c_rmtree('utest_hist_apply')
+    end subroutine
+
+    ! A row id is never handed out twice: an insert after an undo gets a NEW
+    ! id, the undone id reads as gone, and the store survives a reopen (the
+    ! data file's length is still the high-water).  Deeper undos retire their
+    ! own rows under the ones already retired, and redo restores each row at
+    ! the id it had.
+    subroutine test_ids_not_reused()
+        type(db_t), target :: db
+        integer :: r1, r2, r3, r4, r5, rs, ios, ti
+        call make_db(db, 'utest_hist_ids')
+        r1 = ins(db, 1)
+        ti = db_table_index(db, 't')
+        call db_begin(db, rs, label='A'); r2 = ins(db, 2); call db_commit(db, rs)
+        call db_begin(db, rs, label='B'); r3 = ins(db, 3); call db_commit(db, rs)
+
+        call db_undo(db, rs)                                  ! B gone
+        call db_begin(db, rs, label='C'); r4 = ins(db, 4); call db_commit(db, rs)
+        call check(r4 == r3 + 1,           'ids: an insert after an undo gets a fresh id')
+        call check(getv(db, r3) == -huge(0), 'ids: the undone id reads as gone')
+        call check(findv(db, 3) == 0 .and. findv(db, 4) == r4, 'ids: index follows')
+        call check(db%tables(ti)%live_count == 3, 'ids: live_count counts live rows only')
+        call db_verify(db, 't', rs)
+        call check(rs == SQR_OK,           'ids: db_verify clean with a retired row')
+
+        call db_undo(db, rs)                                  ! C gone
+        call db_undo(db, rs)                                  ! A gone
+        call check(getv(db, r2) == -huge(0) .and. getv(db, r4) == -huge(0), &
+                   'ids: deeper undos retire their rows too')
+        call check(db%tables(ti)%next_id == r4 + 1, 'ids: next_id never lowered')
+        call check(db%tables(ti)%live_count == 1,   'ids: live_count back to 1')
+        call db_redo(db, rs)                                  ! A back
+        call db_redo(db, rs)                                  ! C back
+        call check(getv(db, r2) == 2 .and. getv(db, r4) == 4, 'ids: redo restores each row at its id')
+        call check(getv(db, r3) == -huge(0), 'ids: the forked-away row stays gone')
+        call check(findv(db, 2) == r2 .and. findv(db, 4) == r4, 'ids: index follows redo')
+
+        call db_undo(db, rs)                                  ! C gone again
+        r5 = ins(db, 5)                                       ! plain insert
+        call check(r5 == r4 + 1,           'ids: a plain insert after an undo is fresh too')
+        call db_close(db)
+        call db_open(db, 'utest_hist_ids', rs)
+        call check(rs == SQR_OK,           'ids: reopens')
+        ti = db_table_index(db, 't')
+        call check(db%tables(ti)%next_id == r5 + 1, 'ids: high-water survives the reopen')
+        call check(db%tables(ti)%live_count == 3,   'ids: live_count after the reopen')
+        call check(getv(db, r3) == -huge(0) .and. getv(db, r4) == -huge(0), &
+                   'ids: retired rows still gone after the reopen')
+        call db_verify(db, 't', rs)
+        call check(rs == SQR_OK,           'ids: db_verify clean after the reopen')
+        call db_compact(db, 't', rs)
+        call check(rs == SQR_OK .and. db%tables(ti)%next_id == 4, &
+                   'ids: db_compact reclaims the retired rows')
+        call db_close(db)
+        ios = c_rmtree('utest_hist_ids')
     end subroutine
 
 end program utest_history

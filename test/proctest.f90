@@ -90,7 +90,7 @@ contains
     ! commit ('commit') or crash with the journal still hot ('few'/'deep').
     ! 'undo' is "back up, undo, crash": the inserts are a committed gesture,
     ! db_pack_live then writes the schema with the gesture's rows counted, the
-    ! gesture is undone (the data file shrinks) and the process dies before any
+    ! gesture is undone (its rows are retired in place) and the process dies before any
     ! db_close could rewrite the schema.
     subroutine run_child(scenario)
         character(len=*), intent(in) :: scenario
