@@ -23,6 +23,7 @@ PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
 
 # Per-compiler extras consumed by foptions_$(F).mk
+# -assume byterecl is REQUIRED on ifx: direct-access recl is in bytes (see README, Building)
 F_EXTRA_GF  := -Wno-unused-dummy-argument
 F_EXTRA_IFX := -assume byterecl -diag-disable=7712
 

@@ -95,6 +95,19 @@ fpm run sqrsh
 fpm run sqlsh        # the SQL-subset REPL (front-end over the same API)
 ```
 
+> **ifx needs `-assume byterecl`.** Table and index files are direct-access
+> with `recl` given in bytes. gfortran, flang and aof count `recl` in bytes;
+> ifx counts 4-byte words unless built with `-assume byterecl`, and without
+> it every record lands at the wrong offset (the tests crash). The Makefile
+> passes the flag. Under `fpm` add it yourself:
+>
+> ```sh
+> fpm test --compiler ifx --flag '-assume byterecl'
+> ```
+>
+> fpm 0.12 added it in its default debug profile; fpm 0.14 does not (its
+> release profile still does).
+
 > Note: the regex-dependent `match` action and its test link the external
 > `tcl_re` binding and are built via `make sqrsh-regex` / `make test-regex`,
 > not through `fpm`. The command is chosen at link time (an alternative
