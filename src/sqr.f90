@@ -721,14 +721,22 @@ module sqr
 
         !! Unpack a `.sqr` container written by [[db_pack]] into a new database
         !! directory.  Refuses to overwrite an existing `dir` (`SQR_DUP`, as
-        !! Save-As).  Verifies the checksum before writing anything (a truncated
-        !! transfer is `SQR_ERR`) and validates every archived name against path
-        !! traversal, then extracts into a temporary directory, makes every
+        !! Save-As); trailing separators on `dir` are ignored, and an empty
+        !! `dir` is `SQR_INVALID`.  Verifies the checksum (over the table of
+        !! contents and the payload; version 1 containers, the payload only)
+        !! before writing anything, so a truncated or damaged container is
+        !! `SQR_ERR`.  Accepts only the names `db_pack` writes: `_catalog.dat`,
+        !! and `<stem>.schema`, `.dat`, `.blob`, `.idx` with a non-empty stem,
+        !! never `_journal.dat` or `_lock` in any case; anything else, or a
+        !! name with a separator, `..` or NUL, is `SQR_INVALID`, and a name
+        !! given twice is `SQR_ERR`.  Extracts into the temporary directory
+        !! `<dir>.unpack-tmp` (an abandoned one is removed first), makes every
         !! file and the directory durable, and renames it into place, so a
-        !! failure or a power loss leaves no partial database.  Fails with
-        !! `SQR_ERR` (bad magic/truncated/I-O), `SQR_VERSION` (newer format or
-        !! wrong byte order), `SQR_INVALID` (a malformed archived name), or
-        !! `SQR_DUP` (`dir` already exists).
+        !! failure or a power loss leaves no partial database.  Run one unpack
+        !! to a given target at a time.  Fails with `SQR_ERR` (bad magic,
+        !! truncated, damaged, I/O), `SQR_VERSION` (newer format or wrong byte
+        !! order), `SQR_INVALID` (a refused archived name or an empty `dir`),
+        !! or `SQR_DUP` (`dir` already exists).
         module subroutine db_unpack(file, dir, stat, errmsg)
             character(len=*), intent(in)            :: file  !! Container file to read
             character(len=*), intent(in)            :: dir   !! New database directory to create

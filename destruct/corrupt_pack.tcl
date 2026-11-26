@@ -4,6 +4,7 @@
 #   "SQRP" | int32 version | int32 BOM | int32 nfiles | int32 checksum
 #   nfiles x [int32 namelen | name | int64 size | int64 offset]
 #   payload
+# The checksum (version 2) covers the TOC followed by the payload.
 #
 #   tclsh corrupt_pack.tcl <pristine.sqr> [filter]
 

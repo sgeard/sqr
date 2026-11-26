@@ -88,7 +88,9 @@ Clients match permissively — any spelling that lands on the same directory is
 accepted, against either key.
 
 `PACK` writes a `.sqr` container — the same format `db_pack`/`db_unpack`
-already use — **without closing the database**. See "Backup" below. A
+already use (container version 2 since 2026-11-19, which sqr 2.0.0 and
+earlier refuse with `SQR_VERSION`) — **without closing the database**. See
+"Backup" below. A
 database too large to pack (a file, or the total, over 2 GiB) is refused with
 `ERR` carrying `SQR_FULL` (9) and the reason; nothing is written.
 

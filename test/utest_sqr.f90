@@ -3311,8 +3311,125 @@ contains
         call check(rs == SQR_INVALID, 'pack: path-traversal archive name rejected')
         call check(.not. c_path_exists(EVIL), 'pack: nothing written for a malicious archive')
 
+        ! A3: a trailing separator on the target names the same directory.
+        ! (PFILE was truncated above: pack it afresh.)
+        call db_pack(PDIR, PFILE, rs)
+        ios = c_rmtree(PDIR2)
+        call db_unpack(PFILE, PDIR2 // '/', rs)
+        call check(rs == SQR_OK, 'pack: unpack to "<dir>/" succeeds')
+        call check(.not. c_path_exists(PDIR2 // '/.unpack-tmp') .and. &
+                   .not. c_path_exists(PDIR2 // '.unpack-tmp'), &
+                   'pack: unpack to "<dir>/" leaves no temporary inside or beside it')
+        call db_open(db, PDIR2, rs, emsg)
+        call check(rs == SQR_OK .and. db_table_index(db, 'items') > 0, &
+                   'pack: the database unpacked to "<dir>/" opens with its table')
+        call db_close(db)
+        call db_unpack(PFILE, PDIR2 // '/', rs)
+        call check(rs == SQR_DUP, 'pack: a second unpack to "<dir>/" is refused as existing')
+        call db_unpack(PFILE, '', rs)
+        call check(rs == SQR_INVALID, 'pack: unpack to an empty name is refused')
+        ios = c_rmtree(PDIR2)
+
+        ! A5: the checksum covers the table of contents.  Damage one name into
+        ! another acceptable one ("items.schema" -> "itemz.schema").
+        call get_bytes(PFILE, buf)
+        call check(buf(5:8) == i32b(2), 'pack: db_pack writes container version 2')
+        k = index(buf, 'items.schema')
+        if (k > 0) buf(k+4:k+4) = 'z'
+        call put_bytes('utest_sqr_pack_toc.sqr', buf)
+        call db_unpack('utest_sqr_pack_toc.sqr', PDIR2, rs)
+        call check(k > 0 .and. rs == SQR_ERR, 'pack: a damaged name in the TOC is refused')
+        call check(.not. c_path_exists(PDIR2), 'pack: nothing left after a damaged TOC')
+        ios = c_remove('utest_sqr_pack_toc.sqr')
+
+        ! A4: only the names db_pack writes are accepted.
+        call craft_refused(EVIL, '_journal.dat', SQR_INVALID)
+        call craft_refused(EVIL, '_JOURNAL.DAT', SQR_INVALID)
+        call craft_refused(EVIL, '_lock',        SQR_INVALID)
+        call craft_refused(EVIL, 't.alter',      SQR_INVALID)
+        call craft_refused(EVIL, 'notes.txt',    SQR_INVALID)
+        call craft_refused(EVIL, '.dat',         SQR_INVALID)
+        call craft_refused(EVIL, 't.dat|t.dat',  SQR_ERR)
+        ! A7: a name ending in a blank is not a database file, and is not
+        ! taken for the trimmed name.
+        call craft_refused(EVIL, 't.dat |_catalog.dat', SQR_INVALID)
+        call check(.not. c_path_exists(EVIL // '/t.dat'), 'pack: "t.dat " is not unpacked as "t.dat"')
+        call craft_pack('utest_sqr_pack_evil.sqr', 1, 'notes.txt')
+        emsg = ''
+        call db_unpack('utest_sqr_pack_evil.sqr', EVIL, rs, emsg)
+        call check(index(emsg, 'cannot unpack: "notes.txt" is not a database file') == 1, &
+                   'pack: the refusal names the file')
+
+        ! A7: sizes are bounded by the container file before anything is
+        ! allocated from them.
+        open(newunit=u, file='utest_sqr_pack_evil.sqr', access='stream', &
+             form='unformatted', status='replace', action='write', iostat=ios)
+        write(u) 'SQRP', 2_int32, SQR_BOM, 1000000_int32, 0_int32
+        write(u) 5_int32, 't.dat', 1_int64, 0_int64
+        write(u) 'x'
+        close(u)
+        call db_unpack('utest_sqr_pack_evil.sqr', EVIL, rs)
+        call check(rs == SQR_ERR .and. .not. c_path_exists(EVIL), &
+                   'pack: a file count the container cannot hold is refused')
+        open(newunit=u, file='utest_sqr_pack_evil.sqr', access='stream', &
+             form='unformatted', status='replace', action='write', iostat=ios)
+        write(u) 'SQRP', 2_int32, SQR_BOM, 1_int32, 0_int32
+        write(u) 5_int32, 't.dat', 1000000000_int64, 0_int64
+        write(u) 'x'
+        close(u)
+        call db_unpack('utest_sqr_pack_evil.sqr', EVIL, rs)
+        call check(rs == SQR_ERR .and. .not. c_path_exists(EVIL), &
+                   'pack: a file size larger than the container is refused')
+
         ios = c_rmtree(PDIR); ios = c_rmtree(PDIR2); ios = c_rmtree(EVIL)
         ios = c_remove(PFILE); ios = c_remove('utest_sqr_pack_evil.sqr')
+    end subroutine
+
+    ! Unpack a crafted version-1 container (valid checksum) holding the
+    ! '|'-separated names into `dir`: refused with `expect`, nothing left.
+    subroutine craft_refused(dir, spec, expect)
+        character(len=*), intent(in) :: dir, spec
+        integer,          intent(in) :: expect
+        integer :: rs, ios
+        ios = c_rmtree(dir)
+        call craft_pack('utest_sqr_pack_evil.sqr', 1, spec)
+        call db_unpack('utest_sqr_pack_evil.sqr', dir, rs)
+        call check(rs == expect .and. .not. c_path_exists(dir) .and. &
+                   .not. c_path_exists(dir // '.unpack-tmp'), &
+                   'pack: crafted container "' // spec // '" refused, nothing left')
+    end subroutine
+
+    ! Write a container of version `ver` holding the '|'-separated names of
+    ! `spec`, each a one-byte file 'x', with a valid checksum for its version.
+    subroutine craft_pack(path, ver, spec)
+        character(len=*), intent(in) :: path, spec
+        integer,          intent(in) :: ver
+        character(len=:), allocatable :: toc, payload, nm
+        integer :: p, q, n, cks
+        toc = ''
+        payload = ''
+        n = 0
+        p = 1
+        names: do
+            q = index(spec(p:), '|')
+            if (q == 0) then
+                nm = spec(p:)
+            else
+                nm = spec(p:p+q-2)
+            end if
+            toc = toc // i32b(len(nm)) // nm // i64b(1_int64) // i64b(int(n, int64))
+            payload = payload // 'x'
+            n = n + 1
+            if (q == 0) exit names
+            p = p + q
+        end do names
+        if (ver >= 2) then
+            cks = cksum_of(toc // payload)
+        else
+            cks = cksum_of(payload)
+        end if
+        call put_bytes(path, 'SQRP' // i32b(ver) // i32b(SQR_BOM) // i32b(n) // &
+                       i32b(cks) // toc // payload)
     end subroutine
 
     ! Set sku/region/qty into a freshly-cleared row buffer.
@@ -4950,6 +5067,19 @@ contains
         if (len(bytes) > 0) write(u) bytes
         close(u)
     end subroutine put_bytes
+
+    ! A whole file as a byte string.
+    subroutine get_bytes(path, bytes)
+        character(len=*),              intent(in)  :: path
+        character(len=:), allocatable, intent(out) :: bytes
+        integer :: u
+        integer(int64) :: sz
+        open(newunit=u, file=path, access='stream', form='unformatted', status='old', action='read')
+        inquire(unit=u, size=sz)
+        allocate(character(len=int(sz)) :: bytes)
+        if (sz > 0_int64) read(u) bytes
+        close(u)
+    end subroutine get_bytes
 
     ! A two-row people(pid, age, name) table with a name index (altrec fixture).
     subroutine altrec_people(dir)

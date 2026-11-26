@@ -50,6 +50,7 @@ program utest_fault
     call sweep('add_text',     prep_plain,       op_addtext, .false.)
     call addtext_atomicity()
     call unpack_faults()
+    call pack_faults()
     call sweep('set_text',     prep_textrow,     op_settext, .false.)
     call sweep('get_text',     prep_textset,     op_gettext, .false., expect=SQR_ERR)
     ! Every sweep closes its handle after each faulted run: an error path that
@@ -598,6 +599,56 @@ contains
         ios = c_rmtree(OUT)
         ios = c_remove(PK)
     end subroutine unpack_faults
+
+    ! A6: a failed pack never leaves its temporary file, and the target stays
+    ! a container that unpacks to a database that verifies (old or new).
+    subroutine pack_faults()
+        character(len=*), parameter :: PK = 'utest_fault_pack.sqr', OUT = 'utest_fault_pack_db'
+        type(db_t) :: db
+        integer :: nops, n, rs, bad, left, broken, ios
+        character(len=128) :: em
+        call fault_disarm()
+        call prep_indexed()
+        ios = c_remove(PK)
+        ios = c_remove(PK // '.tmp')
+        ios = c_rmtree(OUT)
+        call db_pack(DBDIR, PK, rs)
+        call check(rs == SQR_OK, 'pack: a good container is in place')
+        call fault_arm(BIG)
+        call db_pack(DBDIR, PK, rs)
+        nops = fault_count()
+        call fault_disarm()
+        call check(rs == SQR_OK .and. nops > 0, 'pack: clean run succeeds, with I/O counted')
+        bad = 0; left = 0; broken = 0
+        sweep_loop: do n = 1, nops
+            call fault_arm(n)
+            call db_pack(DBDIR, PK, rs)
+            call fault_disarm()
+            if (rs == SQR_OK) bad = bad + 1
+            if (c_path_exists(PK // '.tmp')) then
+                print '(a,i0,a)', '  pack fault ', n, ': the temporary file was left behind'
+                left = left + 1
+                ios = c_remove(PK // '.tmp')
+            end if
+            ios = c_rmtree(OUT)
+            call db_unpack(PK, OUT, rs)
+            em = ''
+            if (rs == SQR_OK) then
+                call db_open(db, OUT, rs)
+                if (rs == SQR_OK) call db_verify(db, 'people', rs, em)
+                call db_close(db)
+            end if
+            if (rs /= SQR_OK) then
+                print '(a,i0,a)', '  pack fault ', n, ': the target no longer unpacks to a sound database'
+                broken = broken + 1
+            end if
+        end do sweep_loop
+        call check(bad == 0,    'pack: every injected I/O surfaced as a non-OK status')
+        call check(left == 0,   'pack: a failed pack leaves no temporary file')
+        call check(broken == 0, 'pack: the target always unpacks to a database that verifies')
+        ios = c_rmtree(OUT)
+        ios = c_remove(PK)
+    end subroutine pack_faults
 
     subroutine op_compact(rs)
         integer, intent(out) :: rs

@@ -572,12 +572,18 @@ All three take the optional `stat` and `errmsg` arguments.
   database with a file larger than 2 GiB, or more than 2 GiB in total, is
   refused with `SQR_FULL` and nothing is written. Copy the directory instead
   (with no writer attached).
-- **Unpack never overwrites.** An existing `dir` is `SQR_DUP`. The checksum
-  is verified before anything is written, every archived name is checked
-  against path traversal, and the files are extracted into a temporary
-  directory that is renamed into place, so a failure leaves no partial
-  database. A truncated or damaged file is `SQR_ERR`; a newer container
-  version or the other byte order is `SQR_VERSION`.
+- **Unpack never overwrites.** An existing `dir` is `SQR_DUP` (`out/` and
+  `out` are the same target). The checksum is verified before anything is
+  written. Only the names `db_pack` writes are accepted: `_catalog.dat`, and
+  a table's `.schema`, `.dat`, `.blob` and `.idx` files; a journal, a lock
+  file or anything else in the container is `SQR_INVALID`, and a name that
+  appears twice is `SQR_ERR`. The files are extracted into a temporary
+  directory `<dir>.unpack-tmp` that is renamed into place, so a failure
+  leaves no partial database. A truncated or damaged file is `SQR_ERR`; a
+  newer container version or the other byte order is `SQR_VERSION`.
+- **One unpack to a given target at a time.** An unpack removes a
+  `<dir>.unpack-tmp` left by an abandoned one, so two unpacks to the same
+  target at once would work in each other's temporary directory.
 - **`db_pack_live` is the hot backup.** It is what `sqrd` runs for a `PACK`
   request and so what `sqrbak backup` uses: the handle's file units are
   flushed and released, the snapshot is read, and the units are reopened, all
@@ -587,7 +593,11 @@ All three take the optional `stat` and `errmsg` arguments.
 The format is a plain archive, not a compressed one: a header (magic `SQRP`,
 version, byte-order mark, file count, checksum), a table of contents, then
 each file's bytes. A container is therefore about the size of the directory
-it came from, and is read on a machine of the same byte order.
+it came from, and is read on a machine of the same byte order. Containers
+are written as version 2, whose checksum covers the table of contents as
+well as the file bytes; version 1 containers (sqr 2.0.0 and earlier) are
+still read. sqr 2.0.0 and earlier refuse a version 2 container with
+`SQR_VERSION`.
 
 From the shells:
 

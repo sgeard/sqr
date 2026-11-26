@@ -301,6 +301,12 @@ namespace eval shelltest {
         set r [run [utf8 ".unpack $pk $dst\n.quit\n"]]
         check {[regexp {failed} [dict get $r err]] && ![file exists $dst.unpack-tmp]} \
                                                                        "pack/unpack: a second unpack onto it is refused, leaving no temporary"
+        set dst2 [fresh_db packdst2]
+        file delete -force $dst2.unpack-tmp
+        set r [run [utf8 ".unpack $pk $dst2/\n.quit\n"]]
+        check {![regexp {failed|error} [dict get $r err]] && [file isdirectory $dst2]
+               && ![file exists $dst2.unpack-tmp] && ![file exists $dst2/.unpack-tmp]} \
+                                                                       "pack/unpack: a target with a trailing separator unpacks, leaving no temporary"
     }
 
     proc t_utf8_bom {} {
