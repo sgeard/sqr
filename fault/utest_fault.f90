@@ -94,6 +94,14 @@ program utest_fault
 
     ! H1: a faulted undo replay must leave the journal hot, never voided.
     call recover_fault()
+
+    ! C8: a first arm that fails after its hot header went out must still be
+    ! voided by the rollback.
+    call arm_fault_void()
+
+    ! C7: a rollback that fails with the journal hot latches the handle
+    ! against every write and keeps the journal for the next open.
+    call rollback_latch()
     call check(no_stranded_units(), 'all: no unit left connected after faulted runs')
 
     call cleanup()
@@ -1257,6 +1265,149 @@ contains
         call check(bad == 0, &
             'recover_fault: a disarmed retry restores after a fault at any point')
     end subroutine recover_fault
+
+    ! C8.  txn_arm's `armed` latch says "a hot header may be on disk, so commit
+    ! and rollback must void it".  It used to follow the status of the LAST
+    ! step of the arm, so a first arm whose header was written and flushed but
+    ! whose fsync then failed left the latch clear and the header hot: the
+    ! rollback did not void it, and the hot journal outlived its transaction.
+    ! Sweep a fault across every io_check of the first arm: the arm must fail,
+    ! and after a clean rollback the journal must never be hot.
+    subroutine arm_fault_void()
+        type(db_t) :: db
+        character(len=*), parameter :: REL = 'jf.bin'
+        character(len=:), allocatable :: full
+        integer :: rs, n0, n1, k, r, silent, hot, wrong
+
+        call fault_disarm()
+        r = c_rmtree(DBDIR)
+        call db_open(db, DBDIR, rs)
+        full = trim(db%dir) // '/' // REL
+        call jwrite_file(full, 'AAAAAAAAAAAAAAAA')
+        call fault_arm(BIG)                       ! never fires; just counts
+        call txn_begin(db, rs)
+        n0 = fault_count()
+        call jrnl_log_region(db, REL, 5_int64, 4_int64, stat=rs)
+        n1 = fault_count()
+        call fault_disarm()
+        call check(rs == SQR_OK .and. jrnl_hot(db), 'arm_fault: clean first arm leaves the journal hot')
+        call check(n1 > n0, 'arm_fault: the arm performs I/O')
+        call txn_rollback(db, rs)
+        call check(rs == SQR_OK .and. .not. jrnl_hot(db), 'arm_fault: clean rollback voids it')
+        call db_close(db)
+
+        silent = 0; hot = 0; wrong = 0
+        sweep: do k = n0 + 1, n1
+            r = c_rmtree(DBDIR)
+            call db_open(db, DBDIR, rs)
+            call jwrite_file(full, 'AAAAAAAAAAAAAAAA')
+            call fault_arm(k)                     ! fires inside the first arm
+            call txn_begin(db, rs)
+            call jrnl_log_region(db, REL, 5_int64, 4_int64, stat=rs)
+            call fault_disarm()
+            if (rs == SQR_OK) silent = silent + 1
+            ! The arm failed, so the base write it guarded is not made.
+            call txn_rollback(db, rs)
+            if (rs /= SQR_OK) wrong = wrong + 1
+            if (jrnl_hot(db)) hot = hot + 1
+            if (jread_file(full, 16) /= 'AAAAAAAAAAAAAAAA') wrong = wrong + 1
+            call db_close(db)
+        end do sweep
+        call check(silent == 0, 'arm_fault: every fault in the arm fails it')
+        call check(hot == 0,    'arm_fault: no failed arm leaves a hot journal behind its rollback')
+        call check(wrong == 0,  'arm_fault: the rollback after a failed arm is clean')
+    end subroutine arm_fault_void
+
+    ! C7.  A rollback that cannot finish leaves the journal hot on purpose —
+    ! it is the one record that can complete the repair.  The handle used to
+    ! go idle all the same, so the next mutation's first arm restarted the
+    ! journal at offset 0 and destroyed it, and db_close deleted the file.
+    ! Sweep a fault across every io_check of db_rollback.  Wherever the
+    ! rollback fails: row writes, structural operations and the read-only
+    ! demotion are all refused (SQR_ERR), the journal file survives db_close,
+    ! and the next open finishes the rollback — table verified, row count as
+    ! before the transaction.
+    subroutine rollback_latch()
+        integer :: rs, n_before, n_after, k, ti, base_live
+        integer :: silent, unrefused, lost, unrecovered, nfailed, nhot
+        integer(int32) :: rid
+        character(len=128) :: emsg
+        character(len=:), allocatable :: msg
+
+        call prep_indexed()
+        call db_open(gdb, DBDIR, rs)
+        gopen = .true.
+        ti = db_table_index(gdb, 'people')
+        base_live = gdb%tables(ti)%live_count
+        call fault_arm(BIG)                      ! never fires; just counts
+        call db_begin(gdb, rs)
+        call insert_zoe(gdb, rid, rs)
+        n_before = fault_count()
+        call db_rollback(gdb, rs)
+        n_after = fault_count()
+        call fault_disarm()
+        call check(rs == SQR_OK,       'rollback_latch: clean rollback succeeds')
+        call check(n_after > n_before, 'rollback_latch: rollback performs I/O')
+        call insert_zoe(gdb, rid, rs)
+        call check(rs == SQR_OK,       'rollback_latch: a clean rollback leaves the handle writable')
+        call close_g()
+
+        silent = 0; unrefused = 0; lost = 0; unrecovered = 0; nfailed = 0; nhot = 0
+        sweep: do k = n_before + 1, n_after
+            call prep_indexed()
+            call db_open(gdb, DBDIR, rs)
+            gopen = .true.
+            call fault_arm(k)                    ! fires during db_rollback
+            call db_begin(gdb, rs)
+            call insert_zoe(gdb, rid, rs)
+            call db_rollback(gdb, rs)
+            call fault_disarm()
+            if (rs == SQR_OK) then
+                silent = silent + 1
+                call close_g()
+                cycle sweep
+            end if
+            nfailed = nfailed + 1
+            if (jrnl_hot(gdb)) nhot = nhot + 1
+            ! Every kind of write is now refused, and says what to do.
+            call insert_zoe(gdb, rid, rs)
+            if (rs /= SQR_ERR) unrefused = unrefused + 1
+            call db_last_error(gdb, msg=msg)
+            if (index(msg, 'close and reopen') == 0) unrefused = unrefused + 1
+            call db_begin(gdb, rs)
+            if (rs /= SQR_ERR) unrefused = unrefused + 1
+            call db_create_index(gdb, 'people', 'name', rs)
+            if (rs /= SQR_ERR) unrefused = unrefused + 1
+            call db_compact(gdb, 'people', rs)
+            if (rs /= SQR_ERR) unrefused = unrefused + 1
+            call db_set_readonly(gdb, rs)
+            if (rs /= SQR_ERR) unrefused = unrefused + 1
+            ! The close keeps the journal...
+            call close_g()
+            if (.not. c_path_exists(DBDIR // '/_journal.dat')) lost = lost + 1
+            ! ...and the next open finishes the rollback.
+            call db_open(gdb, DBDIR, rs)
+            gopen = rs == SQR_OK
+            if (rs /= SQR_OK) then
+                unrecovered = unrecovered + 1
+                cycle sweep
+            end if
+            ti = db_table_index(gdb, 'people')
+            if (gdb%tables(ti)%live_count /= base_live) unrecovered = unrecovered + 1
+            call db_verify(gdb, 'people', rs, emsg)
+            if (rs /= SQR_OK) unrecovered = unrecovered + 1
+            if (jrnl_hot(gdb)) unrecovered = unrecovered + 1
+            call insert_zoe(gdb, rid, rs)        ! and the reopened handle writes again
+            if (rs /= SQR_OK) unrecovered = unrecovered + 1
+            call close_g()
+        end do sweep
+        call check(silent == 0,      'rollback_latch: every fault in the rollback fails it')
+        call check(nfailed > 0 .and. nhot > 0, &
+                                     'rollback_latch: failed rollbacks leave the journal hot')
+        call check(unrefused == 0,   'rollback_latch: every write is refused after a failed rollback')
+        call check(lost == 0,        'rollback_latch: db_close keeps the journal')
+        call check(unrecovered == 0, 'rollback_latch: the next open completes the rollback')
+    end subroutine rollback_latch
 
     ! Arm a hot journal capturing REL[5..8] and perform the uncommitted base
     ! overwrite, leaving the file hot for recovery to roll back to 'AAAA...'.

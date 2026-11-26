@@ -113,7 +113,15 @@ contains
             else
                 call jrnl_recover(db, rs)
                 if (rs /= SQR_OK) then
-                    call raise_db(db, rs, stat, errmsg, 'journal recovery failed')
+                    ! A refused (damaged) journal says why and what to do;
+                    ! copied out first, since raise_db writes the same buffer.
+                    why_block: block
+                        character(len=:), allocatable :: why
+                        why = 'journal recovery failed'
+                        if (db%last_errlen > 0) &
+                            why = 'journal recovery failed: ' // db%last_errmsg(1:db%last_errlen)
+                        call raise_db(db, rs, stat, errmsg, why)
+                    end block why_block
                     exit open_seq
                 end if
             end if
@@ -371,14 +379,18 @@ contains
                 end do close_indices
             end associate
         end do close_tables
-        if (.not. db%readonly) then
+        if (.not. db%readonly .and. .not. db%jrnl%needs_recovery) then
             ! Any in-flight transaction was rolled back above, so a journal on
             ! disk is now a voided leftover: delete it so the next open does zero
             ! recovery work.  (Read-only opens never write, so they leave it.)
+            ! Not when a rollback FAILED, in this close or earlier in the
+            ! session: the journal is then still hot and is what the next open
+            ! needs to finish the repair.
             call remove_idle_journal(db, rs)
             if (rs /= SQR_OK .and. first == SQR_OK) first = rs
         end if
         call jrnl_close_unit(db)      ! a read-only handle never opened one; harmless
+        db%jrnl%needs_recovery = .false.   ! the latch belongs to the session just closed
         if (allocated(db%tables)) deallocate(db%tables)
         if (allocated(db%dir))    deallocate(db%dir)
         ! Release the advisory lock (closing its descriptor/handle).
@@ -508,6 +520,9 @@ contains
                 'cannot set read-only while a transaction is open')
             return
         end if
+        ! After a failed rollback the journal is hot and must survive to the
+        ! next open; the demotion below would delete it.
+        if (recovery_block(db, stat, errmsg)) return
         ! Bring the disk level with memory while the lock is still exclusive:
         ! a read-only handle never writes again, not even at db_close, so the
         ! row counters (and a catalog whose last write failed) would otherwise

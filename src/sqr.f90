@@ -74,7 +74,7 @@ module sqr
     integer, parameter, public :: SQR_READONLY  = 6  !! Write attempted on a read-only open
     integer, parameter, public :: SQR_LOCKED    = 7  !! Database held by another connection
     integer, parameter, public :: SQR_NO_UNDO   = 8  !! Nothing on the undo (or redo) history to apply
-    integer, parameter, public :: SQR_FULL      = 9  !! Row-id space exhausted (`int32` ids: ~2.1e9 rows per table), or a database too large for `db_pack`
+    integer, parameter, public :: SQR_FULL      = 9  !! Row-id space exhausted (`int32` ids: ~2.1e9 rows per table), a database too large for `db_pack`, or a transaction whose undo data passes `SQR_JRNL_MAX_PAYLOAD`
 
     ! --- Release ---
     !! Release of the library and its programs, as `sqlsh --version` prints
@@ -224,6 +224,17 @@ module sqr
         integer(int64) :: blob_next  = 1_int64   !! `table%blob_next` at txn_begin
     end type
 
+    !! Most undo data (serialised pre-images, in bytes) one transaction may
+    !! journal.  A write that would take the journal past it is refused with
+    !! `SQR_FULL`, which fails the mutator (and dooms an explicit transaction)
+    !! while the in-memory rollback still works.  It limits what ONE
+    !! transaction changes, not the size of a table or a database.  Lowering
+    !! it is a recompile.  RAISING it is not: crash recovery reads the payload
+    !! into one character variable and the serialise / deserialise cursors are
+    !! default integers, so a value above `huge(0)` first needs those moved to
+    !! `int64` (or recovery made record-by-record).
+    integer(int64), parameter, public :: SQR_JRNL_MAX_PAYLOAD = int(huge(0), int64)
+
     !! Per-database rollback journal.  Opaque to callers, carried as a
     !! component of `db_t`; driven by the `txn_*` / `jrnl_*` procedures.  The
     !! file `<db>/_journal.dat` is a reusable sidecar — a hot (valid) journal
@@ -233,7 +244,10 @@ module sqr
         integer        :: unit     = -1       !! Open stream unit, -1 if not open
         logical        :: active   = .false.  !! A transaction is in flight
         logical        :: explicit = .false.  !! The in-flight txn was opened by `db_begin` (vs. auto-commit)
-        logical        :: armed    = .false.  !! Undo records are durable (journal is hot)
+        logical        :: armed    = .false.  !! A hot header may be on disk: commit and rollback must void it
+        logical        :: needs_recovery = .false.  !! A rollback failed with the journal hot: every write is refused until the database is closed and reopened (which replays the journal)
+        logical        :: full     = .false.  !! This transaction was refused at the payload ceiling (`SQR_FULL`)
+        integer(int64) :: max_payload = SQR_JRNL_MAX_PAYLOAD  !! Undo-payload ceiling of this handle; only ever lowers `SQR_JRNL_MAX_PAYLOAD` (the tests do)
         logical        :: sized    = .false.  !! File created + pre-sized this session
         integer(int64) :: capacity = 0        !! Pre-allocated size in bytes
         integer        :: nrec     = 0        !! Live undo-record count for the current txn
@@ -1437,6 +1451,14 @@ module sqr
         !! every base file and in-memory counter to its pre-`db_begin` state.
         !! Fails `SQR_INVALID` if no explicit transaction is in flight.  Maps
         !! onto SQL `ROLLBACK`.
+        !!
+        !! A rollback that cannot finish (an I/O failure part-way) leaves the
+        !! journal on disk to complete it and the handle refusing every write
+        !! — row mutators, `db_begin`, structural operations and
+        !! `db_set_readonly` all fail `SQR_ERR` — until the database is closed
+        !! and reopened, which replays the journal.  Reads still work, over
+        !! files that may be part-restored.  The same holds for a `db_commit`
+        !! whose own roll-back fails.
         module subroutine db_rollback(db, stat, errmsg)
             class(db_t), intent(inout) :: db  !! Database handle
             integer,    intent(out), optional :: stat  !! `SQR_OK` or an error code
@@ -1504,7 +1526,9 @@ module sqr
         !! Arm the journal (make it hot): serialise the undo set to the file,
         !! write a valid header with count + checksum, and `fsync`.  Must be
         !! called after all `jrnl_log_*` and before any base-file write, so a
-        !! crash between here and commit is recoverable.
+        !! crash between here and commit is recoverable.  Refuses with
+        !! `SQR_FULL`, writing nothing, when the transaction's undo data would
+        !! pass `SQR_JRNL_MAX_PAYLOAD`.
         module subroutine txn_arm(db, stat)
             class(db_t), intent(inout)        :: db  !! Database handle (transaction active)
             integer,    intent(out), optional :: stat  !! `SQR_OK` or an error code
@@ -1528,8 +1552,14 @@ module sqr
 
         !! Recover at open: if a hot (valid) journal exists, replay its undo
         !! records in reverse to restore the pre-transaction state, `fsync`,
-        !! then invalidate it.  A missing, empty, invalidated or corrupt
-        !! journal is a no-op success.
+        !! then invalidate it.  A missing, empty or invalidated journal is a
+        !! no-op success.  A journal that is hot but damaged (impossible
+        !! payload length, checksum mismatch, undecodable or foreign records)
+        !! is the remains of an interrupted transaction that can no longer be
+        !! taken out: the call fails `SQR_ERR`, leaves the file untouched and
+        !! records why (`db_last_error`) — so `db_open` fails rather than hand
+        !! back a half-applied transaction.  Removing `_journal.dat` opens the
+        !! database as it stands.
         module subroutine jrnl_recover(db, stat)
             class(db_t), intent(inout)        :: db  !! Database handle
             integer,    intent(out), optional :: stat  !! `SQR_OK` or an error code

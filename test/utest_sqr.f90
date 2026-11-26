@@ -2824,28 +2824,22 @@ contains
         call db_close(db)                       ! one committed row, journal gone
         jpath = JDIR // '/_journal.dat'
 
-        ! Case 1: hot header + garbage payload with a mismatched checksum. The
-        ! payload is either checksum-rejected or fails to deserialise; either
-        ! way it must be voided, never replayed, and the committed row survives.
+        ! A HOT journal that fails its checks is never replayed and never
+        ! voided: it is damage to the record of an interrupted transaction, so
+        ! the open is refused and the file kept (torn_refused checks that,
+        ! then takes the documented way out and proves the committed row).
+
+        ! Case 1: hot header + garbage payload with a mismatched checksum.
         call write_hot_journal(jpath, 1, 123456, 'XXXXXXXX')
-        call db_open(db, JDIR, rs, emsg)
-        call check(rs == SQR_OK, 'torn: open recovers past corrupt-payload journal')
-        call check(db%tables(1)%live_count == 1, 'torn: committed row survives')
-        call db_get(db, 't', 1_int32, buf, rs)
-        call check(rs == SQR_OK .and. row_get_int(buf, db%tables(1)%cols(1)) == 7, &
-                   'torn: committed row value intact')
-        call db_verify(db, 't', rs, emsg)
-        call check(rs == SQR_OK, 'torn: db_verify clean after corrupt-payload recovery')
-        call db_close(db)
+        call torn_refused(JDIR, jpath, 'corrupt-payload journal')
 
         ! Case 2: hot header claiming an absurd payload length — must be rejected
         ! by the length guard, not trusted into a huge allocate.
         call write_hot_journal_plen(jpath, huge(0_int64))
-        call db_open(db, JDIR, rs, emsg)
-        call check(rs == SQR_OK, 'torn: open voids absurd-length journal')
-        call db_close(db)
+        call torn_refused(JDIR, jpath, 'absurd-length journal')
 
-        ! Case 3: truncated file (magic only) — treated as foreign/absent.
+        ! Case 3: truncated file (magic only) — not a hot header at all, so it
+        ! is treated as foreign/absent and the open succeeds.
         open(newunit=u, file=jpath, access='stream', form='unformatted', &
              status='replace', action='write', iostat=ios)
         write(u) 'SQRJ'
@@ -2861,22 +2855,14 @@ contains
         ! whose checksum fold then ran off the end. The file's own size is the
         ! real bound: a journal cannot hold more payload than it is long.
         call write_hot_journal_plen(jpath, int(huge(0), int64))
-        call db_open(db, JDIR, rs, emsg)
-        call check(rs == SQR_OK, 'torn: open voids a plen of huge(int32)')
-        call db_get(db, 't', 1_int32, buf, rs)
-        call check(rs == SQR_OK, 'torn: row intact after huge-plen journal')
-        call db_close(db)
+        call torn_refused(JDIR, jpath, 'plen of huge(int32)')
 
         ! Case 5: an absurd record count with an empty payload. nrec sized an
         ! unguarded allocate, so this aborted db_open with "insufficient
         ! virtual memory" rather than reporting anything. A record cannot be
         ! shorter than 40 bytes, so the payload length caps the count.
         call write_hot_journal(jpath, huge(0), 0, '')
-        call db_open(db, JDIR, rs, emsg)
-        call check(rs == SQR_OK, 'torn: open voids an absurd record count')
-        call db_get(db, 't', 1_int32, buf, rs)
-        call check(rs == SQR_OK, 'torn: row intact after absurd-nrec journal')
-        call db_close(db)
+        call torn_refused(JDIR, jpath, 'absurd record count')
 
         ! Case 6: a record whose pathlen is near huge(int32). The guard used to
         ! read `p + pathlen - 1 > len(buf)`, which overflows to a negative
@@ -2889,11 +2875,7 @@ contains
             pl = i32b(1) // i32b(huge(0)) // 'x' // repeat(char(0), 32)
             call write_hot_journal(jpath, 1, cksum_of(pl), pl)
         end block wild_pathlen
-        call db_open(db, JDIR, rs, emsg)
-        call check(rs == SQR_OK, 'torn: open voids a wild pathlen')
-        call db_get(db, 't', 1_int32, buf, rs)
-        call check(rs == SQR_OK, 'torn: row intact after wild-pathlen journal')
-        call db_close(db)
+        call torn_refused(JDIR, jpath, 'wild pathlen')
 
         ! Cases 7-10: well-formed records (valid checksum, parseable fields)
         ! carrying hostile *meanings*. Each must leave t.dat exactly as it is:
@@ -2936,28 +2918,53 @@ contains
             call check(sz1 == sz0, 'torn: oversized extend undo did not grow the file')
 
             ! 10: a path that escapes the database directory, and an unknown
-            ! record kind. Both are structural, so the set is voided whole and
-            ! the committed row is still readable.
+            ! record kind. Both are structural, so nothing of the set is
+            ! applied: the open is refused, and the committed row is still
+            ! there once the journal is removed.
             pl = jrec_bytes(1, '../escaped', 0_int64, 1_int64, 4_int64, 'PWND')
             call write_hot_journal(jpath, 1, cksum_of(pl), pl)
-            call db_open(db, JDIR, rs, emsg)
-            call check(rs == SQR_OK, 'torn: open voids a journal naming a path outside the db')
-            call db_close(db)
+            call torn_refused(JDIR, jpath, 'journal naming a path outside the db')
             call check(.not. c_path_exists(JDIR // '/../escaped'), &
                        'torn: no file written outside the database directory')
 
             pl = jrec_bytes(99, 't.dat', sz0, 1_int64, 4_int64, 'ABCD')
             call write_hot_journal(jpath, 1, cksum_of(pl), pl)
-            call db_open(db, JDIR, rs, emsg)
-            call check(rs == SQR_OK, 'torn: open voids an unknown record kind')
-            call db_get(db, 't', 1_int32, buf, rs)
-            call check(rs == SQR_OK .and. row_get_int(buf, db%tables(1)%cols(1)) == 7, &
-                       'torn: row intact after the hostile-record cases')
-            call db_close(db)
+            call torn_refused(JDIR, jpath, 'unknown record kind')
+            inquire(file=dpath, size=sz1)
+            call check(sz1 == sz0, 'torn: t.dat unchanged by the hostile-record cases')
         end block undo_bounds
 
         ios = c_rmtree(JDIR)
+
     end subroutine
+
+    ! The journal just written at `jpath` is hot and unusable: the open must
+    ! be refused with the way out in the message and the journal kept.  Then
+    ! take the way out and check the one committed row (v = 7) is as it was.
+    subroutine torn_refused(jdir, jpath, what)
+        character(len=*), intent(in) :: jdir, jpath, what
+        type(db_t) :: db
+        character(len=:), allocatable :: buf
+        character(len=256) :: why
+        integer :: rs, r
+        why = ''
+        call db_open(db, jdir, rs, why)
+        call check(rs == SQR_ERR, 'torn: open refuses a ' // what)
+        call check(index(why, '_journal.dat') > 0, &
+                   'torn: refusal of a ' // what // ' names the journal file')
+        call check(c_path_exists(jpath), 'torn: ' // what // ' is kept, not removed')
+        r = c_remove(jpath)
+        call db_open(db, jdir, rs, why)
+        call check(rs == SQR_OK, 'torn: opens as it stands without the ' // what)
+        call check(db%tables(1)%live_count == 1, 'torn: committed row survives a ' // what)
+        call row_alloc(buf, db%tables(1)%record_size)
+        call db_get(db, 't', 1_int32, buf, rs)
+        call check(rs == SQR_OK .and. row_get_int(buf, db%tables(1)%cols(1)) == 7, &
+                   'torn: committed row value intact after a ' // what)
+        call db_verify(db, 't', rs, why)
+        call check(rs == SQR_OK, 'torn: db_verify clean after a ' // what)
+        call db_close(db)
+    end subroutine torn_refused
 
     ! One serialised undo record, field order per sqr_journal::put_rec:
     ! kind | pathlen | path | orig_len | offset | length | byteslen | bytes.

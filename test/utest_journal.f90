@@ -4,9 +4,16 @@
 ! crash rollback, extend truncate).  This program covers the *review gap* the
 ! 2026-07-04 fault review named: journals the API never armed cleanly — a
 ! foreign magic, a mismatched checksum, a truncated payload, an implausible
-! payload length.  In every case recovery must be SAFE: it returns SQR_OK,
-! never applies garbage over the base file, never aborts inside db_open, and
-! leaves the journal no longer hot.
+! payload length.  In every case recovery must be SAFE: it never applies
+! garbage over the base file and never aborts inside db_open.  A journal that
+! is not hot (foreign magic) is ignored.  A HOT journal that fails its checks
+! is damage to the one record that could take a half-applied transaction out,
+! so the open is refused (SQR_ERR), the journal is left exactly as found, and
+! the message names the way out: removing _journal.dat opens the database as
+! it stands.
+!
+! Also here: the journal's payload ceiling (SQR_JRNL_MAX_PAYLOAD, lowered per
+! handle through jrnl%max_payload so the test need not write 2 GiB).
 !
 ! The fixture arms a real hot journal (region-capture + base overwrite) exactly
 ! as test_lifecycle does, releases the advisory lock to stand in for the dead
@@ -16,7 +23,8 @@
 program utest_journal
     use, intrinsic :: iso_fortran_env, only: int32, int64
     use sqr
-    use clib_wrap, only: c_rmtree, c_truncate, c_file_size, c_lock_release
+    use clib_wrap, only: c_rmtree, c_truncate, c_file_size, c_lock_release, c_remove, &
+                         c_path_exists
     implicit none
 
     integer :: pass = 0, fail = 0
@@ -39,12 +47,13 @@ program utest_journal
     call one_case('trailing garbage past plen recovers', perturb_trailing_garbage, &
                   expect_rollback=.true.)
 
-    ! Torn corpus: recovery must be safe and leave the journal not hot.
+    ! Not hot: nothing to recover, the open succeeds and touches nothing.
     call one_case('foreign magic  -> no-op, safe',       perturb_magic,     .false.)
-    call one_case('bad checksum   -> voided, safe',      perturb_checksum,  .false.)
-    call one_case('truncated payload -> voided, safe',   perturb_truncate,  .false.)
-    call one_case('huge plen (>int32) -> voided, safe',  perturb_plen_huge, .false.)
-    call one_case('negative plen -> voided, safe',       perturb_plen_neg,  .false.)
+    ! Hot but damaged: the open is refused and the journal kept.
+    call refused_case('bad checksum',       perturb_checksum)
+    call refused_case('truncated payload',  perturb_truncate)
+    call refused_case('huge plen (>int32)', perturb_plen_huge)
+    call refused_case('negative plen',      perturb_plen_neg)
 
     ! Tail records: the bytes a truncation removes come back on recovery, at
     ! the point the file was cut to and nowhere else.
@@ -53,6 +62,10 @@ program utest_journal
     call tail_case('tail: interrupted re-append completed',   12_int64, .true.)
     call tail_case('tail: file cut short of the record',       4_int64, .false.)
     call tail_rollback()
+
+    ! The payload ceiling: raw journal calls, then through the row API.
+    call payload_limit_raw()
+    call payload_limit_api()
 
     ios = c_rmtree(DIR)
     print '(a,i0,a,i0,a)', 'sqr journal tests: ', pass, ' passed, ', fail, ' failed'
@@ -118,6 +131,148 @@ contains
         end if
         call db_close(db2)
     end subroutine one_case
+
+    ! Arm, damage the hot journal, and open: the open must be refused with a
+    ! message naming the way out, the journal must still be hot and the base
+    ! file exactly as the "crash" left it.  Taking the way out (removing the
+    ! journal) then opens the database as it stands.
+    subroutine refused_case(label, perturb)
+        character(len=*), intent(in) :: label
+        interface
+            subroutine perturb()
+            end subroutine perturb
+        end interface
+        type(db_t) :: db2
+        integer :: st, r
+        character(len=256) :: emsg
+
+        call arm_hot()
+        call perturb()
+        emsg = ''
+        call db_open(db2, DIR, stat=st, errmsg=emsg)
+        call check(st == SQR_ERR, label // ': open refused (SQR_ERR)')
+        call check(index(emsg, '_journal.dat') > 0, label // ': message names the journal file')
+        call check(file_hot(JPATH), label // ': journal left hot, not voided')
+        call check(jread_file(FULL, 16) == 'AAAACCCCAAAAAAAA', &
+                   label // ': base file as the crash left it')
+        r = c_remove(JPATH)
+        call db_open(db2, DIR, stat=st)
+        call check(st == SQR_OK, label // ': opens once the journal is removed')
+        call check(jread_file(FULL, 16) == 'AAAACCCCAAAAAAAA', &
+                   label // ': opened as it stands')
+        call db_close(db2)
+    end subroutine refused_case
+
+    ! The ceiling on one transaction's undo payload, against the raw journal
+    ! calls.  Each 4-byte region of jtest.bin serialises to 53 bytes (40 fixed
+    ! + 9 of path + 4 of data), so a ceiling of 120 holds two and refuses the
+    ! third — before the base write it would have guarded.  The in-memory
+    ! rollback then undoes the two that were written, and the limit is per
+    ! transaction: the next one starts from zero.
+    subroutine payload_limit_raw()
+        type(db_t) :: db
+        integer :: st, r
+        character(len=:), allocatable :: msg
+        r = c_rmtree(DIR)
+        call db_open(db, DIR, stat=st)
+        call jwrite_file(FULL, 'AAAAAAAAAAAAAAAA')
+        db%jrnl%max_payload = 120_int64
+        call txn_begin(db, st)
+        call jrnl_log_region(db, REL, 1_int64, 4_int64, stat=st)
+        call check(st == SQR_OK, 'limit: first region fits')
+        call jwrite_region(FULL, 1_int64, 'BBBB')
+        call jrnl_log_region(db, REL, 5_int64, 4_int64, stat=st)
+        call check(st == SQR_OK, 'limit: second region fits')
+        call jwrite_region(FULL, 5_int64, 'CCCC')
+        call jrnl_log_region(db, REL, 9_int64, 4_int64, stat=st)
+        call check(st == SQR_FULL, 'limit: third region refused with SQR_FULL')
+        call db_last_error(db, msg=msg)
+        call check(index(msg, 'transaction too large') > 0, 'limit: message says too large')
+        call check(jrnl_hot(db), 'limit: journal still hot with the two durable records')
+        call txn_rollback(db, st)
+        call check(st == SQR_OK .and. .not. jrnl_hot(db), 'limit: rollback succeeds, journal voided')
+        call check(jread_file(FULL, 16) == 'AAAAAAAAAAAAAAAA', 'limit: rollback restores every byte')
+        call txn_begin(db, st)
+        call jrnl_log_region(db, REL, 9_int64, 4_int64, stat=st)
+        call check(st == SQR_OK, 'limit: a new transaction starts from zero')
+        call txn_rollback(db, st)
+        ! A ceiling set above the compiled one does not raise it.
+        db%jrnl%max_payload = huge(0_int64)
+        call txn_begin(db, st)
+        call jrnl_log_region(db, REL, 1_int64, 4_int64, stat=st)
+        call check(st == SQR_OK, 'limit: handle ceiling above the compiled one is harmless')
+        call txn_rollback(db, st)
+        call db_close(db)
+    end subroutine payload_limit_raw
+
+    ! The same ceiling through the row API.  In an explicit transaction the
+    ! insert that hits it fails with SQR_FULL and dooms the transaction, the
+    ! commit rolls everything back, and the table is intact afterwards.  An
+    ! auto-committed insert that hits it rolls itself back.
+    subroutine payload_limit_api()
+        type(db_t) :: db
+        type(column_t) :: c(1)
+        character(len=:), allocatable :: buf
+        character(len=128) :: emsg
+        integer, parameter :: NFIX = 2000
+        integer :: st, r, i, nfit
+        integer(int32) :: rid
+        r = c_rmtree(DIR)
+        c(1)%name = 'v'; c(1)%dtype = DT_INT; c(1)%csize = 4
+        ! durable=.false.: the fixture is 2000 auto-committed inserts and the
+        ! ceiling does not depend on the fsyncs.
+        call db_open(db, DIR, stat=st, durable=.false.)
+        call db_create_table(db, 't', c, st)
+        call db_create_index(db, 't', 'v', stat=st)
+        call row_alloc(buf, db%tables(1)%record_size)
+        ! Keys 10, 20, ... 20000: enough to spread the index over many leaf
+        ! pages, each of which costs a transaction one page image the first
+        ! time it is written.
+        fixture: do i = 1, NFIX
+            call row_set_int(buf, db%tables(1)%cols(1), int(10 * i, int32))
+            call db_insert(db, 't', buf, rid, st)
+            if (st /= SQR_OK) exit fixture
+        end do fixture
+        call check(st == SQR_OK, 'limit api: fixture rows inserted')
+
+        ! Room for two page images, not three; the inserts below land in
+        ! leaves far apart.
+        db%jrnl%max_payload = 9000_int64
+        call db_begin(db, st)
+        nfit = 0
+        fill: do i = 0, 19
+            call row_set_int(buf, db%tables(1)%cols(1), int(5 + 1000 * i, int32))
+            call db_insert(db, 't', buf, rid, st)
+            if (st /= SQR_OK) exit fill
+            nfit = nfit + 1
+        end do fill
+        call check(st == SQR_FULL, 'limit api: an insert is refused with SQR_FULL')
+        call check(nfit > 0, 'limit api: earlier inserts in the transaction succeeded')
+        call check(db_txn_doomed(db), 'limit api: the transaction is doomed')
+        call db_commit(db, st)
+        call check(st /= SQR_OK, 'limit api: commit of the doomed transaction refuses')
+        call check(db%tables(1)%live_count == NFIX, 'limit api: every insert rolled back')
+        call db_verify(db, 't', st, emsg)
+        call check(st == SQR_OK, 'limit api: table verifies after the rollback')
+        call check(.not. jrnl_hot(db), 'limit api: journal not hot')
+
+        ! Auto-commit: one mutator too big for the ceiling undoes itself.
+        db%jrnl%max_payload = 8_int64
+        call row_set_int(buf, db%tables(1)%cols(1), 5001_int32)
+        call db_insert(db, 't', buf, rid, st)
+        call check(st == SQR_FULL, 'limit api: auto-committed insert refused with SQR_FULL')
+        call check(db%tables(1)%live_count == NFIX, 'limit api: auto-committed insert left nothing')
+        call db_verify(db, 't', st, emsg)
+        call check(st == SQR_OK, 'limit api: table verifies after the refused insert')
+
+        ! Back at the compiled ceiling the same insert goes in.
+        db%jrnl%max_payload = SQR_JRNL_MAX_PAYLOAD
+        call db_insert(db, 't', buf, rid, st)
+        call check(st == SQR_OK .and. db%tables(1)%live_count == NFIX + 1, &
+                   'limit api: the insert succeeds at the compiled ceiling')
+        call db_close(db)
+        call check(.not. c_path_exists(JPATH), 'limit api: clean close removes the journal')
+    end subroutine payload_limit_api
 
     ! Log the tail of a 16-byte file beyond byte 8, leave the file `left`
     ! bytes long (8 = the truncation the record guards; 16 = it never
@@ -256,6 +411,23 @@ contains
         read(u, pos=1) s
         close(u)
     end function jread_file
+
+    ! Does the journal file at `path` carry a hot header?  Read from the disk,
+    ! with no handle (a refused open leaves none).
+    function file_hot(path) result(hot)
+        character(len=*), intent(in) :: path
+        logical :: hot
+        character(len=4) :: magic
+        integer(int32) :: fmt, state
+        integer :: u, io
+        hot = .false.
+        open(newunit=u, file=path, access='stream', form='unformatted', &
+             status='old', action='read', iostat=io)
+        if (io /= 0) return
+        read(u, pos=1, iostat=io) magic, fmt, state
+        close(u)
+        hot = io == 0 .and. magic == 'SQRJ' .and. state == 1
+    end function file_hot
 
     ! By stat, not inquire: a unit a stale (crash stand-in) handle still holds
     ! would make inquire answer from that connection, not from the disk.

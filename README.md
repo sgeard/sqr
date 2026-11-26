@@ -630,6 +630,25 @@ inside an explicit transaction costs ~35 µs. **Batch your writes in
 scaling with the row count, so per-insert cost *falls* as the transaction
 grows.
 
+Three behaviours of that path are worth knowing:
+
+- **A damaged journal stops the open.** If `db_open` finds a journal that
+  is live but fails its checks (bad length, checksum or records), the
+  interrupted transaction can no longer be rolled back. The open fails with
+  `SQR_ERR` and the journal is left untouched, rather than being discarded
+  and the half-applied transaction served as a clean database. The message
+  names the way out: removing `_journal.dat` opens the database as it
+  stands (then `db_verify` each table).
+- **A rollback that fails latches the handle.** After an I/O failure in the
+  middle of a rollback the journal stays on disk and every write on that
+  handle is refused with `SQR_ERR` until the database is closed and
+  reopened, which completes the rollback. Reads still work.
+- **One transaction can journal at most 2 GiB of undo data**
+  (`SQR_JRNL_MAX_PAYLOAD`). The write that would pass it fails with
+  `SQR_FULL`; an explicit transaction is then doomed and rolls back whole.
+  This bounds what a single transaction changes, not the size of a table
+  or a database — split a very large update across several transactions.
+
 A store the host can rebuild, or one it will make durable itself when it
 is finished (an application's working scratch, a cache, a copy being
 assembled before an atomic rename), can be opened with
@@ -637,7 +656,8 @@ assembled before an atomic rename), can be opened with
 barrier and the schema/catalog replace alike — while the writes, flushes,
 transactions, rollback and the atomic renames all stay, so the running
 process never sees a torn file. Only a crash can, and that is the trade the
-flag names.
+flag names: after a power loss such a store may have a torn journal, and
+the open is then refused as described above.
 
 Two things the engine avoids on its own account, because their cost grows
 with the number of open tables: a name-based `inquire`/`open` (the ifx

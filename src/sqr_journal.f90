@@ -166,6 +166,16 @@ contains
             if (present(stat)) stat = SQR_READONLY
             return
         end if
+        ! A rollback that failed left the journal hot and the base files
+        ! part-restored.  A new transaction's first arm would start the
+        ! journal again at payload offset 0 and destroy the only record that
+        ! can finish the repair, so no transaction opens until a close and
+        ! reopen has replayed it.
+        if (db%jrnl%needs_recovery) then
+            call set_last_err(db, SQR_ERR, NEEDS_RECOVERY_MSG)
+            if (present(stat)) stat = SQR_ERR
+            return
+        end if
         if (.not. allocated(db%jrnl%path)) &
             db%jrnl%path = pathjoin(db%dir, '_journal.dat')
         ! Fresh in-memory undo set; the file (if any) stays invalid until arm.
@@ -369,6 +379,23 @@ contains
             if (present(stat)) stat = SQR_INVALID
             return
         end if
+        ! Refuse to grow the payload past what crash recovery can read back
+        ! (see SQR_JRNL_MAX_PAYLOAD): a journal longer than that would be
+        ! unrecoverable after a crash, so the transaction stops here instead,
+        ! while the in-memory rollback can still undo all of it.  Tested
+        ! before anything is serialised or written, so the journal on disk
+        ! still names only the records already durable.
+        newplen = db%jrnl%plen_durable + &
+                  range_serial_len(db%jrnl, db%jrnl%nrec_durable + 1, db%jrnl%nrec)
+        if (newplen > min(db%jrnl%max_payload, SQR_JRNL_MAX_PAYLOAD)) then
+            ! Latched as well as returned: an index page write reaches here
+            ! through the b_tree hook, which can only say "failed", so ac_end
+            ! restores the real cause from the latch.
+            db%jrnl%full = .true.
+            call set_last_err(db, SQR_FULL, TXN_TOO_LARGE_MSG)
+            if (present(stat)) stat = SQR_FULL
+            return
+        end if
         ! Lazily create + pre-size the journal on the first txn of the session.
         fresh = .false.
         if (.not. db%jrnl%sized) then
@@ -414,6 +441,14 @@ contains
             return
         end if
         ! Phase 2 — the header may now safely point at the durable payload.
+        ! Latch `armed` BEFORE the attempt: from here a hot header may be on
+        ! disk whatever this write, its flush or the fsyncs below return (a
+        ! write that reports failure can still have landed), and a later
+        ! re-arm failure does not un-hot the file either.  So commit and
+        ! rollback must void it; voiding a header that never became hot is
+        ! harmless.  (Crash recovery reads the disk, not this flag — see
+        ! jrnl_recover.)
+        db%jrnl%armed = .true.
         write(u, pos=1, iostat=ios) JMAGIC, JFMT, JSTATE_HOT, db%jrnl%nrec, &
                                     ck, newplen
         call io_check(ios)
@@ -443,11 +478,6 @@ contains
             call io_check(ios)
             if (ios /= 0) st = SQR_ERR
         end if
-        ! Latch armed once a hot header has been written: re-arm is called
-        ! before every base write, and a later re-arm failure does not un-hot
-        ! the file, so clean commit/rollback must still void it.  (Crash
-        ! recovery reads the disk, not this flag — see jrnl_recover.)
-        if (ios == 0) db%jrnl%armed = .true.
         if (present(stat)) stat = st
     end subroutine
 
@@ -558,7 +588,20 @@ contains
         ! Void only on a clean unwind.  A failed undo/resync (transient EIO,
         ! ENOSPC) must leave the journal hot so the next open re-applies the
         ! (idempotent) undo records rather than serving a half-restored file.
-        if (db%jrnl%armed .and. st == SQR_OK) call void_header(db, st)
+        if (db%jrnl%armed) then
+            if (st == SQR_OK) call void_header(db, st)
+            ! Still hot: the unwind (or the void itself) failed.  The handle
+            ! goes idle next, and the first arm of a new transaction would
+            ! overwrite the journal — so latch the handle against every write
+            ! (txn_begin, txn_block) and leave the journal for the next open;
+            ! db_close keeps the file when this is set.
+            if (st /= SQR_OK) then
+                db%jrnl%needs_recovery = .true.
+                call set_last_err(db, st, &
+                    'rollback failed and the database is part-restored; ' // &
+                    'close and reopen it to recover')
+            end if
+        end if
     end subroutine
 
     ! Tear down the in-memory transaction state after a commit or rollback.
@@ -569,6 +612,7 @@ contains
         db%jrnl%armed    = .false.
         db%jrnl%nrec     = 0
         db%jrnl%doomed   = .false.
+        db%jrnl%full     = .false.
         db%jrnl%nwrites  = 0
         db%jrnl%op_mark  = 0
         db%hist%tracked  = .false.
@@ -595,7 +639,7 @@ contains
         type(undo_rec_t), allocatable :: recs(:)
         character(len=:), allocatable :: payload
         character(len=len(JMAGIC)) :: magic
-        integer          :: u, ios, fmt, state, nrec, cksum, i, st
+        integer          :: u, ios, fmt, state, nrec, cksum, i, st, cs
         integer(int64)   :: plen, fsize
         logical          :: held
         st = SQR_OK
@@ -628,59 +672,65 @@ contains
             if (present(stat)) stat = SQR_OK
             return
         end if
+        ! From here the header is HOT, so a transaction was in flight and the
+        ! base files may be part-written.  The header only ever names payload
+        ! that was written (and, on a durable handle, fsynced) before it, so
+        ! a journal that now fails a check below is damaged, not unfinished —
+        ! and without its undo records the transaction cannot be taken out.
+        ! Voiding it and opening would hand back a half-applied transaction
+        ! as a clean database, so the open is REFUSED and the journal left
+        ! exactly as found.  (durable=.false. is the exception by design: a
+        ! power loss can tear the journal there, and the same refusal tells
+        ! the user so.)
+        !
         ! Guard the payload length before trusting it: it is not covered by the
-        ! checksum, int(plen) would truncate a >2 GiB value, and a corrupt huge
-        ! plen must not abort db_open inside the allocate.  An implausible or
-        ! unallocatable length means the header is corrupt -> void and move on.
+        ! checksum, int(plen) would truncate a value past the int32 ceiling,
+        ! and a corrupt huge plen must not abort db_open inside the allocate.
         ! The file's own size is the tightest bound available: a journal
         ! claiming more payload than it holds is corrupt however plausible the
-        ! number looks, and checking it here keeps a plen of huge(int32) — which
-        ! clears the int32 ceiling — from reaching a 2 GiB allocate.
-        if (plen < 0_int64 .or. plen > int(huge(0), int64) .or. &
+        ! number looks.  txn_arm never writes past SQR_JRNL_MAX_PAYLOAD.
+        if (plen < 0_int64 .or. plen > SQR_JRNL_MAX_PAYLOAD .or. &
             plen > fsize - JHEADER) then
-            if (.not. held) close(u)
-            call void_header(db, st)
+            if (.not. held) close(u, iostat=cs)
+            call refuse_recovery(db, 'its payload length is impossible', st)
             if (present(stat)) stat = st
             return
         end if
         allocate(character(len=int(plen)) :: payload, stat=ios)
         if (ios /= 0) then
-            if (.not. held) close(u)
-            call void_header(db, st)
+            if (.not. held) close(u, iostat=cs)
+            call refuse_recovery(db, 'no memory to read it', st)
             if (present(stat)) stat = st
             return
         end if
         if (plen > 0) read(u, pos=JHEADER + 1, iostat=ios) payload
-        if (.not. held) close(u)
-        ! A torn or mismatched payload means arming never completed, so no base
-        ! file was touched: discard the journal rather than replay garbage.
+        if (.not. held) close(u, iostat=cs)
         ! Nested rather than `ios /= 0 .or. checksum(...) /= cksum`: .or. does
         ! not short-circuit, so the one-line form folds a whole uninitialised
         ! buffer whenever the read failed.
         if (ios /= 0) then
-            call void_header(db, st)
+            call refuse_recovery(db, 'it cannot be read', st)
             if (present(stat)) stat = st
             return
         end if
         if (checksum(payload) /= cksum) then
-            call void_header(db, st)
+            call refuse_recovery(db, 'its checksum does not match', st)
             if (present(stat)) stat = st
             return
         end if
         call deserialise(payload, nrec, recs, ios)
         if (ios /= 0) then
-            call void_header(db, st)
+            call refuse_recovery(db, 'its records cannot be decoded', st)
             if (present(stat)) stat = st
             return
         end if
         ! Check the whole set before a single base file is touched: a replay
         ! that aborts part-way leaves the database in a state neither the
         ! transaction nor its undo describes.  A set this library never wrote
-        ! is not a repair record at all, so void it rather than apply the
-        ! prefix that happens to parse — unlike the transient I/O failure
-        ! below, this cannot come right on a retry.
+        ! is not a repair record at all, so nothing of it is applied — not
+        ! even the prefix that happens to parse.
         if (.not. recs_sane(recs, nrec)) then
-            call void_header(db, st)
+            call refuse_recovery(db, 'its records are not ones this library writes', st)
             if (present(stat)) stat = st
             return
         end if
@@ -693,6 +743,18 @@ contains
         ! of destroying the one record that can still repair the database.
         if (st == SQR_OK) call void_header(db, st)
         if (present(stat)) stat = st
+    end subroutine
+
+    ! A hot journal that cannot be used: fail the open with the reason and the
+    ! way out, and leave the file untouched (see jrnl_recover).
+    subroutine refuse_recovery(db, why, st)
+        class(db_t),      intent(inout) :: db
+        character(len=*), intent(in)    :: why
+        integer,          intent(out)   :: st
+        st = SQR_ERR
+        call set_last_err(db, SQR_ERR, 'a transaction was interrupted and its ' // &
+            'journal is damaged (' // why // '), so it cannot be rolled back; ' // &
+            'removing _journal.dat opens the database as it stands')
     end subroutine
 
     module function jrnl_hot(db) result(hot)
@@ -757,13 +819,15 @@ contains
     subroutine flush_index_trees(db, st)
         class(db_t), intent(in)              :: db
         integer,     intent(inout), optional :: st
-        integer :: ti, j, bs
+        integer :: ti, j, bs, ios
         do ti = 1, db%ntables
             associate (t => db%tables(ti))
                 do j = 1, t%nindices
                     if (.not. idx_live(t%indices(j))) cycle
                     call bt_sync(t%indices(j)%bt, bs)
-                    if (bs /= BT_OK .and. present(st)) st = SQR_ERR
+                    ios = merge(0, 1, bs == BT_OK)
+                    call io_check(ios)       ! a fault point: b_tree has none of its own
+                    if (ios /= 0 .and. present(st)) st = SQR_ERR
                 end do
             end associate
         end do
@@ -778,16 +842,13 @@ contains
     subroutine fsync_base_files(db, st)
         class(db_t), intent(inout) :: db
         integer,     intent(inout) :: st
-        integer :: i, ios, ti, j, bs
+        integer :: i, ios
         logical :: dup
         call flush_base_files(db, st)
-        do ti = 1, db%ntables
-            associate (t => db%tables(ti))
-                do j = 1, t%nindices
-                    if (idx_live(t%indices(j))) call bt_sync(t%indices(j)%bt, bs)
-                end do
-            end associate
-        end do
+        ! A tree whose buffered pages cannot reach the OS must fail the commit
+        ! like any other file here: fsyncing its path below would succeed over
+        ! pages that never landed.
+        call flush_index_trees(db, st)
         ! Fsync each distinct base file this txn touched, once.  Compare each
         ! record's path only against the DISTINCT paths already seen (first(:),
         ! bounded by tables*2 + indices) — O(nrec * ndistinct), not the old
@@ -1339,19 +1400,25 @@ contains
         if (blen > 0) then; buf(p:p+int(blen)-1) = r%bytes; p = p + int(blen); end if
     end subroutine
 
+    ! Serialised byte length of records recs(lo:hi); zero when lo > hi.
+    pure integer(int64) function range_serial_len(j, lo, hi) result(total)
+        type(journal_t), intent(in) :: j
+        integer,         intent(in) :: lo, hi
+        integer :: i
+        total = 0_int64
+        do i = lo, hi
+            total = total + rec_serial_len(j%recs(i))
+        end do
+    end function
+
     ! Serialise records recs(lo:hi) into a single freshly-allocated buffer (one
     ! allocation, positioned copies — no per-record concat).  Empty when lo > hi.
     subroutine serialise_range(j, lo, hi, buf)
         type(journal_t),               intent(in)  :: j
         integer,                       intent(in)  :: lo, hi
         character(len=:), allocatable, intent(out) :: buf
-        integer(int64) :: total
         integer :: i, p
-        total = 0_int64
-        do i = lo, hi
-            total = total + rec_serial_len(j%recs(i))
-        end do
-        allocate(character(len=int(total)) :: buf)
+        allocate(character(len=int(range_serial_len(j, lo, hi))) :: buf)
         p = 1
         do i = lo, hi
             call put_rec(buf, p, j%recs(i))

@@ -83,6 +83,14 @@ submodule (sqr) sqr_base
     ! Sticky text for a write refused inside a doomed transaction (see ac_begin).
     character(len=*), parameter :: DOOMED_MSG = &
         'refused: a write in this transaction failed part-way; roll it back'
+    ! Sticky text for a write refused after a failed rollback (recovery_block).
+    character(len=*), parameter :: NEEDS_RECOVERY_MSG = &
+        'refused: a rollback failed and the database is part-restored; ' // &
+        'close and reopen it to recover'
+    ! Text for a transaction refused at the journal's payload ceiling (txn_arm).
+    character(len=*), parameter :: TXN_TOO_LARGE_MSG = &
+        'transaction too large: its undo data would pass the journal limit; ' // &
+        'roll back and split it into smaller transactions'
 
     ! checksum_fold: a polynomial fold, acc = (acc*CKSUM_MULT + byte) mod
     ! CKSUM_MOD. The result is stored in journal and pack files, so both
@@ -1461,6 +1469,29 @@ contains
             call set_last_err(db, SQR_INVALID, 'refused: a transaction is in flight')
             if (present(stat))   stat   = SQR_INVALID
             if (present(errmsg)) errmsg = 'refused: a transaction is in flight'
+            return
+        end if
+        ! These operations never pass txn_begin, so the needs-recovery latch
+        ! is tested here as well: rewriting a file the hot journal still
+        ! describes would leave its undo records pointing at the wrong bytes.
+        blocked = recovery_block(db, stat, errmsg)
+    end function
+
+    ! Guard for every write once a rollback has failed with the journal hot
+    ! (jrnl%needs_recovery).  The base files are then part-restored and the
+    ! journal on disk is the only record that can finish the job, so nothing
+    ! may write until a close and reopen has replayed it.  Returns .true. and
+    ! sets stat=SQR_ERR when the caller should refuse.
+    function recovery_block(db, stat, errmsg) result(blocked)
+        type(db_t),       intent(inout)           :: db
+        integer,          intent(out),   optional :: stat
+        character(len=*), intent(inout), optional :: errmsg
+        logical :: blocked
+        blocked = db%jrnl%needs_recovery
+        if (blocked) then
+            call set_last_err(db, SQR_ERR, NEEDS_RECOVERY_MSG)
+            if (present(stat))   stat   = SQR_ERR
+            if (present(errmsg)) errmsg = NEEDS_RECOVERY_MSG
         end if
     end function
 
@@ -1511,6 +1542,13 @@ contains
         logical,    intent(in)    :: owns
         integer,    intent(inout) :: stat
         integer :: st
+        ! A body that failed because the journal refused to grow (txn_arm, at
+        ! the payload ceiling) reports that, whatever the layer in between
+        ! made of it: the b_tree page hook can only pass on "failed".
+        if (stat /= SQR_OK .and. db%jrnl%active .and. db%jrnl%full) then
+            stat = SQR_FULL
+            call set_last_err(db, SQR_FULL, TXN_TOO_LARGE_MSG)
+        end if
         if (.not. owns) then
             if (stat /= SQR_OK .and. db%jrnl%active) then
                 if (db%jrnl%nwrites > db%jrnl%op_mark) db%jrnl%doomed = .true.
@@ -1593,7 +1631,7 @@ contains
         case (SQR_READONLY);  s = 'write attempted on a read-only open'
         case (SQR_LOCKED);    s = 'database held by another connection'
         case (SQR_NO_UNDO);   s = 'nothing on the undo/redo history to apply'
-        case (SQR_FULL);      s = 'row-id space exhausted, or too large to pack'
+        case (SQR_FULL);      s = 'row-id space exhausted, or too large to pack or to journal'
         case default;         s = 'unknown status code'
         end select
     end function
