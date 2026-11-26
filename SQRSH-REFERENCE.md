@@ -143,8 +143,8 @@ table t: record_size=34, next_id=8, live=6
 ```
 
 `next_id` is the id the next inserted row will get; `live` is the number of
-rows. The `entries` figure of an index is not at present reliable
-(section 9). The types are `int`, `real`, `char` and `text`.
+rows. The `entries` figure of an index also counts rows
+deleted since the last `compact` (section 9). The types are `int`, `real`, `char` and `text`.
 
 A table name with a space in it must be quoted: `use "my table"`.
 
@@ -363,7 +363,7 @@ writing this document.
 | — | A backslash before a double quote inside a quoted text is kept, and the quote does not end the text: `"x \"q\" y"` is stored as `x \"q\" y`. cmdgraph documents no escape. | Decide in cmdgraph. |
 | — | A real with an empty exponent (`1e`) is 1.0 in the ifx build and is not a number in the gfortran build. | Refuse it. |
 | — | A real with a three-digit exponent is shown without its `E` (`1.00000000-300`). | Use a form that always has it. |
-| — | After a row is deleted, `desc` still counts it in each index: `live=3` beside `(4 entries)`. Not investigated: a stale counter, or entries really left behind. | Find out which; the two numbers should agree. |
+| — | `delete` leaves the row's entries in the indexes; lookups skip them and `compact` removes them. `desc` counts them, so `live=3` can stand beside `(4 entries)`. (`update` does remove the old entries.) | By design in the engine; should `desc` show the live count, or say what it counts? |
 | — | A failed `done` cannot be repaired, only cancelled. | A command to remove a pending column? |
 | — | `create` allows 64 columns where SQL allows 256. | One limit. |
 | — | Commands are case-sensitive; SQL keywords are not. | Intended (cmdgraph); stated so it is not taken for a defect. |
