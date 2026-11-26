@@ -538,9 +538,12 @@ the notices of meta-commands go to standard error. An error is one line,
 by an error.
 
 **Exit status** is 0 when nothing failed. It is 1 when any statement or
-meta-command failed (the script still runs to its end), or the input is in an
-unsupported encoding, and 2 for a bad command line. A terminal and a pipe give
-the same status.
+meta-command failed (the script still runs to its end), the input is in an
+unsupported encoding, or the Fortran runtime reports that standard input
+cannot be read (`error: cannot read standard input`; `sqlsh` ends at once, a
+partial line unread), and 2 for a bad command line. Some runtimes report such
+input (a directory, for instance) as end of input instead, which ends `sqlsh`
+normally. A terminal and a pipe give the same status.
 
 **Output of a statement:**
 

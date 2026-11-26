@@ -43,8 +43,11 @@ neither.
 
 **Exit status** is 0 when nothing failed. It is 1 when any command failed
 (an unknown or ambiguous command word included), the start-up open failed,
-or the input is in an unsupported encoding (README, "Input encoding"), and 2
-for an option.
+the input is in an unsupported encoding (README, "Input encoding"), or the
+Fortran runtime reports that standard input cannot be read (`cannot read
+standard input`; `sqrsh` ends at once, a partial line unread), and 2 for an
+option. Some runtimes report such input (a directory, for instance) as end of
+input instead, which ends `sqrsh` normally.
 
 **There are no transactions.** Each command that changes the database is
 complete and durable when it reports success. There is no undo.

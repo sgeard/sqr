@@ -82,6 +82,8 @@ int sqr_os_path_exists(const char *p) {
    recurse into subdirectories, delete files, then remove the now-empty
    directory. Continue after a failure so a partial tree is cleared as far as
    possible, but report nonzero if any step failed. */
+static int remove_entry_win(const char *path, DWORD attr);
+
 static int rmtree_win(const char *path) {
     char pat[MAX_PATH];
     WIN32_FIND_DATAA fd;
@@ -104,20 +106,30 @@ static int rmtree_win(const char *path) {
             ierr = 1;                   /* name too long: skip, report failure */
             continue;
         }
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (rmtree_win(child) != 0) ierr = 1;
-        } else {
-            if (!DeleteFileA(child)) ierr = 1;
-        }
+        if (remove_entry_win(child, fd.dwFileAttributes) != 0) ierr = 1;
     } while (FindNextFileA(h, &fd));
     FindClose(h);
     if (!RemoveDirectoryA(path)) ierr = 1;
     return ierr;
 }
 
+/* Remove one entry with attributes `attr`.  A reparse point (junction or
+   symbolic link) is never entered: only the link itself goes, so files
+   outside the tree are left alone, as FTW_PHYS does on POSIX.  A real
+   directory is removed with its contents; anything else is deleted. */
+static int remove_entry_win(const char *path, DWORD attr) {
+    if (attr & FILE_ATTRIBUTE_REPARSE_POINT) {
+        if (attr & FILE_ATTRIBUTE_DIRECTORY) return RemoveDirectoryA(path) ? 0 : 1;
+        return DeleteFileA(path) ? 0 : 1;
+    }
+    if (attr & FILE_ATTRIBUTE_DIRECTORY) return rmtree_win(path);
+    return DeleteFileA(path) ? 0 : 1;
+}
+
 int sqr_os_rmtree(const char *p) {
-    if (_access(p, 0) != 0) return 0;   /* nothing to remove */
-    return rmtree_win(p);
+    DWORD attr = GetFileAttributesA(p);
+    if (attr == INVALID_FILE_ATTRIBUTES) return 0;   /* nothing to remove */
+    return remove_entry_win(p, attr);
 }
 
 int sqr_os_fsync_path(const char *p) {

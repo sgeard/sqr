@@ -14,8 +14,9 @@
 !! name really does start with `-` is given as `./-name`.
 !!
 !! Exit status: 0 when nothing failed; 1 when a statement or a meta-command
-!! failed (the input is read to its end regardless), or the input is in an
-!! encoding sqr cannot read; 2 for a bad command line.
+!! failed (the input is read to its end regardless), the input is in an
+!! encoding sqr cannot read, or standard input cannot be read; 2 for a bad
+!! command line.
 
 program sqlsh
     use, intrinsic :: iso_fortran_env, only: output_unit, error_unit, iostat_end
@@ -29,6 +30,9 @@ program sqlsh
     logical :: interactive, first_line
     logical :: any_failed = .false.   ! a statement or meta-command failed: exit status 1
     character(len=*), parameter :: USAGE = 'usage: sqlsh [<db-dir>]   (or --help, --version)'
+    ! read_line outcomes
+    integer, parameter :: READ_OK = 0, READ_EOF = 1, READ_ERROR = 2
+    integer :: rstat
 
     interactive = is_a_tty()       ! prompt only when reading from a terminal
 
@@ -39,8 +43,9 @@ program sqlsh
     first_line = .true.
     repl: do
         call prompt()
-        call read_line(line)
-        if (.not. allocated(line)) exit repl       ! EOF
+        call read_line(line, rstat)
+        if (rstat == READ_EOF) exit repl
+        if (rstat == READ_ERROR) call input_failed()
         call check_encoding(line, first_line)
         first_line = .false.
         if (len_trim(line) == 0) cycle repl
@@ -141,23 +146,45 @@ contains
     end subroutine
 
     !! Read one logical line of arbitrary length from stdin into `line`.
-    !! Leaves `line` unallocated on end-of-file.
-    subroutine read_line(line)
+    !! `stat` is `READ_OK` for a line (a last line without a newline
+    !! included), `READ_EOF` at end of file, `READ_ERROR` when stdin cannot
+    !! be read (a directory, a closed descriptor, ...).  `line` is left
+    !! unallocated unless `stat` is `READ_OK`: a partial line read before an
+    !! error is discarded, never run.
+    subroutine read_line(line, stat)
         character(len=:), allocatable, intent(out) :: line
+        integer,                       intent(out) :: stat
         integer, parameter :: CHUNK_LEN = 512   ! bytes read per non-advancing read
         character(len=CHUNK_LEN) :: chunk
         integer :: ios, n
         line = ''
-        do
+        stat = READ_OK
+        reading: do
             read(*, '(a)', advance='no', size=n, iostat=ios) chunk
-            if (n > 0) line = line // chunk(1:n)
             if (ios == iostat_end) then
-                if (len(line) == 0) deallocate(line)   ! true EOF, nothing buffered
+                if (n > 0) line = line // chunk(1:n)
+                if (len(line) == 0) then               ! true EOF, nothing buffered
+                    deallocate(line)
+                    stat = READ_EOF
+                end if
                 return
             end if
+            if (ios /= 0 .and. .not. is_iostat_eor(ios)) then
+                deallocate(line)
+                stat = READ_ERROR
+                return
+            end if
+            if (n > 0) line = line // chunk(1:n)
             if (is_iostat_eor(ios)) return             ! end of record: done
-            if (ios /= 0) return                       ! other error: take what we have
-        end do
+        end do reading
+    end subroutine
+
+    !! Standard input cannot be read: say so, close the database as at end
+    !! of file, and end with status 1 rather than reading again for ever.
+    subroutine input_failed()
+        write(error_unit,'(a)') 'error: cannot read standard input'
+        if (db%opened) call db_close(db)
+        call quit(1)
     end subroutine
 
     ! ---- SQL ----

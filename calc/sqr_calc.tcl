@@ -299,21 +299,35 @@ proc sqr::push {} {
         lappend headers $text
         lappend types [lindex $ctypes $at]
     }
-    # full-replace inside one transaction: a failure rolls back to the old table
+    # Every literal is built before the first statement is sent, so a bad
+    # cell stops the push with the table untouched.  Blank text cells sent
+    # (stored as NULL) are counted for the result message.
     set qheaders [lmap h $headers {qid $h}]
-    set npushed 0
-    run BEGIN
+    set inserts {}
+    set nempty 0
     if {[catch {
-        run "DELETE FROM [qid $table]"
         for {set base $nc} {$base < [llength $flat]} {incr base $nc} {
             set row [lrange $flat $base [expr {$base + $nc - 1}]]
             if {[empty_row $row]} continue
+            set sheetrow [expr {$r1 + $base / $nc}]
             set lits {}
-            foreach cell $row type $types {
-                lappend lits [literal $cell $type]
+            foreach cell $row type $types name $headers {
+                lassign $cell tag v
+                if {$tag eq "S" && [string trim $v] eq ""} { incr nempty }
+                lappend lits [literal $cell $type $sheetrow $name]
             }
-            run "INSERT INTO [qid $table] ([join $qheaders {, }]) VALUES ([join $lits {, }])"
-            incr npushed
+            lappend inserts "INSERT INTO [qid $table] ([join $qheaders {, }]) VALUES ([join $lits {, }])"
+        }
+    } err]} {
+        hangup
+        error "push failed, table unchanged: $err"
+    }
+    # full-replace inside one transaction: a failure rolls back to the old table
+    run BEGIN
+    if {[catch {
+        run "DELETE FROM [qid $table]"
+        foreach sql $inserts {
+            run $sql
         }
         run COMMIT
     } err]} {
@@ -322,7 +336,20 @@ proc sqr::push {} {
         error "push failed, table unchanged: $err"
     }
     hangup
-    msg "sqr: pushed $npushed row(s) to $table"
+    # What the full replace discarded: table columns the sheet does not
+    # carry are NULL in every row now.
+    set note "sqr: pushed [llength $inserts] row(s) to $table"
+    set missing {}
+    foreach c $cnames {
+        if {$c ni $headers} { lappend missing $c }
+    }
+    if {[llength $missing]} {
+        append note "; column(s) [join $missing {, }] are not on the sheet and are now NULL in every row"
+    }
+    if {$nempty > 0} {
+        append note "; $nempty empty cells were stored as NULL"
+    }
+    msg $note
 }
 
 # ------------------------------------------------------------------- helpers
@@ -344,11 +371,25 @@ proc sqr::empty_row {row} {
     return 1
 }
 
+# The text a numeric column accepts, as SQL-REFERENCE.md section 2 writes
+# its literals: an INT cell an integer literal with an optional sign; a
+# REAL cell an integer or real literal ("begin with a digit and carry a
+# fraction, an exponent or both"; no leading point; an exponent has a
+# digit), with an optional sign.
+namespace eval sqr {
+    variable INT_TEXT  {^[+-]?[0-9]+$}
+    variable REAL_TEXT {^[+-]?[0-9]+(\.[0-9]*)?([eE][+-]?[0-9]+)?$}
+}
+
 # One tagged cell -> one SQL literal, guided by the column type.  Empty
 # strings are NULL (blanks are never significant); numbers into CHAR/TEXT
-# columns become their text; numeric-looking text into INT/REAL columns is
-# passed through for the server to parse.
-proc sqr::literal {cell type} {
+# columns become their text; text into an INT/REAL column must be a numeric
+# literal of that type, never passed through otherwise (it would be part of
+# the statement).  `row` (the sheet row) and `col` (the column name) name
+# the cell in an error.
+proc sqr::literal {cell type row col} {
+    variable INT_TEXT
+    variable REAL_TEXT
     lassign $cell tag v
     switch $tag {
         N {
@@ -357,13 +398,26 @@ proc sqr::literal {cell type} {
         S {
             set v [string trim $v]
             if {$v eq ""} { return NULL }
-            if {$type in {INT REAL}} { return $v }
+            switch $type {
+                INT {
+                    if {![regexp $INT_TEXT $v]} {
+                        error "row $row, column \"$col\": \"$v\" is not an integer"
+                    }
+                    return $v
+                }
+                REAL {
+                    if {![regexp $REAL_TEXT $v]} {
+                        error "row $row, column \"$col\": \"$v\" is not a number"
+                    }
+                    return $v
+                }
+            }
             return "'[string map {' ''} $v]'"
         }
         V {
             if {$type eq "INT"} {
                 if {$v != entier($v)} {
-                    error "non-integer value $v for INTEGER column"
+                    error "row $row, column \"$col\": non-integer value $v for an INTEGER column"
                 }
                 return [expr {entier($v)}]
             }
@@ -371,5 +425,5 @@ proc sqr::literal {cell type} {
             return $v
         }
     }
-    error "bad cell \"$cell\""
+    error "row $row, column \"$col\": bad cell \"$cell\""
 }

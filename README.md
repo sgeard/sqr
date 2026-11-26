@@ -134,7 +134,8 @@ The handle is declared `target`, and must be: while a transaction is open
 (every write opens one) the index trees hold a pointer to it.  A handle held
 inside another type needs that variable to be the target.  `db_open`
 refuses a handle that is already open (`SQR_INVALID`, the open database
-left as it was): `db_close` it first.
+left as it was): `db_close` it first.  Trailing blanks in a path are not
+significant; a directory whose name ends in a space cannot be opened.
 
 Wrap a group of changes in an explicit transaction when you need them to
 commit (and fail) as a unit:

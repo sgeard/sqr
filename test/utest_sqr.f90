@@ -230,6 +230,12 @@ contains
         call check(c_truncate('no_such_file.xyz', 8_int64) /= 0, &
                                                           'c_truncate on missing file fails')
         ios = c_remove(f)
+        ! c_rmtree on a plain file removes it, as on POSIX (A8, Windows branch)
+        open(newunit=u, file=f, status='replace', iostat=ios)
+        write(u, '(a)') 'x'
+        close(u)
+        call check(c_rmtree(f) == 0,                      'c_rmtree on a plain file returns 0')
+        call check(.not. c_path_exists(f),                'c_rmtree removed the plain file')
     end subroutine
 
     ! Drive the rollback journal directly (no engine wiring yet): a committed

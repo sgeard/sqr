@@ -1291,7 +1291,7 @@ program sqrsh
     type(engine_t) :: ui
     character(len=SQR_MAX_DIR) :: arg
     logical :: interactive
-    logical :: any_failed = .false.   ! a command, the start-up open or the encoding failed: status 1
+    logical :: any_failed = .false.   ! a command, the start-up open, the encoding or reading stdin failed: status 1
 
     ! root state — database-level commands
     call ui%add_state("root", prompt=PROMPT_ROOT)
@@ -1381,10 +1381,11 @@ contains
     !! terminal, and every failed command remembered for the exit status.
     !! The first line loses a UTF-8 byte-order mark and is screened for
     !! another encoding's signature; every line is screened for NUL bytes
-    !! (a wide encoding without a mark).  A refused encoding ends the loop.
+    !! (a wide encoding without a mark).  A refused encoding, or standard
+    !! input that cannot be read, ends the loop with status 1.
     subroutine read_loop()
         character(len=:), allocatable :: line
-        logical :: first
+        logical :: first, read_failed
         integer :: enc, rc
         first = .true.
         lines: do while (ui%is_running())
@@ -1392,7 +1393,12 @@ contains
                 write(output_unit,'(a)', advance='no') prompt_now()
                 flush(output_unit)
             end if
-            call read_line(line)
+            call read_line(line, read_failed)
+            if (read_failed) then
+                write(error_unit,'(a)') 'cannot read standard input'
+                any_failed = .true.
+                exit lines
+            end if
             if (.not. allocated(line)) exit lines
             if (first) then
                 call strip_bom(line, enc)
@@ -1422,23 +1428,33 @@ contains
     end function
 
     !! Read one line of any length from standard input into `line`; leaves
-    !! it unallocated at the end of the input.
-    subroutine read_line(line)
+    !! it unallocated at the end of the input.  `failed` is set, and `line`
+    !! left unallocated, when standard input cannot be read (a directory, a
+    !! closed descriptor, ...): a partial line read before the error is
+    !! discarded, never run.
+    subroutine read_line(line, failed)
         character(len=:), allocatable, intent(out) :: line
+        logical,                       intent(out) :: failed
         integer, parameter :: CHUNK_LEN = 512   ! bytes read per non-advancing read
         character(len=CHUNK_LEN) :: chunk
         integer :: ios, n
         line = ''
-        do
+        failed = .false.
+        reading: do
             read(*, '(a)', advance='no', size=n, iostat=ios) chunk
-            if (n > 0) line = line // chunk(1:n)
             if (ios == iostat_end) then
+                if (n > 0) line = line // chunk(1:n)
                 if (len(line) == 0) deallocate(line)   ! true end, nothing buffered
                 return
             end if
+            if (ios /= 0 .and. .not. is_iostat_eor(ios)) then
+                deallocate(line)
+                failed = .true.
+                return
+            end if
+            if (n > 0) line = line // chunk(1:n)
             if (is_iostat_eor(ios)) return             ! end of record: done
-            if (ios /= 0) return                       ! other error: take what we have
-        end do
+        end do reading
     end subroutine
 
     !! End the process with `code`, both streams flushed first (c_exit is the

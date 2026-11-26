@@ -38,7 +38,7 @@ program sqrbak
     use :: sqr,        only: SQR_MAX_DIR
     use :: sqr_net
     use :: sqr_consts, only: INT_TEXT_LEN
-    use :: clib_wrap, only: c_sock_connect, c_sock_close, c_abspath, c_exit, &
+    use :: clib_wrap, only: c_sock_connect, c_abspath, c_exit, &
                             c_joincwd, c_realpath, c_path_exists
     implicit none
 
@@ -293,11 +293,12 @@ contains
 
     !! Say goodbye and close down cleanly.  The server answers QUIT and drops
     !! the session; a failed send here changes nothing, so it is not checked.
+    !! `net_close` closes the socket: closing `sock` as well would close the
+    !! descriptor twice (and perhaps another file that reused it).
     subroutine finish()
         integer :: ne
         ne = net_send_line(conn, 'QUIT')
         call net_close(conn)
-        call c_sock_close(sock)
     end subroutine
 
     pure function itoa(v) result(s)

@@ -64,19 +64,27 @@ For one-click use, bind the two macros to toolbar buttons or shortcuts
 - **The data sheet belongs to the macros**: row 1 must hold column names
   (any subset/order of the table's columns), data rows sit contiguously
   below, and pull clears the sheet before writing. Keep formulas and
-  derived views on other sheets referencing this one.
+  derived views on other sheets referencing this one.  A table column
+  that is not on the sheet is NULL in every row after a push; the push
+  goes ahead and its message names the column(s).
 - **Empty cells are NULL**, in both directions; an empty string is treated
-  as NULL too (blanks are never significant).
-- INTEGER columns reject non-integral numbers; text typed into a numeric
-  column is passed through for the server to parse, so `42` typed as text
-  still lands in an INTEGER column.
+  as NULL too (blanks are never significant).  When a push sent any
+  blank text cell, its message says how many were stored as NULL.
+- INTEGER columns reject non-integral numbers.  Text typed into a numeric
+  column must be a literal of that type (`SQL-REFERENCE.md` section 2): an
+  optionally signed run of digits for INTEGER, that or a real literal
+  (`1.5`, `1.`, `1e3`, `-2.5E+3`) for REAL.  So `42` typed as text still
+  lands in an INTEGER column, but any other text stops the push before
+  anything is sent, naming the row, the column and the text; the table is
+  left untouched.
 
 ## Testing
 
 `make calctest` runs `test_calc.tcl`: the real `sqr_calc.tcl` driven over a
 dict-backed mock servant against a real spawned `sqrd` — configuration
 bootstrap, pull exactness (0.1, -1.5e-300), NULL round-trip, push,
-rollback-on-error and header validation (22 checks). Only the pyuno lines
+rollback-on-error, refused text in numeric columns, a sheet lacking a
+column, and header validation. Only the pyuno lines
 in `tclcalc.py` are outside its reach; smoke-test those in Calc once per
 change there:
 

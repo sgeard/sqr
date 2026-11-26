@@ -10,8 +10,8 @@
 # the other recognisable encodings refused by name, with exit status 1),
 # and the command line: an argument that starts with '-' is an option, never
 # a database directory, so a mistyped one must not create a directory.
-# sqlsh reads its own input and sqrsh's is read by cmdgraph, so the same
-# cases are run through both to show that they give the same answer.
+# sqlsh and sqrsh each read their own input, so the same cases are run
+# through both to show that they give the same answer.
 #
 # Each case writes a script as raw bytes, runs `<shell> < script` and checks
 # the exit status, stdout and stderr.
@@ -393,6 +393,36 @@ namespace eval shelltest {
         check {[dict get $r status] == 1} "status: no database open ends with 1"
     }
 
+    # P1: standard input that cannot be read (a directory) ends the shell
+    # at once with status 1 and a message, rather than reading again for
+    # ever.  `timeout` turns a spin into status 124, a failed check.  A
+    # gfortran runtime reports a directory as end of file, not as an error:
+    # that build ends at once with status 0 and nothing on stderr, also a
+    # pass (LOWS-DESIGN 6.3.1).  Any other status fails.
+    proc t_unreadable_stdin {} {
+        variable sqlsh
+        variable sqrsh
+        variable work
+        set errf [file join $work err.txt]
+        foreach {shell name msg} [list $sqlsh sqlsh {^error: cannot read standard input$} \
+                                       $sqrsh sqrsh {^cannot read standard input$}] {
+            set db [fresh_db unreadable_$name]
+            set status 0
+            try {
+                exec timeout 20 $shell $db < $work > /dev/null 2> $errf
+            } trap CHILDSTATUS {m opts} {
+                set status [lindex [dict get $opts -errorcode] 2]
+            } on error {} {
+                set status -1
+            }
+            set fh [open $errf r]
+            set err [read $fh]
+            close $fh
+            check {($status == 1 && [regexp -line $msg $err]) || ($status == 0 && $err eq "")} \
+                "$name: unreadable standard input ends at once (1 and the message, or 0 as empty input)"
+        }
+    }
+
     # R25, R13: sqrsh piped: no banner and no prompts; failures on standard
     # error; status 1 when any command failed, the script running on.
     proc t_sqrsh_streams {} {
@@ -680,6 +710,7 @@ namespace eval shelltest {
             t_display
             t_schema
             t_exit_status
+            t_unreadable_stdin
             t_like_long
             t_add_text_column
             t_readonly_counters

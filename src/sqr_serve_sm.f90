@@ -13,8 +13,15 @@ submodule (sqr_serve) sqr_serve_impl
     use :: sqr_consts, only: I32_BYTES, CH_LF, PATH_SEPS, INT_TEXT_LEN
     use :: clib_wrap, only: c_sock_listen, c_sock_port, c_sock_accept, c_sock_poll, c_sock_close, &
                             c_sock_send_timeout, &
-                            c_realpath, c_joincwd
+                            c_realpath, c_joincwd, C_SOCK_POLL_MAX
     implicit none
+
+    ! serve_step polls the listener plus every session in one call, so that
+    ! set must fit the shim's limit: a larger one makes c_sock_poll return
+    ! -1, which serve_step takes for "nothing ready" for ever.  The kind is
+    ! invalid, and the compile fails, unless it fits.
+    integer(kind=merge(int32, -1, SQRD_MAX_SESSIONS + 1 <= C_SOCK_POLL_MAX)), &
+        parameter :: POLL_SET_FITS = 1
 
     character(len=*), parameter :: LF = CH_LF
 

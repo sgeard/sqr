@@ -57,7 +57,7 @@ contains
 
     subroutine t_shim()
         integer(c_int64_t) :: socks(2)
-        logical :: ready(2)
+        logical :: ready(2), short(1), long(3)
         integer :: nready, ierr
         ls = c_sock_listen(0)
         call check(ls >= 0, 'shim: listen on an ephemeral port')
@@ -73,6 +73,14 @@ contains
         call c_sock_poll(socks, 2000, ready, nready)
         call check(nready == 1 .and. ready(1) .and. .not. ready(2), &
                    'shim: poll flags exactly the readable end')
+        short = .true.
+        call c_sock_poll(socks, 0, short, nready)
+        call check(nready == -1 .and. .not. any(short), &
+                   'shim: poll with a short ready array is an error')
+        long = .true.
+        call c_sock_poll(socks, 0, long, nready)
+        call check(nready == 1 .and. long(1) .and. .not. any(long(2:3)), &
+                   'shim: poll with a long ready array is false beyond the sockets')
         call net_close(a)
         call net_close(b)
         call check(a%sock == -1_c_int64_t, 'shim: close resets the token')

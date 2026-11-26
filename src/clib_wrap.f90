@@ -44,6 +44,12 @@ module clib_wrap
     public :: c_sock_accept !! accept one pending connection
     public :: c_sock_connect!! connect to a numeric IPv4 host:port
     public :: c_sock_poll   !! wait for sockets to become readable
+
+    !> Most sockets one `c_sock_poll` call may watch.  Must equal
+    !> `SQR_OS_POLL_MAX` in `osshim.c` (both branches): beyond it the shim
+    !> returns -1.  A caller sizing its poll set from its own limit checks it
+    !> against this constant at compile time.
+    integer, parameter, public :: C_SOCK_POLL_MAX = 64
     public :: c_sock_recv   !! receive up to len(buf) bytes
     public :: c_sock_send   !! send all bytes
     public :: c_sock_send_timeout !! limit how long a send may stall
@@ -467,7 +473,10 @@ module clib_wrap
         !! Wait up to `timeout_ms` (0 = just check, negative = forever) for
         !! any of `socks` to become readable — a hangup or error also counts
         !! as readable, so the next `c_sock_recv` reports it.  `nready` is
-        !! the number of ready sockets (0 on timeout, -1 on error).
+        !! the number of ready sockets (0 on timeout, -1 on error).  A
+        !! `ready` shorter than `socks` is an error (-1, `ready` all false);
+        !! a longer one is false beyond `size(socks)`.  More than
+        !! `C_SOCK_POLL_MAX` sockets is an error too.
         module subroutine c_sock_poll(socks, timeout_ms, ready, nready)
             integer(c_int64_t), intent(in)  :: socks(:)    !! Sockets to watch
             integer,            intent(in)  :: timeout_ms  !! Wait limit in ms

@@ -570,6 +570,9 @@ module sqr
         !! database into it.  A closed (or never opened) handle is reset to
         !! its default state before the open begins.
         !! The handle must be declared `target` (module header).
+        !!
+        !! Trailing blanks in `dir` are not significant; a directory whose
+        !! name ends in a space cannot be opened.
         module subroutine db_open(db, dir, stat, errmsg, readonly, durable)
             class(db_t),       intent(inout)           :: db  !! Database handle (must not be open)
             character(len=*), intent(in)              :: dir  !! Database directory name

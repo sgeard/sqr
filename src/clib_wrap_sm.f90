@@ -10,7 +10,9 @@ submodule (clib_wrap) clib_wrap_impl
 contains
 
     ! Copy a Fortran string into a NUL-terminated c_char target buffer sized
-    ! exactly len_trim+1, ready to pass as a C char*.
+    ! exactly len_trim+1, ready to pass as a C char*.  Trailing blanks are
+    ! dropped by design: callers pass blank-padded or trimmed text, so a path
+    ! that really ends in a space cannot be named (documented on db_open).
     pure subroutine to_cstr(s, buf)
         character(len=*),       intent(in)  :: s
         character(kind=c_char), intent(out) :: buf(:)
@@ -285,10 +287,15 @@ contains
         logical,            intent(out) :: ready(:)
         integer,            intent(out) :: nready
         integer(c_int) :: r(size(socks))
+        ready = .false.
+        if (size(ready) < size(socks)) then
+            nready = -1
+            return
+        end if
         r = 0_c_int
         nready = int(sqr_os_sock_poll(socks, int(size(socks), c_int), &
                                       int(timeout_ms, c_int), r))
-        ready = r /= 0_c_int
+        ready(1:size(socks)) = r /= 0_c_int
     end subroutine
 
     ! Both socket transfers hand the character argument straight to the C

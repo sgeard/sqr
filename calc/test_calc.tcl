@@ -160,14 +160,60 @@ check {[lindex $cells 14] eq {S Dave} && [lindex $cells 15] eq {N}} "new row lan
 sqr::hangup
 
 # ---- 4: a failing push rolls back to the intact table ----
-setcell t 2 1 {S notanumber}               ;# id column, unparseable
+# (the server refuses it: a duplicate id under the unique index; text that
+# is not a number is refused before anything is sent, case 4b)
+setcell t 3 1 {V 1}                        ;# id 2 -> 1, a duplicate key
 set rc [catch {sqr::main push} err]
 check {$rc == 1 && [string match "*unchanged*" $err]} "bad push raises: $err"
 sqr::dial 127.0.0.1 $port
 lassign [sqr::fetch "SELECT id FROM t ORDER BY id"] - - nr - cells
-check {$nr == 4 && [lindex $cells 0 1] == 1} "table unchanged after rollback"
+check {$nr == 4 && [lindex $cells 0 1] == 1 && [lindex $cells 1 1] == 2} "table unchanged after rollback"
+sqr::hangup
+setcell t 3 1 {V 2}                        ;# restore
+
+# ---- 4b: text in a numeric column is validated before anything is sent ----
+# (X4.)  Unquoted, this text would have become part of the INSERT.
+setcell t 2 1 {S {1), (2}}
+set rc [catch {sqr::main push} err]
+check {$rc == 1 && [string match {*row 2, column "id": "1), (2" is not an integer*} $err]} \
+    "text in an INT column stops the push and names the cell: $err"
+sqr::dial 127.0.0.1 $port
+lassign [sqr::fetch "SELECT id FROM t ORDER BY id"] - - nr - cells
+check {$nr == 4 && [lindex $cells 0 1] == 1 && [lindex $cells 3 1] == 4} \
+    "table keeps its old rows after a refused cell"
 sqr::hangup
 setcell t 2 1 {V 1}                        ;# restore
+setcell t 3 2 {S 1.5e}
+set rc [catch {sqr::main push} err]
+check {$rc == 1 && [string match {*row 3, column "x": "1.5e" is not a number*} $err]} \
+    "a malformed real in a REAL column is refused: $err"
+setcell t 3 2 {S -2.5E+3}
+set rc [catch {sqr::main push} err]
+check {$rc == 0} "a well-formed real as text is pushed"
+setcell t 3 2 [list V $third]              ;# restore
+
+# ---- 4c: a sheet that lacks a table column; blank cells sent as NULL ----
+# (X4.)  Column "note" is left off the sheet: the push goes ahead and says so.
+sheet t
+set saved $::mock::sheets
+for {set r 1} {$r <= 5} {incr r} {
+    putcells $r 4 1 1 {N}
+}
+setcell t 4 3 {S {   }}                    ;# id 3: blank name -> NULL
+set rc [catch {sqr::main push} err]
+set m [lindex $::mock::msgs end]
+check {$rc == 0 && [string match {*pushed 4*column(s) note are not on the sheet and are now NULL in every row*} $m]} \
+    "a push without a column names it: $m"
+check {[string match {*1 empty cells were stored as NULL*} $m]} "and counts the blank cells sent"
+sqr::dial 127.0.0.1 $port
+lassign [sqr::fetch "SELECT COUNT(note) FROM t"] - - - - cells
+check {[lindex $cells 0 1] == 0} "the missing column is NULL in every row"
+sqr::hangup
+set ::mock::sheets $saved
+set rc [catch {sqr::main push} err]
+set m [lindex $::mock::msgs end]
+check {$rc == 0 && ![string match {*not on the sheet*} $m] && ![string match {*empty cells*} $m]} \
+    "a full sheet with no blank cells adds nothing to the message: $m"
 
 # ---- 5: header validation ----
 setcell t 1 2 {S bogus}
