@@ -10,8 +10,23 @@
 !! a specific entry can be removed by its payload.
 !!
 !! On-disk: one fixed-size page per direct-access record.  Page 1 is the
-!! meta page and is always written **last** so a crash leaves a coherent
-!! tree (at worst some unreferenced pages, reclaimable by `bt_bulk_load`).
+!! meta page and is always written **last**, and only by a mutation that
+!! has succeeded, so a reader of the meta page never sees a half-described
+!! tree.  A mutation that fails leaves the handle's `root`, `first_leaf`,
+!! `npages` and `nentries` as the meta page holds them (`bt_bulk_load`
+!! may leave `npages` higher: the file is never shrunk).
+!!
+!! But WITHOUT a journal, a crash or a failed write during a mutation can
+!! leave pages it already wrote in the file: (1) the file longer than
+!! `page_size * npages`, which `bt_open` then refuses as `BT_CORRUPT`;
+!! (2) after `bt_bulk_load`, new pages written over the old tree under the
+!! old meta page; (3) after a split, a right half reachable by the leaf
+!! chain but not by descent.  Standalone, the remedy is to rebuild into a
+!! fresh file (`bt_open(create=.true.)` then `bt_bulk_load`).  A caller
+!! that needs more installs the journal hook (`bt_set_journal_hook`),
+!! restores the recorded pre-images after a failure and calls `bt_reload`,
+!! which is what sqr does.
+!!
 !! Freed pages are kept on a free list rooted in the meta page.  The page
 !! geometry is derived from the key length at create time and stored in
 !! the meta page, so arbitrarily large keys are supported without overflow
@@ -34,6 +49,8 @@ module b_tree
     integer, parameter, public :: BT_ERR     = 1  !! I/O / filesystem failure
     integer, parameter, public :: BT_CORRUPT = 2  !! Corrupt on-disk metadata
     integer, parameter, public :: BT_VERSION = 3  !! Unsupported on-disk format
+    integer, parameter, public :: BT_INVALID = 4  !! Argument does not fit the tree (a key
+                                                  !! shorter than `key_len`, unequal array sizes)
 
     !! On-disk format version of the paged file. Bumped 1->2 when the
     !! page geometry was widened to provision the transient over-full
@@ -54,8 +71,9 @@ module b_tree
         !! `old_bytes` is empty, and the layer should record the file's
         !! pre-growth length instead.  A non-zero `stat` aborts the write,
         !! so a journalling failure never lets an un-recorded overwrite
-        !! through.  `ctx` is the caller's opaque context, threaded
-        !! unchanged.
+        !! through; the tree then reports `BT_ERR`, whatever value the hook
+        !! set (keep any reason of your own in `ctx`).  `ctx` is the caller's
+        !! opaque context, threaded unchanged.
         subroutine bt_journal_hook(ctx, offset, old_bytes, is_new, stat)
             import :: int64
             class(*),         intent(in)  :: ctx       !! Opaque caller context
@@ -90,7 +108,10 @@ module b_tree
 
     !! A forward cursor over entries in ascending `(key,payload)` order.
     !! Obtained from `bt_first` (whole tree) or `bt_seek` (lower bound on a
-    !! key); advanced and read with `bt_next`.
+    !! key); advanced and read with `bt_next`.  A cursor holds a copy of one
+    !! leaf page.  It is valid only until the next `bt_insert`, `bt_remove`,
+    !! `bt_bulk_load` or `bt_reload` on that tree; after any of them take a
+    !! new cursor with `bt_first` or `bt_seek`.
     type, public :: bt_cursor_t
         integer :: leaf  = 0        !! Current leaf page id (0 = exhausted)
         integer :: slot  = 0        !! 0-based index of the next entry to yield
@@ -133,7 +154,9 @@ module b_tree
         end subroutine
 
         !! Flush the meta page (read-write opens) and close the unit.  Safe
-        !! to call on an already-closed handle.
+        !! to call on an already-closed handle.  A failed meta write or close
+        !! is `BT_ERR` (the first failure is the one reported); the handle is
+        !! closed either way.
         module subroutine bt_close(bt, stat)
             type(btree_t), intent(inout)         :: bt    !! Tree handle
             integer,       intent(out), optional :: stat  !! `BT_OK` or an error code
@@ -174,7 +197,10 @@ module b_tree
 
         !! Insert `(key, payload)`.  Duplicate keys are allowed; the pair
         !! is ordered by key then payload so the entry is uniquely
-        !! addressable for `bt_remove`.
+        !! addressable for `bt_remove`.  A key shorter than `key_len` is
+        !! `BT_INVALID` and nothing is touched; a longer one is accepted and
+        !! only its first `key_len` bytes are used.  On a failure the
+        !! handle is left as it was (see the module text for the file).
         module subroutine bt_insert(bt, key, payload, cmp, ctx, stat)
             type(btree_t),    intent(inout) :: bt       !! Tree handle
             character(len=*), intent(in)    :: key      !! Key bytes (`key_len`)
@@ -185,8 +211,10 @@ module b_tree
         end subroutine
 
         !! Remove the entry matching `(key, payload)` exactly.  `found`
-        !! is `.false.` (with `stat == BT_OK`) if no such entry exists.
-        !! Lazy: an emptied leaf is left in place, not merged.
+        !! is `.false.` (with `stat == BT_OK`) if no such entry exists; it
+        !! is meaningful only when `stat` is `BT_OK`.  A key shorter than
+        !! `key_len` is `BT_INVALID`.  On a failure the handle is left as it
+        !! was.  Lazy: an emptied leaf is left in place, not merged.
         module subroutine bt_remove(bt, key, payload, cmp, ctx, found, stat)
             type(btree_t),    intent(inout) :: bt       !! Tree handle
             character(len=*), intent(in)    :: key      !! Key bytes (`key_len`)
@@ -201,7 +229,11 @@ module b_tree
         !! then write perfectly-packed leaves and the internal levels
         !! bottom-up.  O(N log N) — the proper replacement for per-row
         !! reinsertion.  `keys` is a rank-1 array of `key_len` byte strings,
-        !! `payloads(i)` the payload for `keys(i)`.
+        !! `payloads(i)` the payload for `keys(i)`.  Keys shorter than
+        !! `key_len`, or `size(payloads) /= size(keys)`, is `BT_INVALID`
+        !! before anything is built.  On a failure the handle is left as it
+        !! was, except that `npages` may be higher; pages already written
+        !! stay in the file (see the module text).
         !!
         !! Note: this rewrites from page 2 but does NOT shrink the underlying
         !! file.  When the new tree needs fewer pages than the file holds, the
@@ -222,7 +254,8 @@ module b_tree
 
         !! Position `cur` at the first entry whose key is not ordered
         !! before `key` (lower bound).  Callers iterate with `bt_next` and
-        !! stop themselves once the yielded key compares greater.
+        !! stop themselves once the yielded key compares greater.  A key
+        !! shorter than `key_len` is `BT_INVALID`, with the cursor invalid.
         module subroutine bt_seek(bt, key, cmp, ctx, cur, stat)
             type(btree_t),    intent(in)  :: bt   !! Tree handle
             character(len=*), intent(in)  :: key  !! Lower-bound key (`key_len`)
@@ -243,12 +276,16 @@ module b_tree
 
         !! Yield the entry at the cursor and advance.  `ok` is `.false.`
         !! when the cursor is exhausted (no entry returned).
-        !! `key` must be exactly `key_len` bytes: only `key(1:key_len)` is
-        !! assigned, so a longer buffer keeps undefined trailing bytes.
+        !! `key` must be at least `key_len` bytes (shorter is `BT_INVALID`,
+        !! the cursor not advanced): only `key(1:key_len)` is assigned, so a
+        !! longer buffer keeps undefined trailing bytes.  A leaf chain that
+        !! leads to a page that is not a leaf is `BT_CORRUPT`.  The cursor
+        !! is valid only until the next `bt_insert`, `bt_remove`,
+        !! `bt_bulk_load` or `bt_reload` on the tree.
         module subroutine bt_next(bt, cur, key, payload, ok, stat)
             type(btree_t),     intent(in)    :: bt       !! Tree handle
             type(bt_cursor_t), intent(inout) :: cur      !! Cursor (advanced)
-            character(len=*),  intent(out)   :: key      !! Receives the key (must be exactly `key_len`)
+            character(len=*),  intent(out)   :: key      !! Receives the key (at least `key_len` bytes)
             integer(int32),    intent(out)   :: payload  !! Receives the payload
             logical,           intent(out)   :: ok       !! `.true.` if an entry was yielded
             integer,           intent(out)   :: stat     !! `BT_OK` or an error code

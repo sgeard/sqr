@@ -32,6 +32,9 @@ module utest_btree_hook
     integer        :: hk_extend   = 0          !! new-page (is_new) writes seen
     integer        :: hk_last_len = 0          !! len(old_bytes) of the last region call
     integer(int64) :: hk_last_off = 0_int64    !! offset of the last region call
+    integer        :: fk_calls    = 0          !! fail_hook calls since fk_arm
+    integer        :: fk_at       = 0          !! call that fails (0 = none)
+    integer        :: fk_stat     = 1          !! status the failing call returns
 contains
     subroutine rec_hook(ctx, offset, old_bytes, is_new, stat)
         class(*),         intent(in)  :: ctx
@@ -50,6 +53,23 @@ contains
     end subroutine
     subroutine hk_reset()
         hk_region = 0; hk_extend = 0; hk_last_len = 0; hk_last_off = 0_int64
+    end subroutine
+
+    ! A hook that counts its calls and fails the `fk_at`-th with status
+    ! `fk_stat` (fk_at = 0: never fails).
+    subroutine fail_hook(ctx, offset, old_bytes, is_new, stat)
+        class(*),         intent(in)  :: ctx
+        integer(int64),   intent(in)  :: offset
+        character(len=*), intent(in)  :: old_bytes
+        logical,          intent(in)  :: is_new
+        integer,          intent(out) :: stat
+        fk_calls = fk_calls + 1
+        stat = 0
+        if (fk_calls == fk_at) stat = fk_stat
+    end subroutine
+    subroutine fk_arm(at, st)
+        integer, intent(in) :: at, st
+        fk_calls = 0; fk_at = at; fk_stat = st
     end subroutine
 end module utest_btree_hook
 
@@ -79,6 +99,8 @@ program utest_btree
     call t_page_bodies()
     call t_page_size_vs_file()
     call t_discard()
+    call t_bad_arguments()
+    call t_failed_mutators()
 
     print '(a,i0,a,i0,a)', 'b_tree tests: ', pass, ' passed, ', fail, ' failed'
     if (fail > 0) error stop 1
@@ -646,6 +668,7 @@ contains
         ! (key_len + 8). Spelled as a literal because the compilers warn on a
         ! constant-folded integer division.
         integer, parameter :: MK = 339
+        integer :: n
         integer(int32) :: pay
         character(len=4) :: kk
         logical :: ok, found
@@ -733,6 +756,20 @@ contains
         call bt_seek(bt, k4(1_int32), icmp, dummy, cur, st)
         call check(st == BT_CORRUPT, 'body: leaf next id past npages rejected')
         call bt_close(bt, st)
+        ! A leaf whose next id names the root (an internal page): the scan
+        ! must stop with BT_CORRUPT after the 294 entries of page 2, not read
+        ! entries out of the internal page.
+        call poke_i32('utest_btree_11.bt', PS + 6, 4_int32)
+        call bt_open(bt, 'utest_btree_11.bt', 4, .false., .false., st)
+        call bt_first(bt, cur, st)
+        n = 0
+        scan_int: do i = 1, 100000
+            call bt_next(bt, cur, kk, pay, ok, st)
+            if (.not. ok .or. st /= BT_OK) exit scan_int
+            n = n + 1
+        end do scan_int
+        call check(st == BT_CORRUPT .and. n == 294, 'body: leaf chain into an internal page rejected')
+        call bt_close(bt, st)
         call poke_i32('utest_btree_11.bt', PS + 6, 3_int32)     ! restore
 
         ! --- child ids --------------------------------------------------
@@ -794,6 +831,189 @@ contains
 
         call fresh('utest_btree_12.bt')
     end subroutine
+
+    ! B4: an argument that does not fit the tree is BT_INVALID, and the
+    ! tree is untouched.
+    subroutine t_bad_arguments()
+        type(btree_t)     :: bt
+        type(bt_cursor_t) :: cur
+        integer :: st, i, n0, n1
+        integer(int64) :: s0, s1
+        integer(int32) :: pay
+        character(len=2) :: short
+        character(len=4) :: kk
+        character(len=2) :: skeys(3)
+        character(len=4) :: keys(3)
+        integer(int32)   :: pays(2)
+        logical :: ok, found
+
+        call fresh('utest_btree_14.bt')
+        call bt_open(bt, 'utest_btree_14.bt', 4, .true., .true., st)
+        do i = 1, 600
+            call bt_insert(bt, k4(int(i, int32)), int(i, int32), icmp, dummy, st)
+        end do
+        call scan_sum(bt, n0, s0)
+        short = 'ab'
+
+        call bt_insert(bt, short, 1_int32, icmp, dummy, st)
+        call check(st == BT_INVALID, 'badarg: insert with a short key')
+        call bt_remove(bt, short, 1_int32, icmp, dummy, found, st)
+        call check(st == BT_INVALID .and. .not. found, 'badarg: remove with a short key')
+        call bt_seek(bt, short, icmp, dummy, cur, st)
+        call check(st == BT_INVALID .and. .not. cur%valid, 'badarg: seek with a short key')
+        call bt_first(bt, cur, st)
+        call bt_next(bt, cur, short, pay, ok, st)
+        call check(st == BT_INVALID .and. .not. ok, 'badarg: next into a short key')
+        call bt_next(bt, cur, kk, pay, ok, st)
+        call check(st == BT_OK .and. ok .and. kof(kk) == 1_int32, &
+                   'badarg: the refused next did not advance the cursor')
+        skeys = ['aa', 'bb', 'cc']
+        call bt_bulk_load(bt, skeys, [1_int32, 2_int32, 3_int32], icmp, dummy, st)
+        call check(st == BT_INVALID, 'badarg: bulk load of short keys')
+        keys = [k4(1_int32), k4(2_int32), k4(3_int32)]
+        pays = [1_int32, 2_int32]
+        call bt_bulk_load(bt, keys, pays, icmp, dummy, st)
+        call check(st == BT_INVALID, 'badarg: bulk load with fewer payloads than keys')
+
+        call scan_sum(bt, n1, s1)
+        call check(n1 == n0 .and. s1 == s0 .and. bt%nentries == 600_int64, &
+                   'badarg: the tree is unchanged')
+        call bt_close(bt, st)
+        call fresh('utest_btree_14.bt')
+    end subroutine
+
+    ! Entry count and payload sum of a whole-tree scan.
+    subroutine scan_sum(bt, n, s)
+        type(btree_t),  intent(in)  :: bt
+        integer,        intent(out) :: n
+        integer(int64), intent(out) :: s
+        type(bt_cursor_t) :: cur
+        integer :: st
+        integer(int32) :: pay
+        character(len=4) :: kk
+        logical :: ok
+        n = 0
+        s = 0_int64
+        call bt_first(bt, cur, st)
+        scan: do
+            call bt_next(bt, cur, kk, pay, ok, st)
+            if (.not. ok .or. st /= BT_OK) exit scan
+            n = n + 1
+            s = s + int(pay, int64)
+        end do scan
+    end subroutine
+
+    ! B5 and B7: a mutator that fails part-way leaves root, first_leaf,
+    ! npages and nentries as they were (the meta page's values), and a hook's
+    ! own status is reported as BT_ERR.  A fresh tree for each failure point.
+    subroutine t_failed_mutators()
+        integer, parameter :: MK = 339           ! entries per leaf, key_len 4
+        character(len=*), parameter :: P = 'utest_btree_15.bt'
+        type(btree_t)     :: bt, b0
+        integer :: st, n, ncalls, bad
+        logical :: found
+        character(len=4), allocatable :: keys(:)
+        integer(int32),   allocatable :: pays(:)
+
+        ! --- insert that splits the root leaf -------------------------
+        call hooked_tree(bt, P, MK, b0)
+        call fk_arm(0, 1)
+        call bt_insert(bt, k4(int(MK + 1, int32)), 1_int32, icmp, dummy, st)
+        ncalls = fk_calls
+        call check(st == BT_OK .and. ncalls >= 4, 'failmut: a splitting insert writes 4+ pages')
+        call unhook(bt)
+        bad = 0
+        ins_sweep: do n = 1, ncalls
+            call hooked_tree(bt, P, MK, b0)
+            call fk_arm(n, 1)
+            call bt_insert(bt, k4(int(MK + 1, int32)), 1_int32, icmp, dummy, st)
+            if (st == BT_OK .or. .not. same_meta(bt, b0)) bad = bad + 1
+            call unhook(bt)
+        end do ins_sweep
+        call check(bad == 0, 'failmut: a failed insert leaves the handle as it was')
+
+        ! --- remove --------------------------------------------------
+        call hooked_tree(bt, P, 600, b0)
+        call fk_arm(0, 1)
+        call bt_remove(bt, k4(7_int32), 7_int32, icmp, dummy, found, st)
+        ncalls = fk_calls
+        call check(st == BT_OK .and. found .and. ncalls >= 2, 'failmut: remove writes 2+ pages')
+        call unhook(bt)
+        bad = 0
+        rem_sweep: do n = 1, ncalls
+            call hooked_tree(bt, P, 600, b0)
+            call fk_arm(n, 1)
+            call bt_remove(bt, k4(7_int32), 7_int32, icmp, dummy, found, st)
+            if (st == BT_OK .or. .not. same_meta(bt, b0)) bad = bad + 1
+            call unhook(bt)
+        end do rem_sweep
+        call check(bad == 0, 'failmut: a failed remove leaves the handle as it was')
+
+        ! --- bulk load of a different number of entries ---------------
+        allocate(keys(1000), pays(1000))
+        do n = 1, 1000
+            keys(n) = k4(int(n, int32))
+            pays(n) = int(n, int32)
+        end do
+        call hooked_tree(bt, P, 600, b0)
+        call fk_arm(0, 1)
+        call bt_bulk_load(bt, keys, pays, icmp, dummy, st)
+        ncalls = fk_calls
+        call check(st == BT_OK .and. ncalls >= 2, 'failmut: bulk load writes pages')
+        call unhook(bt)
+        bad = 0
+        bulk_sweep: do n = 1, ncalls
+            call hooked_tree(bt, P, 600, b0)
+            call fk_arm(n, 1)
+            call bt_bulk_load(bt, keys, pays, icmp, dummy, st)
+            if (st == BT_OK .or. bt%root /= b0%root .or. bt%first_leaf /= b0%first_leaf .or. &
+                bt%nentries /= b0%nentries .or. bt%npages < b0%npages) bad = bad + 1
+            call unhook(bt)
+        end do bulk_sweep
+        call check(bad == 0, 'failmut: a failed bulk load leaves the handle as it was')
+
+        ! --- B7: the hook's own status is not a tree status -----------
+        call hooked_tree(bt, P, MK, b0)
+        call fk_arm(1, 3)                        ! 3 = BT_VERSION's value
+        call bt_insert(bt, k4(int(MK + 1, int32)), 1_int32, icmp, dummy, st)
+        call check(st == BT_ERR, 'failmut: a hook status of 3 is reported as BT_ERR')
+        call unhook(bt)
+        call fresh(P)
+    end subroutine
+
+    ! A fresh tree of `nent` ascending entries with fail_hook installed (not
+    ! armed); `b0` is a copy of the handle as it then stands.
+    subroutine hooked_tree(bt, path, nent, b0)
+        type(btree_t),    intent(inout) :: bt
+        character(len=*), intent(in)    :: path
+        integer,          intent(in)    :: nent
+        type(btree_t),    intent(out)   :: b0
+        integer, target, save :: ctx_tgt = 0
+        class(*), pointer :: ctxp
+        integer :: i, st
+        call fresh(path)
+        call bt_open(bt, path, 4, .true., .true., st)
+        do i = 1, nent
+            call bt_insert(bt, k4(int(i, int32)), int(i, int32), icmp, dummy, st)
+        end do
+        ctxp => ctx_tgt
+        call bt_set_journal_hook(bt, fail_hook, ctxp)
+        call fk_arm(0, 1)
+        b0 = bt
+    end subroutine
+
+    ! Remove the hook and close without writing the meta page.
+    subroutine unhook(bt)
+        type(btree_t), intent(inout) :: bt
+        call bt_set_journal_hook(bt)
+        call bt_discard(bt)
+    end subroutine
+
+    logical function same_meta(a, b)
+        type(btree_t), intent(in) :: a, b
+        same_meta = a%root == b%root .and. a%first_leaf == b%first_leaf .and. &
+                    a%npages == b%npages .and. a%nentries == b%nentries
+    end function
 
     ! Overwrite one int32 / int8 at a 1-based byte position, using the same
     ! native transfer the library reads with (so the test holds on either

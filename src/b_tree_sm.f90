@@ -307,7 +307,10 @@ contains
                 end if
                 call bt%jhook(bt%jctx, off, old, .false., stat)
             end if
-            if (stat /= BT_OK) return
+            if (stat /= 0) then
+                stat = BT_ERR                    ! the hook can only say "failed"
+                return
+            end if
         end if
         write(bt%unit, rec=pid, iostat=ios) pg
         stat = merge(BT_ERR, BT_OK, ios /= 0)
@@ -332,8 +335,10 @@ contains
         end if
     end subroutine
 
-    ! Meta page is page 1, written last so a torn write never corrupts a
-    ! reachable tree (orphan pages are reclaimed by the next bulk_load).
+    ! Meta page is page 1, written last and only by a mutator that has
+    ! succeeded, so a reader of it never sees a half-described tree.  Without
+    ! a journal, pages a failed mutation already wrote stay in the file (see
+    ! the module text in b_tree.f90 for what that can leave).
     subroutine write_meta(bt, stat)
         type(btree_t), intent(in)  :: bt
         integer,       intent(out) :: stat
@@ -584,7 +589,7 @@ contains
         logical,          intent(in)  :: writable
         logical,          intent(in)  :: create
         integer,          intent(out) :: stat
-        integer :: u, ios, ps
+        integer :: u, ios, ps, ignore
         integer(int64) :: fsize
         character(len=9) :: act
         character(len=:), allocatable :: pg
@@ -647,7 +652,9 @@ contains
             integer(int32)    :: bom
             read(u, iostat=ios) hdr
             inquire(unit=u, size=fsize)
-            close(u)
+            ! A failure here is ignored: the direct-access open below
+            ! reports any real problem with the file.
+            close(u, iostat=ignore)
             if (ios /= 0) then
                 stat = BT_ERR
                 return
@@ -723,11 +730,12 @@ contains
     module subroutine bt_close(bt, stat)
         type(btree_t), intent(inout)         :: bt
         integer,       intent(out), optional :: stat
-        integer :: rs
+        integer :: rs, ios
         rs = BT_OK
         if (bt%unit /= -1) then
             if (bt%writable) call write_meta(bt, rs)
-            close(bt%unit)
+            close(bt%unit, iostat=ios)
+            if (ios /= 0 .and. rs == BT_OK) rs = BT_ERR   ! the first failure is kept
             bt%unit = -1
         end if
         if (present(stat)) stat = rs
@@ -738,8 +746,9 @@ contains
     ! exactly as it is.
     module subroutine bt_discard(bt)
         type(btree_t), intent(inout) :: bt
+        integer :: ignore
         if (bt%unit /= -1) then
-            close(bt%unit)
+            close(bt%unit, iostat=ignore)         ! never fails: nothing to report
             bt%unit = -1
         end if
     end subroutine
@@ -949,28 +958,51 @@ contains
         procedure(bt_compare)           :: cmp
         class(*),         intent(in)    :: ctx
         integer,          intent(out)   :: stat
+        type(btree_t) :: held
         logical :: split
         integer :: right_pid, newroot
         integer(int32) :: up_pay
         character(len=:), allocatable :: up_key, pg
-        allocate(character(len=bt%key_len) :: up_key)
-        call ins(bt, bt%root, 1, key, payload, cmp, ctx, &
-                 split, up_key, up_pay, right_pid, stat)
-        if (stat /= BT_OK) return
-        if (split) then
-            ! Tree grew: new root over the old root and its new sibling.
-            call alloc_page(bt, newroot)
-            allocate(character(len=bt%page_size) :: pg)
-            pg = repeat(char(0), bt%page_size)
-            call set_node(pg, K_INT, 1_int32)
-            call set_int_child(pg, 1, bt%root)
-            call set_int_child(pg, 2, right_pid)
-            call set_int_sep(bt, pg, 1, up_key, up_pay)
-            call write_page(bt, newroot, pg, stat)
-            if (stat /= BT_OK) return
-            bt%root = newroot
+        if (len(key) < bt%key_len) then
+            stat = BT_INVALID
+            return
         end if
-        call write_meta(bt, stat)
+        held = bt
+        insert_body: block
+            allocate(character(len=bt%key_len) :: up_key)
+            call ins(bt, bt%root, 1, key, payload, cmp, ctx, &
+                     split, up_key, up_pay, right_pid, stat)
+            if (stat /= BT_OK) exit insert_body
+            if (split) then
+                ! Tree grew: new root over the old root and its new sibling.
+                call alloc_page(bt, newroot)
+                allocate(character(len=bt%page_size) :: pg)
+                pg = repeat(char(0), bt%page_size)
+                call set_node(pg, K_INT, 1_int32)
+                call set_int_child(pg, 1, bt%root)
+                call set_int_child(pg, 2, right_pid)
+                call set_int_sep(bt, pg, 1, up_key, up_pay)
+                call write_page(bt, newroot, pg, stat)
+                if (stat /= BT_OK) exit insert_body
+                bt%root = newroot
+            end if
+            call write_meta(bt, stat)
+            if (stat == BT_OK) return
+        end block insert_body
+        ! Failed: the handle goes back to what the meta page holds.
+        call put_back(bt, held)
+        bt%npages = held%npages
+    end subroutine
+
+    ! After a failed mutation, put the handle's tree description back to the
+    ! copy `held` taken on entry - the values the meta page still holds.
+    ! npages is left to the caller: bt_bulk_load keeps its own rule for it.
+    subroutine put_back(bt, held)
+        type(btree_t), intent(inout) :: bt
+        type(btree_t), intent(in)    :: held
+        bt%root       = held%root
+        bt%first_leaf = held%first_leaf
+        bt%nentries   = held%nentries
     end subroutine
 
     ! ===== Remove (lazy) =====
@@ -983,10 +1015,16 @@ contains
         class(*),         intent(in)    :: ctx
         logical,          intent(out)   :: found
         integer,          intent(out)   :: stat
+        type(btree_t) :: held
         character(len=:), allocatable :: pg
         integer :: pid, nk, j, k, hops
 
         found = .false.
+        if (len(key) < bt%key_len) then
+            stat = BT_INVALID
+            return
+        end if
+        held = bt
         allocate(character(len=bt%page_size) :: pg)
         pid  = bt%root
         hops = 0
@@ -1022,6 +1060,7 @@ contains
                 bt%nentries = bt%nentries - 1_int64
                 found = .true.
                 call write_meta(bt, stat)
+                if (stat /= BT_OK) call put_back(bt, held)
                 return
             end if
         end if
@@ -1053,6 +1092,10 @@ contains
         cur%valid = .false.
         cur%leaf  = NO_PAGE
         cur%slot  = 0
+        if (len(key) < bt%key_len) then
+            stat = BT_INVALID
+            return
+        end if
         allocate(character(len=bt%page_size) :: pg)
         pid  = bt%root
         hops = 0
@@ -1093,6 +1136,10 @@ contains
         ok      = .false.
         payload = 0_int32
         stat    = BT_OK
+        if (len(key) < bt%key_len) then
+            stat = BT_INVALID                    ! the cursor is not advanced
+            return
+        end if
         if (.not. cur%valid .or. cur%leaf == NO_PAGE) return
         advance: do
             ! Serve the current leaf from the cursor's one-page cache: a range
@@ -1104,6 +1151,13 @@ contains
                     allocate(character(len=bt%page_size) :: cur%cpg)
                 call read_node(bt, cur%leaf, cur%cpg, stat)
                 if (stat /= BT_OK) return
+                ! The leaf chain may only lead to leaves: a next id naming an
+                ! internal page would have its children read as entries.
+                if (node_kind(cur%cpg) /= K_LEAF) then
+                    cur%valid = .false.
+                    stat = BT_CORRUPT
+                    return
+                end if
                 cur%cpid = cur%leaf
             end if
             nk = n_keys(cur%cpg)
@@ -1143,16 +1197,21 @@ contains
         procedure(bt_compare)           :: cmp
         class(*),         intent(in)    :: ctx
         integer,          intent(out)   :: stat
-        integer :: held
+        type(btree_t) :: held
+        if (size(payloads) /= size(keys) .or. len(keys) < bt%key_len) then
+            stat = BT_INVALID                    ! nothing built, tree untouched
+            return
+        end if
+        held = bt
         ! npages counts the pages in the file, and bt_open holds the file to
         ! exactly that length.  The build packs from page 2 and may need
         ! fewer pages than the file already has; the file is not shrunk, so
         ! the count must not fall either.  It is put back on a failed build
         ! too, so the handle never describes a file shorter than the real one.
-        held = bt%npages
         call bulk_build(bt, keys, payloads, cmp, ctx, stat)
-        bt%npages = max(bt%npages, held)
+        bt%npages = max(bt%npages, held%npages)
         if (stat == BT_OK) call write_meta(bt, stat)
+        if (stat /= BT_OK) call put_back(bt, held)
     end subroutine
 
     ! The build proper: sorts, then writes the leaves and the internal levels
