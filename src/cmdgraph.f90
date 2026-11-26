@@ -1,6 +1,6 @@
 !! SPDX-License-Identifier: MIT
 !! Copyright (c) 2026 Simon Geard
-!! Vendored into sqr from https://github.com/sgeard/cmdgraph (fortran/src) at svn r2355, 2026-11-12 (v1.4.0); kept in sync by hand.
+!! Vendored into sqr from https://github.com/sgeard/cmdgraph (fortran/src) at svn r2451, 2026-11-23 (v1.5.0); kept in sync by hand.
 !!
 !! State-graph driven command interpreter — Fortran implementation.
 !!
@@ -51,7 +51,7 @@ module cmdgraph
     end type version_t
 
     !! Compile-time library version constant.
-    type(version_t), parameter :: CMDGRAPH_VERSION = version_t(1, 4, 0)
+    type(version_t), parameter :: CMDGRAPH_VERSION = version_t(1, 5, 0)
 
     interface
         module function version_t_string(this) result(s)

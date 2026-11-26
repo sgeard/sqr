@@ -1,6 +1,6 @@
 !! SPDX-License-Identifier: MIT
 !! Copyright (c) 2026 Simon Geard
-!! Vendored into sqr from https://github.com/sgeard/cmdgraph (fortran/src) at svn r1883, 2026-07-09 (after its v1.3.1 release); dlist_sm.f90 re-vendored 2026-09-30 (replace_ll gfortran 16 polymorphic-realloc fix); kept in sync by hand.
+!! Vendored into sqr from https://github.com/sgeard/cmdgraph (fortran/src) at svn r2451, 2026-11-23 (v1.5.0); kept in sync by hand.
 !!
 submodule (dlist) dlist_sm
     implicit none

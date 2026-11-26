@@ -1,6 +1,6 @@
 !! SPDX-License-Identifier: MIT
 !! Copyright (c) 2026 Simon Geard
-!! Vendored into sqr from https://github.com/sgeard/cmdgraph (fortran/src) at svn r1883, 2026-07-09 (after its v1.3.1 release); kept in sync by hand.
+!! Vendored into sqr from https://github.com/sgeard/cmdgraph (fortran/src) at svn r2451, 2026-11-23 (v1.5.0); kept in sync by hand.
 !!
 !! Polymorphic doubly-linked list used as the parsed-argument container.
 !!
@@ -61,9 +61,11 @@ module dlist
         real(dp), allocatable :: data(:,:)
     end type dlist_node_real_m
 
-    !! Node holding an allocatable `character` string.
+    !! Node holding an allocatable `character` string.  `quoted` records that
+    !! the text was written as a quoted token (set by the cmdgraph tokeniser).
     type, extends(dlist_node_data_t) :: dlist_node_char
         character(len=:), allocatable :: data
+        logical                       :: quoted = .false.
     end type dlist_node_char
     
     !! Construct an integer node.

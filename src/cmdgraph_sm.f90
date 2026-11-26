@@ -1,8 +1,10 @@
 !! SPDX-License-Identifier: MIT
 !! Copyright (c) 2026 Simon Geard
-!! Vendored into sqr from https://github.com/sgeard/cmdgraph (fortran/src) at svn r2355, 2026-11-12 (v1.4.0); kept in sync by hand.
+!! Vendored into sqr from https://github.com/sgeard/cmdgraph (fortran/src) at svn r2451, 2026-11-23 (v1.5.0); kept in sync by hand.
 !!
 submodule (cmdgraph) cmdgraph_sm
+    use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
+    use, intrinsic :: iso_fortran_env, only: int64
     implicit none
 
     ! Per-state commands snapshot. Used by finalize_engine to resolve includes
@@ -23,6 +25,11 @@ submodule (cmdgraph) cmdgraph_sm
     end type
 
     character(len=1), parameter :: NUL = achar(0)
+
+    ! --- Argument tokens ---
+    character(len=*), parameter :: QUOTE_CHARS    = '''"'
+    character(len=*), parameter :: DIGIT_CHARS    = '0123456789'
+    character(len=*), parameter :: EXPONENT_CHARS = 'eEdD'
 
     ! Tested in this order, so a signature that begins with a shorter one
     ! (UTF-32 LE starts with the UTF-16 LE mark) must come first.
@@ -525,13 +532,7 @@ contains
             if (rc == RC_UNKNOWN .or. rc == RC_AMBIGUOUS .or. rc == RC_ERROR) then
                 if (present(stat)) stat = rc
                 if (present(line)) line = lineno
-                if (present(errmsg)) then
-                    if (rc == RC_ERROR) then
-                        errmsg = this%last_error
-                    else
-                        errmsg = this%last_message
-                    end if
-                end if
+                if (present(errmsg)) errmsg = this%last_error
                 close(unit)
                 ok = .false.
                 return
@@ -591,7 +592,7 @@ contains
                 call show_help(this)
                 rc = RC_OK
             else
-                call emit_info(this, "unknown: " // cmd)
+                call emit_error(this, "unknown: " // cmd)
                 rc = RC_UNKNOWN
             end if
         case (1)
@@ -613,12 +614,11 @@ contains
 
     ! Parse `rest` into `args` for the single matched command and validate it
     ! against the command's arg spec (R6).  Returns RC_OK when args are ready
-    ! for apply_edge, or RC_ERROR (having emitted the message) on an unbalanced
-    ! quote or a failed validation.  `args` is intent(out): it is reset on
-    ! entry and, on an error return, left populated for the caller's single
-    ! clear.  Check order is load-bearing: for a rest slot the lead-prefix quote
-    ! balance is tested before the tail is stripped; otherwise the whole `rest`
-    ! is balance-checked before parse_args — both before validate_args.
+    ! for apply_edge, or RC_ERROR (having emitted the message) on a malformed
+    ! quoted token or a failed validation.  `args` is intent(out): it is reset
+    ! on entry and, on an error return, left populated for the caller's single
+    ! clear.  For a rest slot only the leading structured args are tokenised,
+    ! so quote characters in the free-text remainder mean nothing.
     function parse_and_validate(this, sidx, match_idx, rest, args) result(rc)
         class(engine_t), intent(inout)         :: this
         integer, intent(in)                    :: sidx, match_idx
@@ -627,33 +627,24 @@ contains
         integer                                :: rc
         integer                                :: rest_idx, n_lead
         logical                                :: ok
-        character(len=:), allocatable          :: vmsg, tail, lead_src
+        character(len=:), allocatable          :: vmsg, tail, perr
+        integer                                :: next
 
         rc = RC_OK
         rest_idx = this%states(sidx)%commands(match_idx)%rest_idx
 
+        ! Spec ends in a rest slot: tokenise only the leading structured args,
+        ! then take the remainder verbatim.
+        n_lead = merge(rest_idx - 1, -1, rest_idx > 0)
+        call parse_args(rest, n_lead, args, next, perr)
+        if (len(perr) > 0) then
+            call emit_error(this, perr)
+            rc = RC_ERROR
+            return
+        end if
         if (rest_idx > 0) then
-            ! Spec ends in a rest slot: tokenise only the leading structured
-            ! args, then take the remainder verbatim.
-            n_lead = rest_idx - 1
-            call parse_args_lead(rest, n_lead, args, tail)
-            ! Quote balance only constrains the structured lead; the rest
-            ! portion is free text and may contain a lone '"'.
-            lead_src = rest(1 : len(rest) - len(tail))
-            if (.not. has_balanced_quotes(lead_src)) then
-                call emit_error(this, "unmatched quote in arguments")
-                rc = RC_ERROR
-                return
-            end if
-            tail = strip_leading_arg_space(tail)
+            tail = strip_leading_arg_space(rest(next:))
             if (len(tail) > 0) call args%append(char_node(tail))
-        else
-            if (.not. has_balanced_quotes(rest)) then
-                call emit_error(this, "unmatched quote in arguments")
-                rc = RC_ERROR
-                return
-            end if
-            call parse_args(rest, args)
         end if
 
         if (allocated(this%states(sidx)%commands(match_idx)%args)) then
@@ -831,179 +822,232 @@ contains
         end if
     end function strip_leading_arg_space
 
+    ! Position of the first delimiter in text, 0 if none.
     pure function first_arg_separator(text) result(pos)
         character(len=*), intent(in)             :: text
-        integer                                  :: pos, i
-        logical                                  :: in_quote
+        integer                                  :: pos
 
-        pos = 0
-        in_quote = .false.
-        do i = 1, len(text)
-            if (text(i:i) == '"') then
-                in_quote = .not. in_quote
-            else if (.not. in_quote) then
-                if (scan(text(i:i), ARG_DELIMITERS) == 1) then
-                    pos = i
-                    return
-                end if
-            end if
-        end do
+        pos = scan(text, ARG_DELIMITERS)
     end function first_arg_separator
 
-    function has_balanced_quotes(text) result(ok)
-        character(len=*), intent(in)             :: text
-        logical                                  :: ok
+    ! Tokenise `text`, at most `max_toks` tokens (all of them when max_toks is
+    ! negative), appending each to `args`.  `next` is the position just after
+    ! the last token taken, so text(next:) is the unconsumed remainder (empty
+    ! when next > len(text)).  `errmsg` is "" or the message for a malformed
+    ! quoted token.
+    !
+    ! A token that starts with ' or " is a quoted token: always text, flagged
+    ! `quoted` on its node.  Any other token runs to the next delimiter, a
+    ! quote character inside it is ordinary, and its type is inferred.
+    subroutine parse_args(text, max_toks, args, next, errmsg)
+        character(len=*), intent(in)               :: text
+        integer, intent(in)                        :: max_toks
+        type(dlist_t), intent(out)                 :: args
+        integer, intent(out)                       :: next
+        character(len=:), allocatable, intent(out) :: errmsg
+        character(len=:), allocatable              :: value
+        type(dlist_node_char)                      :: qnode
+        integer                                    :: p, sep, taken, after
 
-        ok = mod(count_char(text, '"'), 2) == 0
-    end function has_balanced_quotes
-
-    pure function count_char(text, ch) result(n)
-        character(len=*), intent(in)             :: text
-        character(len=1), intent(in)             :: ch
-        integer                                  :: n, i
-
-        n = count([(text(i:i) == ch, i = 1, len(text))])
-    end function count_char
-
-    ! Tokenise the whole line, walking a start position into `text` (slicing
-    ! only each token) rather than copying the unconsumed remainder per step.
-    subroutine parse_args(text, args)
-        character(len=*), intent(in)             :: text
-        type(dlist_t), intent(out)               :: args
-        integer                                  :: pos, p, sep
-
-        pos = 1
-        do
-            ! Skip leading delimiters to the next token (strip_leading_arg_space).
-            p = verify(text(pos:), ARG_DELIMITERS)
-            if (p == 0) return                       ! only delimiters / exhausted
-            pos = pos + p - 1
-            sep = first_arg_separator(text(pos:))
-            if (sep == 0) then                       ! last token runs to the end
-                call append_arg_token(unquote_arg_token(text(pos:)), args)
-                return
+        errmsg = ""
+        next   = 1
+        taken  = 0
+        tokens: do
+            if (max_toks >= 0 .and. taken >= max_toks) exit tokens
+            if (next > len(text)) exit tokens
+            p = verify(text(next:), ARG_DELIMITERS)
+            if (p == 0) then                         ! only delimiters remain
+                next = len(text) + 1
+                exit tokens
             end if
-            call append_arg_token(unquote_arg_token(text(pos:pos+sep-2)), args)
-            pos = pos + sep                          ! step past the separator
-        end do
+            next = next + p - 1
+            if (scan(text(next:next), QUOTE_CHARS) == 1) then
+                call read_quoted(text, next, value, after, errmsg)
+                if (len(errmsg) > 0) exit tokens
+                next = after
+                qnode = char_node(value)
+                qnode%quoted = .true.
+                call args%append(qnode)
+            else
+                sep = first_arg_separator(text(next:))
+                if (sep == 0) sep = len(text) - next + 2
+                call append_arg_token(text(next:next+sep-2), args)
+                next = next + sep - 1
+            end if
+            taken = taken + 1
+        end do tokens
     end subroutine parse_args
 
-    ! Tokenise at most n_lead leading args (like parse_args), then return the
-    ! unconsumed remainder verbatim in `tail` (a true suffix of `text`, so
-    ! len(text)-len(tail) is the consumed-prefix length). Used for the
-    ! rest-of-line slot: the caller takes `tail` as free text.  The position
-    ! walk preserves that suffix property exactly: tail = text(pos:) with pos
-    ! sitting just past the last consumed separator (or "" when exhausted).
-    subroutine parse_args_lead(text, n_lead, args, tail)
+    ! Read the quoted token whose opening quote is at text(start:start).  The
+    ! token runs to the next occurrence of the same quote character; that
+    ! character written twice is one of it.  `next` is the position just after
+    ! the closing quote, which must be a delimiter or the end of the text.
+    pure subroutine read_quoted(text, start, value, next, errmsg)
         character(len=*), intent(in)               :: text
-        integer, intent(in)                        :: n_lead
-        type(dlist_t), intent(out)                 :: args
-        character(len=:), allocatable, intent(out) :: tail
-        integer                                    :: pos, p, sep, taken
+        integer, intent(in)                        :: start
+        character(len=:), allocatable, intent(out) :: value
+        integer, intent(out)                       :: next
+        character(len=:), allocatable, intent(out) :: errmsg
+        character(len=1)                           :: q
+        integer                                    :: from, p
 
-        pos   = 1
-        taken = 0
-        do while (taken < n_lead)
-            p = verify(text(pos:), ARG_DELIMITERS)
-            if (p == 0) then                         ! line exhausted early
-                pos = len(text) + 1
-                exit
+        q      = text(start:start)
+        value  = ""
+        errmsg = ""
+        next   = start
+        from   = start + 1
+        pieces: do
+            p = 0
+            if (from <= len(text)) p = index(text(from:), q)
+            if (p == 0) then
+                errmsg = "unmatched quote in arguments"
+                return
             end if
-            pos = pos + p - 1
-            sep = first_arg_separator(text(pos:))
-            if (sep == 0) then                       ! last lead token to the end
-                call append_arg_token(unquote_arg_token(text(pos:)), args)
-                pos = len(text) + 1
-                exit
-            end if
-            call append_arg_token(unquote_arg_token(text(pos:pos+sep-2)), args)
-            pos = pos + sep
-            taken = taken + 1
-        end do
-        if (pos > len(text)) then
-            tail = ""
-        else
-            tail = text(pos:)
+            p = from + p - 1                         ! the quote, in text
+            value = value // text(from:p-1)
+            if (p == len(text)) exit pieces
+            if (text(p+1:p+1) /= q) exit pieces
+            value = value // q                       ! doubled: one of it
+            from = p + 2
+        end do pieces
+        next = p + 1
+        if (next <= len(text)) then
+            if (scan(text(next:next), ARG_DELIMITERS) == 0) &
+                errmsg = "unexpected character after closing quote"
         end if
-    end subroutine parse_args_lead
+    end subroutine read_quoted
 
-    recursive function unquote_arg_token(token) result(unquoted)
-        character(len=*), intent(in)             :: token
-        character(len=:), allocatable            :: unquoted
-
-        if (len(token) >= 2 .and. token(1:1) == '"' .and. token(len(token):len(token)) == '"') then
-            if (len(token) == 2) then
-                unquoted = ""
-            else
-                unquoted = token(2:len(token)-1)
-            end if
-        else
-            unquoted = token
-        end if
-    end function unquote_arg_token
-
+    ! Append an unquoted token as an integer, a real or text, by its spelling.
     subroutine append_arg_token(token, args)
         character(len=*), intent(in)             :: token
         type(dlist_t), intent(inout)             :: args
         integer                                  :: ival, iostat
         real(dp)                                 :: rval
+        logical                                  :: is_int
 
-        if (is_integer_token(token)) then
-            read(token, *, iostat=iostat) ival
-            if (iostat == 0) then
-                call args%append(int_node(ival))
-                return
-            end if
+        call read_integer_token(token, is_int, ival)
+        if (is_int) then
+            call args%append(int_node(ival))
+            return
         end if
 
         if (is_real_token(token)) then
+            ! The spelling is already known to be a real literal, so the read
+            ! only converts.  A value too large to hold is not a number; one
+            ! too small to hold is zero.
             read(token, *, iostat=iostat) rval
+            if (iostat /= 0) then
+                if (has_negative_exponent(token)) then
+                    rval   = 0.0_dp
+                    iostat = 0
+                end if
+            end if
             if (iostat == 0) then
-                call args%append(real_node(rval))
-                return
+                if (ieee_is_finite(rval)) then
+                    call args%append(real_node(rval))
+                    return
+                end if
             end if
         end if
 
         call args%append(char_node(token))
     end subroutine append_arg_token
 
-    logical function is_integer_token(s)
+    ! Number of leading digits in s(from:); 0 when from is past the end.
+    pure function digit_run(s, from) result(n)
         character(len=*), intent(in) :: s
+        integer, intent(in)          :: from
         integer                      :: n
-        character(len=*), parameter  :: integer_signs = '+-'
-        character(len=*), parameter  :: integer_chars = '0123456789'
 
-        n = len_trim(s)
-        if (n == 0) then
-            is_integer_token = .false.
+        n = 0
+        if (from > len(s)) return
+        n = verify(s(from:), DIGIT_CHARS) - 1
+        if (n < 0) n = len(s) - from + 1
+    end function digit_run
+
+    ! `is_int` is true iff s is [+-]digits with a value that fits a default
+    ! integer; `ival` is then that value (0 otherwise).
+    pure subroutine read_integer_token(s, is_int, ival)
+        character(len=*), intent(in) :: s
+        logical, intent(out)         :: is_int
+        integer, intent(out)         :: ival
+        integer                      :: first, i
+        integer(int64)               :: v
+        logical                      :: negative
+
+        is_int = .false.
+        ival   = 0
+        if (len(s) == 0) return
+        negative = s(1:1) == '-'
+        first = merge(2, 1, scan(s(1:1), '+-') == 1)
+        if (first > len(s)) return
+        if (verify(s(first:), DIGIT_CHARS) /= 0) return
+        ! Leading zeros carry no value; ten digits is the most that can fit.
+        i = verify(s(first:), '0')
+        if (i == 0) then
+            is_int = .true.
             return
         end if
-        is_integer_token = (verify(s(1:1), integer_chars) == 0) .or. &
-                            (verify(s(1:1), integer_signs) == 0) .and. n > 1
-        if (is_integer_token) then
-            is_integer_token = verify(s(2:n), integer_chars) == 0
-        end if
+        first = first + i - 1
+        if (len(s) - first + 1 > 10) return
+        v = 0_int64
+        do i = first, len(s)
+            v = 10_int64 * v + int(index(DIGIT_CHARS, s(i:i)) - 1, int64)
+        end do
+        if (negative) v = -v
+        if (v < -int(huge(ival), int64) - 1_int64 .or. v > int(huge(ival), int64)) return
+        ival   = int(v)
+        is_int = .true.
+    end subroutine read_integer_token
 
-    end function is_integer_token
-
-    ! True iff s is parseable as a Fortran real literal.
-    ! Pre-screen with verify/scan to reject tokens whose characters fall
-    ! outside the real-literal alphabet (handles `/` which is a list-directed
-    ! input terminator, `.false.`, paths, etc.), then delegate to read.
-    logical function is_real_token(s)
+    ! True iff s is spelt as a real literal:
+    !   [+-](digits[.digits] | .digits)[(e|E|d|D)[+-]digits]
+    ! Decided by the spelling alone, so the answer is the same on every
+    ! compiler (list-directed input accepts more, and differs between them).
+    pure function is_real_token(s) result(is_real)
         character(len=*), intent(in) :: s
-        real(dp) :: rval
-        integer :: n, iostat
-        character(len=*), parameter :: real_chars = '+-0123456789.eEdD'
-        character(len=*), parameter :: digits     = '0123456789'
-        n = len_trim(s)
-        is_real_token = .false.
-        if (n == 0) return
-        if (verify(s(:n), real_chars) /= 0) return
-        if (scan(s(:n), digits) == 0) return
-        read(s(:n), *, iostat=iostat) rval
-        is_real_token = (iostat == 0)
+        logical                      :: is_real
+        integer                      :: pos, n_int, n_frac, n_exp
+
+        is_real = .false.
+        if (len(s) == 0) return
+        pos   = merge(2, 1, scan(s(1:1), '+-') == 1)
+        n_int = digit_run(s, pos)
+        pos   = pos + n_int
+        if (pos > len(s)) then
+            is_real = n_int > 0
+            return
+        end if
+        if (s(pos:pos) == '.') then
+            n_frac = digit_run(s, pos + 1)
+            if (n_int == 0 .and. n_frac == 0) return
+            pos = pos + 1 + n_frac
+        else if (n_int == 0) then
+            return
+        end if
+        if (pos > len(s)) then
+            is_real = .true.
+            return
+        end if
+        if (scan(s(pos:pos), EXPONENT_CHARS) == 0) return
+        pos = pos + 1
+        if (pos > len(s)) return
+        if (scan(s(pos:pos), '+-') == 1) pos = pos + 1
+        n_exp   = digit_run(s, pos)
+        is_real = n_exp > 0 .and. pos + n_exp - 1 == len(s)
     end function is_real_token
+
+    ! True iff the exponent of a real literal is negative.
+    pure function has_negative_exponent(s) result(negative)
+        character(len=*), intent(in) :: s
+        logical                      :: negative
+        integer                      :: pos
+
+        negative = .false.
+        pos = scan(s, EXPONENT_CHARS)
+        if (pos == 0 .or. pos == len(s)) return
+        negative = s(pos+1:pos+1) == '-'
+    end function has_negative_exponent
 
     ! Prefix-match test shared by find_matches and report_ambiguous (R2): cmd
     ! matches iff it is at least the required prefix, at most the full spelling,
@@ -1278,7 +1322,7 @@ contains
                 end if
             end do
         end associate
-        call emit_info(this, msg)
+        call emit_error(this, msg)
     end subroutine report_ambiguous
 
     ! ===== Input encoding =====
