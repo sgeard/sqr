@@ -495,6 +495,41 @@ namespace eval shelltest {
             "sqrsh char: a non-ASCII value is right-justified by characters"
     }
 
+    # R26, R27, R14 and the command-word messages (cmdgraph 1.5.0): a quoted
+    # token is text, either quote character quotes, `1e` is not a number,
+    # and `unknown:` is on standard error.
+    proc t_sqrsh_tokens {} {
+        variable sqrsh
+        set db [fresh_db sqrsh_tokens]
+        set cmds "open $db\ncreate t\ncol id int\ncol r real\ncol k char 12\ndone\nuse t\n"
+        append cmds "insert 1 1.5 \"null\"\ninsert 2 1.5 null\ninsert 3 1.5 'NULL'\n"
+        append cmds "insert 4 1.5 'two words'\ninsert 5 1.5 '\"'\ninsert 6 1.5 \"it's\"\n"
+        append cmds "insert 7 1.5 'it''s'\ninsert 8 1.5 O'Brien\n"
+        append cmds "insert 20 1e x\ninsert 21 \"1.5\" x\ninsert 22 1.5 \"a\"b\ninsert 23 1.5 'open\n"
+        append cmds "nosuch\nselect\nquit\n"
+        set r [run [utf8 $cmds] $sqrsh]
+        set out [dict get $r out]
+        set err [dict get $r err]
+        check {[regexp -line {^ +1 +1 +\S+ +null$} $out] && [regexp -line {^ +3 +3 +\S+ +NULL$} $out]} \
+            "sqrsh tokens: a quoted null is the text, in either quote character"
+        check {[regexp -line {^ +2 +2 +\S+ +NULL$} $out] && [regexp -all -line { NULL$} $out] == 2} \
+            "sqrsh tokens: an unquoted null is NULL"
+        check {[regexp -line {^ +4 +4 +\S+ +two words$} $out]} "sqrsh tokens: single quotes hold a space"
+        check {[regexp -line {^ +5 +5 +\S+ +"$} $out]}         "sqrsh tokens: a double quote inside single quotes"
+        check {[regexp -line {^ +6 +6 +\S+ +it's$} $out] && [regexp -line {^ +7 +7 +\S+ +it's$} $out]} \
+            "sqrsh tokens: a single quote inside double quotes, and doubled"
+        check {[regexp -line {^ +8 +8 +\S+ +O'Brien$} $out]}   "sqrsh tokens: a quote inside a word is ordinary"
+        check {[regexp -all -line {^col 2: expected number$} $err] == 2} \
+            "sqrsh tokens: 1e and a quoted number are not numbers"
+        check {[regexp -line {^unexpected character after closing quote$} $err]
+               && [regexp -line {^unmatched quote in arguments$} $err]} \
+            "sqrsh tokens: a malformed quoted value is refused"
+        check {[regexp -line {^unknown: nosuch$} $err] && ![regexp {unknown} $out]} \
+            "sqrsh tokens: an unknown command is reported on stderr"
+        check {![regexp -line {^ +[0-9]+ +2[0-3] } $out] && [dict get $r status] == 1} \
+            "sqrsh tokens: the refused lines wrote nothing, and the status is 1"
+    }
+
     # R24, R28, R30: ind(ex); what desc counts; 256 columns.
     proc t_sqrsh_misc {} {
         variable sqrsh
@@ -726,6 +761,7 @@ namespace eval shelltest {
             t_sqrsh_reasons
             t_sqrsh_char
             t_sqrsh_misc
+            t_sqrsh_tokens
             t_sqrsh_match
             t_sqrsh_utf8_bom
             t_sqrsh_wide

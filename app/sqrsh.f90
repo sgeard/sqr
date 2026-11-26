@@ -82,12 +82,17 @@ contains
         end do
     end function
 
-    ! A value token of `null` (any case) means SQL NULL for that column.
-    function tok_is_null(nd) result(yes)
-        use dlist, only: dlist_node_data_t
+    ! An unquoted value token of `null` (any case) means SQL NULL for that
+    ! column; quoted (`"null"`, `'null'`) it is the four-letter text.
+    pure function tok_is_null(nd) result(yes)
+        use dlist, only: dlist_node_data_t, dlist_node_char
         class(dlist_node_data_t), intent(in) :: nd
         logical :: yes
-        yes = lower(trim(node_as_char(nd))) == 'null'
+        yes = .false.
+        select type (nd)
+        type is (dlist_node_char)
+            if (.not. nd%quoted) yes = lower(trim(nd%data)) == 'null'
+        end select
     end function
 
     pure function dtype_name(dt) result(s)

@@ -32,9 +32,9 @@ sqrsh [<db-dir>]
 
 **Streams.** Results and confirmations (`inserted row 3`, listings,
 `(no tables)`, the `help` list) go to standard output. Every failure and
-usage message goes to standard error, one line each. Two messages are
-written by cmdgraph, which reads the command word, and go to standard
-output: `unknown: <word>` and `ambiguous: ...`; both still count as failures.
+usage message goes to standard error, one line each, including the two
+written when the command word is not recognised: `unknown: <word>` and
+`ambiguous: ...`.
 
 **Prompts and the banner are written only when standard input is a
 terminal**, to standard output. The prompt is `sqr> `, `cols> ` or `row> `
@@ -65,12 +65,27 @@ A line is a command word followed by arguments, separated by spaces.
 - **Arguments** are of three kinds, decided by how they are written:
   - an **integer**: an optional sign and digits, within −2147483648 to
     2147483647 (`7`, `007`, `+5`, `-9`);
-  - a **real**: a number with a point or an exponent (`1.5`, `1.`, `.5`,
-    `1e3`, `-1e-3`);
-  - **text**: anything else, and anything in double quotes. Quotes are needed
-    for text that contains a space and for the empty text `""`. Single quotes
-    are ordinary characters: `'abc'` is five characters.
-  - A quoted text cannot contain a double quote; there is no escape.
+  - a **real**: an optional sign, digits with a point or an exponent or
+    both, and a finite value (`1.5`, `1.`, `.5`, `1e3`, `-1e-3`, `1d3`). An
+    exponent needs its digits: `1e` is text. A whole number too large for an
+    integer is a real;
+  - **text**: anything else, and anything in quotes.
+- **Quotes.** An argument that starts with `'` or `"` runs to the next
+  occurrence of the same character, and is always text: `"12"` is the two
+  characters, not a number. Quotes are needed for text that contains a
+  space, for the empty text (`""` or `''`), and for text that would
+  otherwise be read as a number or as `null`.
+  - The other quote character is ordinary inside: `'"'` is one double quote
+    and `"it's"` is `it's`.
+  - The quote that delimits the text, written twice, is one of it:
+    `'it''s'` is `it's`.
+  - The closing quote must be followed by a space or the end of the line;
+    otherwise the line is refused with `unexpected character after closing
+    quote`. A quote that is never closed is refused with `unmatched quote in
+    arguments`.
+  - A quote character inside an unquoted word is ordinary: `O'Brien` is
+    seven characters.
+  - A backslash has no special meaning.
 - A blank line does nothing. There are no comments and no way to put two
   commands on one line: `#` and `;` are ordinary arguments.
 - `help` and `?` list the commands of the current state. Arguments to them
@@ -82,8 +97,8 @@ A line is a command word followed by arguments, separated by spaces.
   commands refuse the line with their usage message.
 
 **The word `null`.** Where a command takes a value for a column, the argument
-`null`, in any letter case, quoted or not, means NULL. The text `null`
-therefore cannot be stored through `sqrsh`.
+`null`, in any letter case and not in quotes, means NULL. In quotes
+(`"null"`, `'NULL'`) it is the text.
 
 ## 3. States
 
@@ -342,8 +357,7 @@ engine's reason, which says the database is read-only: `insert failed:
   `sqlsh` does these.
 - Change one column of a row: `update` replaces the whole row.
 - Group changes into a transaction, or undo one.
-- Store the text `null`, a text containing a double quote, or a char value
-  with trailing blanks.
+- Store a char value with trailing blanks.
 
 ## 8. Limits
 
@@ -364,9 +378,6 @@ writing this document.
 
 | | Present behaviour | Question |
 |---|---|---|
-| — | The word `null` is NULL even when quoted, so the text cannot be stored. | Quoted `"null"` should be text. Waits for cmdgraph. |
-| — | A backslash before a double quote inside a quoted text is kept, and the quote does not end the text: `"x \"q\" y"` is stored as `x \"q\" y`. cmdgraph documents no escape. | Decide in cmdgraph. Waits for cmdgraph. |
-| — | A real with an empty exponent (`1e`) is 1.0 in the ifx build and is not a number in the gfortran build. | Refuse it. Waits for cmdgraph. |
 | — | Commands are case-sensitive; SQL keywords are not. | Intended (cmdgraph); stated so it is not taken for a defect. |
 
 ## 10. Notes for writing tests
