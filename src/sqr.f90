@@ -88,7 +88,7 @@ module sqr
     !! Release of the library and its programs, as `sqlsh --version` prints
     !! it.  Kept level with `version` in fpm.toml (the shell tests compare
     !! the two).
-    character(len=*), parameter, public :: SQR_RELEASE = '2.0.2'
+    character(len=*), parameter, public :: SQR_RELEASE = '2.0.3'
 
     ! --- On-disk format version ---
     !! Current on-disk format version: composite index records (ncols,
